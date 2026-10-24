@@ -1,0 +1,33 @@
+# Python Virtual Environment & Bytecode
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Mock block devices, arena files & test sockets
+/tmp/hypercache_nvme*.raw
+*.raw
+*.dat
+*.log
+daemon_local.log
+client-py/tests/.tmp*
+
+# Compiled Binaries
+/hypercache
+/hypercache-admin
+control-plane/target/
+
+# IDE & OS
+.DS_Store
+.vscode/
+.idea/

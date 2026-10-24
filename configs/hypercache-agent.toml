@@ -1,0 +1,123 @@
+# HyperCache Worker Node Agent Configuration
+# Deployed on GPU compute nodes running: ./hypercache -c configs/hypercache-agent.toml start
+
+# ==============================================================================
+# 1. RAW NVME / BLOCK STORAGE POOL DISCOVERY
+# ==============================================================================
+
+# Device discovery mode: "auto" (detect all host physical/virtual NVMe/SSDs), "manual" (use explicit list)
+device_discovery_mode = "auto"
+
+# Virtual drive support: allows virtualized disks (e.g. /dev/vdc, /dev/vdb, /dev/xvdf)
+allow_virtual_drives = true
+
+# Include disk partitions in discovery (e.g. /dev/vdc1, /dev/nvme0n1p1)
+include_partitions = true
+
+# Allowed block device prefixes
+device_prefixes = ["nvme", "vd", "xvd", "sd"]
+
+# Optional filter: target specific drive or partition (e.g. "vdc1" or "vd*" or leave empty for all)
+device_filter = ""
+
+# Automatically exclude OS root filesystem drive from cache striping pool
+exclude_root_device = true
+
+# Chunk size for striping across devices (default: 4 MiB)
+chunk_size_bytes = 4194304
+
+# Starting offset on each device (leaves 4KB header/safety margin)
+device_start_offset_bytes = 4096
+
+# Storage Backing Mode: "auto" (raw block if available, else filesystem arena if configured),
+# "raw_block" (raw unmounted NVMe only), or "filesystem" (O_DIRECT arena files on ext4/XFS for K8s & GDS)
+storage_backing_mode = "auto"
+# filesystem_cache_paths = ["/mnt/nvme0/hypercache", "/mnt/nvme1/hypercache"]
+filesystem_arena_size_bytes = 10737418240  # 10 GiB per arena file
+
+# Developer / CI Mock Device Settings (Disabled by default)
+dev_mock_device_pattern = "/tmp/hypercache_nvme*.raw"
+dev_mock_auto_count = 4
+auto_create_mock_devices = false
+mock_device_size_bytes = 104857600  # 100 MiB each
+
+# Dual-Tier Metadata Persistence (Async NVMe sync & instant warm-boot recovery)
+# Standard Linux persistent state directory: /var/lib/hypercache/metadata.json (with /tmp/hypercache fallback)
+metadata_persistence_enabled = true
+metadata_persistence_path = "/var/lib/hypercache/metadata.json"
+
+# Tier 1 Host RAM / CXL-Ready Shared Memory Acceleration (/dev/shm)
+# Disabled by default. Set to true (or pass --ram) to enable 50-70+ GB/s ephemeral RAM caching.
+ram_cache_enabled = false
+# Configurable RAM cache capacity in bytes (e.g. 34359738368 = 32 GiB, 17179869184 = 16 GiB, 4294967296 = 4 GiB).
+# If omitted or commented out while ram_cache_enabled = true, dynamically auto-sizes to 75% of /dev/shm.
+ram_cache_capacity_bytes = 34359738368
+ram_cache_shm_path = "/dev/shm/hypercache"
+
+# ==============================================================================
+# 2. AUTHORITATIVE BACKENDS (S3 / NFS)
+# ==============================================================================
+
+# Authoritative Backend Configuration: "s3" or "nfs"
+authoritative_backend = "s3"
+
+# Authoritative S3 Store (used when authoritative_backend = "s3" or URI is s3://)
+# AWS S3:           s3_endpoint = "https://s3.us-east-1.amazonaws.com"
+# Cloudflare R2:    s3_endpoint = "https://<account_id>.r2.cloudflarestorage.com"
+# Ceph / MinIO:     s3_endpoint = "http://127.0.0.1:9002"
+s3_endpoint = "http://127.0.0.1:9002"
+s3_region = "us-east-1"
+s3_bucket = "hypercache-authoritative"
+s3_access_key = ""
+s3_secret_key = ""
+
+# Synthetic S3 Fallback for Offline Benchmarks (Disabled by default so real S3 errors fail fast)
+allow_synthetic_s3_fallback = false
+
+# Peer-to-Peer (P2P) Checkpoint Replication Factor (1 = local + S3 write-back, 2 = k=2 peer replica + S3)
+peer_replication_factor = 1
+
+# NFS / Shared POSIX Filesystem Settings (used when authoritative_backend = "nfs" or URI is file:///nfs://)
+nfs_mount_path = "/mnt/nfs"
+nfs_read_buffer_bytes = 4194304 # 4 MiB
+
+# Write-Through vs. Write-Back Caching Mode
+# Disabled by default (false = asynchronous Write-Back for ultra-fast non-blocking checkpoint saves).
+# Set to true to enforce synchronous Write-Through (blocking until authoritative S3/NFS confirms write).
+# Can also be overridden per-request via write_through=True in Python fsspec or client.
+write_through_enabled = false
+
+# ==============================================================================
+# 3. CLUSTER AUTO-REGISTRATION & FLEET AGENT API
+# ==============================================================================
+
+# Unique identifier for this worker node (defaults to hostname if unset)
+# node_id = "gpu-node-01"
+
+# URL of the Central Controller for automatic registration and 5-second heartbeats
+# If configured, the Node Agent HTTP API is automatically enabled.
+# controller_url = "http://10.0.0.10:9120"
+
+# GPU Node Agent Fleet API (Receives parallel preload/evict directives from the Controller)
+# OFF by default for standalone nodes. Enabled automatically when controller_url is set, or set agent_enabled = true.
+agent_enabled = false
+agent_bind_address = "0.0.0.0"
+agent_http_port = 9115
+
+# Cluster Security Token (Required when talking to an authenticated Controller)
+# Can also be set via: export HYPERCACHE_AUTH_TOKEN="your-cluster-token"
+# cluster_auth_token = "your-cluster-token"
+
+# Optional Node Labels for selective fleet targeting (--selector "gpu=h100,pool=training")
+# [node_labels]
+# gpu = "h100"
+# pool = "training"
+
+# ==============================================================================
+# 4. TELEMETRY & METRICS (PROMETHEUS)
+# ==============================================================================
+
+# OFF by default. Set metrics_enabled = true (or use --metrics flag) to expose metrics.
+metrics_enabled = false
+metrics_bind_address = "127.0.0.1"
+metrics_port = 9110

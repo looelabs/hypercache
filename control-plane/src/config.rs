@@ -1,0 +1,517 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default = "default_socket_path")]
+    pub socket_path: String,
+
+    #[serde(default = "default_block_devices")]
+    pub block_devices: Vec<String>,
+
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size_bytes: usize,
+
+    #[serde(default = "default_device_start_offset")]
+    pub device_start_offset_bytes: u64,
+
+    #[serde(default)]
+    pub max_cache_capacity_bytes: Option<u64>,
+
+    #[serde(default = "default_authoritative_backend")]
+    pub authoritative_backend: String,
+
+    #[serde(default = "default_nfs_mount_path")]
+    pub nfs_mount_path: String,
+
+    #[serde(default = "default_nfs_buffer_size")]
+    pub nfs_read_buffer_bytes: usize,
+
+    #[serde(default = "default_s3_endpoint")]
+    pub s3_endpoint: String,
+
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+
+    #[serde(default = "default_s3_bucket")]
+    pub s3_bucket: String,
+
+    #[serde(default = "default_s3_key")]
+    pub s3_access_key: String,
+
+    #[serde(default = "default_s3_key")]
+    pub s3_secret_key: String,
+
+    #[serde(default = "default_auto_create")]
+    pub auto_create_mock_devices: bool,
+
+    #[serde(default = "default_mock_device_size")]
+    pub mock_device_size_bytes: u64,
+
+    #[serde(default = "default_discovery_mode")]
+    pub device_discovery_mode: String,
+
+    #[serde(default = "default_mock_pattern")]
+    pub dev_mock_device_pattern: String,
+
+    #[serde(default = "default_mock_count")]
+    pub dev_mock_auto_count: usize,
+
+    #[serde(default = "default_allow_virtual")]
+    pub allow_virtual_drives: bool,
+
+    #[serde(default = "default_include_partitions")]
+    pub include_partitions: bool,
+
+    #[serde(default = "default_device_prefixes")]
+    pub device_prefixes: Vec<String>,
+
+    #[serde(default)]
+    pub device_filter: String,
+
+    #[serde(default = "default_exclude_root")]
+    pub exclude_root_device: bool,
+
+    #[serde(default = "default_exclude_mounted")]
+    pub exclude_mounted_devices: bool,
+
+    #[serde(default = "default_exclude_fs")]
+    pub exclude_devices_with_existing_fs: bool,
+
+    #[serde(default)]
+    pub force_use_devices: Vec<String>,
+
+    #[serde(default = "default_ram_cache_enabled")]
+    pub ram_cache_enabled: bool,
+
+    #[serde(default = "default_ram_cache_capacity")]
+    pub ram_cache_capacity_bytes: Option<u64>,
+
+    #[serde(default = "default_ram_cache_shm_path")]
+    pub ram_cache_shm_path: String,
+
+    #[serde(default)]
+    pub ram_cache_hugepages: bool,
+
+    #[serde(default = "default_ram_cache_hugepages_path")]
+    pub ram_cache_hugepages_path: String,
+
+    #[serde(default = "default_persistence_enabled")]
+    pub metadata_persistence_enabled: bool,
+
+    #[serde(default = "default_persistence_path")]
+    pub metadata_persistence_path: String,
+
+    #[serde(default)]
+    pub controller_url: Option<String>,
+
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+
+    #[serde(default = "default_node_address")]
+    pub node_address: Option<String>,
+
+    #[serde(default)]
+    pub node_labels: std::collections::HashMap<String, String>,
+
+    #[serde(default)]
+    pub metrics_enabled: bool,
+
+    #[serde(default = "default_metrics_bind_address")]
+    pub metrics_bind_address: String,
+
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+
+    #[serde(default)]
+    pub agent_enabled: bool,
+
+    #[serde(default = "default_agent_bind_address")]
+    pub agent_bind_address: String,
+
+    #[serde(default = "default_agent_http_port")]
+    pub agent_http_port: u16,
+
+    #[serde(default = "default_controller_bind_address")]
+    pub controller_bind_address: String,
+
+    #[serde(default = "default_controller_port")]
+    pub controller_port: u16,
+
+    #[serde(default = "default_controller_admin_port")]
+    pub controller_admin_port: u16,
+
+    #[serde(default = "default_cluster_auth_token")]
+    pub cluster_auth_token: Option<String>,
+
+    #[serde(default)]
+    pub write_through_enabled: bool,
+
+    #[serde(default)]
+    pub allow_synthetic_s3_fallback: bool,
+
+    #[serde(default = "default_storage_backing_mode")]
+    pub storage_backing_mode: String,
+
+    #[serde(default)]
+    pub filesystem_cache_paths: Vec<String>,
+
+    #[serde(default = "default_filesystem_arena_size_bytes")]
+    pub filesystem_arena_size_bytes: u64,
+
+    #[serde(default = "default_peer_replication_factor")]
+    pub peer_replication_factor: usize,
+
+    #[serde(default)]
+    pub p2p_preload_enabled: bool,
+}
+
+pub const PRIMARY_METADATA_PATH: &str = "/var/lib/hypercache/metadata.json";
+pub const FALLBACK_METADATA_PATH: &str = "/tmp/hypercache/metadata.json";
+
+pub const PRIMARY_SHM_PATH: &str = "/dev/shm/hypercache";
+pub const FALLBACK_SHM_PATH: &str = "/tmp/hypercache/shm";
+
+pub fn get_shm_path() -> std::path::PathBuf {
+    if Path::new("/dev/shm").exists() && std::fs::create_dir_all(PRIMARY_SHM_PATH).is_ok() {
+        std::path::PathBuf::from(PRIMARY_SHM_PATH)
+    } else {
+        let _ = std::fs::create_dir_all(FALLBACK_SHM_PATH);
+        std::path::PathBuf::from(FALLBACK_SHM_PATH)
+    }
+}
+
+pub fn get_metadata_persistence_path() -> std::path::PathBuf {
+    if std::fs::create_dir_all("/var/lib/hypercache").is_ok() {
+        std::path::PathBuf::from(PRIMARY_METADATA_PATH)
+    } else {
+        let _ = std::fs::create_dir_all("/tmp/hypercache");
+        std::path::PathBuf::from(FALLBACK_METADATA_PATH)
+    }
+}
+
+pub fn resolve_metadata_persistence_path(configured_path: &str) -> std::path::PathBuf {
+    let p = Path::new(configured_path);
+    if configured_path == PRIMARY_METADATA_PATH || configured_path == "/tmp/hypercache_metadata.json" {
+        get_metadata_persistence_path()
+    } else {
+        if let Some(parent) = p.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                let fallback = Path::new("/tmp/hypercache").join(p.file_name().unwrap_or_default());
+                let _ = std::fs::create_dir_all("/tmp/hypercache");
+                return fallback;
+            }
+        }
+        p.to_path_buf()
+    }
+}
+
+fn default_ram_cache_enabled() -> bool {
+    false
+}
+
+fn default_ram_cache_capacity() -> Option<u64> {
+    let shm_dir = get_shm_path();
+    if let Ok(space) = fs2::total_space(&shm_dir) {
+        if space > 0 {
+            // Allocate 75% of /dev/shm capacity by default, with 8 GiB minimum
+            let recommended = (space * 3) / 4;
+            return Some(recommended.max(8 * 1024 * 1024 * 1024));
+        }
+    }
+    Some(8 * 1024 * 1024 * 1024) // 8 GiB fallback
+}
+
+fn default_ram_cache_shm_path() -> String {
+    get_shm_path().to_string_lossy().to_string()
+}
+
+fn default_persistence_enabled() -> bool {
+    true
+}
+
+fn default_persistence_path() -> String {
+    PRIMARY_METADATA_PATH.to_string()
+}
+
+fn default_discovery_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_mock_pattern() -> String {
+    "/tmp/hypercache_nvme*.raw".to_string()
+}
+
+fn default_mock_count() -> usize {
+    4
+}
+
+fn default_allow_virtual() -> bool {
+    true
+}
+
+fn default_include_partitions() -> bool {
+    true
+}
+
+fn default_device_prefixes() -> Vec<String> {
+    vec![
+        "nvme".to_string(),
+        "vd".to_string(),
+        "xvd".to_string(),
+        "sd".to_string(),
+    ]
+}
+
+fn default_exclude_root() -> bool {
+    true
+}
+
+fn default_exclude_mounted() -> bool {
+    true
+}
+
+fn default_exclude_fs() -> bool {
+    true
+}
+
+pub const PRIMARY_SOCKET_PATH: &str = "/run/hypercache/hypercache.sock";
+pub const FALLBACK_SOCKET_PATH: &str = "/tmp/hypercache/hypercache.sock";
+pub const PRIMARY_LOCK_PATH: &str = "/run/hypercache/hypercache.lock";
+pub const FALLBACK_LOCK_PATH: &str = "/tmp/hypercache/hypercache.lock";
+
+pub fn get_socket_path() -> std::path::PathBuf {
+    if std::fs::create_dir_all("/run/hypercache").is_ok() {
+        let test_probe = "/run/hypercache/.probe_sock";
+        if std::fs::write(test_probe, b"").is_ok() {
+            let _ = std::fs::remove_file(test_probe);
+            return std::path::PathBuf::from(PRIMARY_SOCKET_PATH);
+        }
+    }
+    let _ = std::fs::create_dir_all("/tmp/hypercache");
+    std::path::PathBuf::from(FALLBACK_SOCKET_PATH)
+}
+
+pub fn get_lock_path() -> std::path::PathBuf {
+    if std::fs::create_dir_all("/run/hypercache").is_ok() {
+        let test_probe = "/run/hypercache/.probe_lock";
+        if std::fs::write(test_probe, b"").is_ok() {
+            let _ = std::fs::remove_file(test_probe);
+            return std::path::PathBuf::from(PRIMARY_LOCK_PATH);
+        }
+    }
+    let _ = std::fs::create_dir_all("/tmp/hypercache");
+    std::path::PathBuf::from(FALLBACK_LOCK_PATH)
+}
+
+pub fn probe_active_socket_path() -> std::path::PathBuf {
+    if Path::new(PRIMARY_SOCKET_PATH).exists() {
+        std::path::PathBuf::from(PRIMARY_SOCKET_PATH)
+    } else if Path::new(FALLBACK_SOCKET_PATH).exists() {
+        std::path::PathBuf::from(FALLBACK_SOCKET_PATH)
+    } else if Path::new("/tmp/hypercache.sock").exists() {
+        std::path::PathBuf::from("/tmp/hypercache.sock")
+    } else {
+        get_socket_path()
+    }
+}
+
+fn default_socket_path() -> String {
+    get_socket_path().to_string_lossy().to_string()
+}
+
+fn default_block_devices() -> Vec<String> {
+    Vec::new()
+}
+
+fn default_chunk_size() -> usize {
+    4 * 1024 * 1024 // 4 MiB
+}
+
+fn default_device_start_offset() -> u64 {
+    4096 // 4 KB aligned
+}
+
+fn default_authoritative_backend() -> String {
+    "s3".to_string()
+}
+
+fn default_nfs_mount_path() -> String {
+    "/mnt/nfs".to_string()
+}
+
+fn default_nfs_buffer_size() -> usize {
+    4 * 1024 * 1024 // 4 MiB buffer
+}
+
+fn default_s3_endpoint() -> String {
+    "http://127.0.0.1:9002".to_string()
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_s3_bucket() -> String {
+    "hypercache-authoritative".to_string()
+}
+
+fn default_s3_key() -> String {
+    String::new()
+}
+
+fn default_ram_cache_hugepages_path() -> String {
+    "/dev/hugepages/hypercache".to_string()
+}
+
+fn default_node_id() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "node-01".to_string())
+}
+
+fn default_node_address() -> Option<String> {
+    std::env::var("HYPERCACHE_NODE_IP").ok().filter(|s| !s.trim().is_empty())
+}
+
+fn default_metrics_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_metrics_port() -> u16 {
+    9110
+}
+
+fn default_agent_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_agent_http_port() -> u16 {
+    9115
+}
+
+fn default_controller_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_controller_port() -> u16 {
+    9120
+}
+
+fn default_controller_admin_port() -> u16 {
+    9121
+}
+
+fn default_cluster_auth_token() -> Option<String> {
+    std::env::var("HYPERCACHE_AUTH_TOKEN").ok().filter(|s| !s.trim().is_empty())
+}
+
+fn default_auto_create() -> bool {
+    false
+}
+
+fn default_mock_device_size() -> u64 {
+    100 * 1024 * 1024 // 100 MiB
+}
+
+fn default_storage_backing_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_filesystem_arena_size_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024 // 10 GiB default per filesystem directory arena
+}
+
+fn default_peer_replication_factor() -> usize {
+    1
+}
+
+pub fn get_ram_pool_path(config: &Config) -> std::path::PathBuf {
+    if config.ram_cache_hugepages {
+        let hp = Path::new(&config.ram_cache_hugepages_path);
+        if std::fs::create_dir_all(hp).is_ok() {
+            return hp.to_path_buf();
+        }
+        tracing::warn!(
+            "Failed to initialize HugePages directory at {:?}; falling back to standard POSIX shared memory.",
+            hp
+        );
+    }
+    if !config.ram_cache_shm_path.is_empty() && config.ram_cache_shm_path != PRIMARY_SHM_PATH {
+        let custom = Path::new(&config.ram_cache_shm_path);
+        if std::fs::create_dir_all(custom).is_ok() {
+            return custom.to_path_buf();
+        }
+    }
+    get_shm_path()
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            socket_path: default_socket_path(),
+            block_devices: default_block_devices(),
+            chunk_size_bytes: default_chunk_size(),
+            device_start_offset_bytes: default_device_start_offset(),
+            max_cache_capacity_bytes: None,
+            authoritative_backend: default_authoritative_backend(),
+            nfs_mount_path: default_nfs_mount_path(),
+            nfs_read_buffer_bytes: default_nfs_buffer_size(),
+            s3_endpoint: default_s3_endpoint(),
+            s3_region: default_s3_region(),
+            s3_bucket: default_s3_bucket(),
+            s3_access_key: default_s3_key(),
+            s3_secret_key: default_s3_key(),
+            auto_create_mock_devices: default_auto_create(),
+            mock_device_size_bytes: default_mock_device_size(),
+            device_discovery_mode: default_discovery_mode(),
+            dev_mock_device_pattern: default_mock_pattern(),
+            dev_mock_auto_count: default_mock_count(),
+            allow_virtual_drives: default_allow_virtual(),
+            include_partitions: default_include_partitions(),
+            device_prefixes: default_device_prefixes(),
+            device_filter: String::new(),
+            exclude_root_device: default_exclude_root(),
+            exclude_mounted_devices: default_exclude_mounted(),
+            exclude_devices_with_existing_fs: default_exclude_fs(),
+            force_use_devices: Vec::new(),
+            ram_cache_enabled: default_ram_cache_enabled(),
+            ram_cache_capacity_bytes: default_ram_cache_capacity(),
+            ram_cache_shm_path: default_ram_cache_shm_path(),
+            ram_cache_hugepages: false,
+            ram_cache_hugepages_path: default_ram_cache_hugepages_path(),
+            metadata_persistence_enabled: default_persistence_enabled(),
+            metadata_persistence_path: default_persistence_path(),
+            controller_url: None,
+            node_id: default_node_id(),
+            node_address: default_node_address(),
+            node_labels: std::collections::HashMap::new(),
+            metrics_enabled: false,
+            metrics_bind_address: default_metrics_bind_address(),
+            metrics_port: default_metrics_port(),
+            agent_enabled: false,
+            agent_bind_address: default_agent_bind_address(),
+            agent_http_port: default_agent_http_port(),
+            controller_bind_address: default_controller_bind_address(),
+            controller_port: default_controller_port(),
+            controller_admin_port: default_controller_admin_port(),
+            cluster_auth_token: default_cluster_auth_token(),
+            write_through_enabled: false,
+            allow_synthetic_s3_fallback: false,
+            storage_backing_mode: default_storage_backing_mode(),
+            filesystem_cache_paths: Vec::new(),
+            filesystem_arena_size_bytes: default_filesystem_arena_size_bytes(),
+            peer_replication_factor: default_peer_replication_factor(),
+            p2p_preload_enabled: false,
+        }
+    }
+}
+
+impl Config {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let content = std::fs::read_to_string(path.as_ref())
+            .with_context(|| format!("Failed to read config file at {:?}", path.as_ref()))?;
+        let config: Config = toml::from_str(&content)
+            .with_context(|| "Failed to parse TOML configuration")?;
+        Ok(config)
+    }
+}

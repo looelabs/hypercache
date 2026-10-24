@@ -1,0 +1,34 @@
+# HyperCache Central Cluster Controller Configuration
+# Deployed on Head / Coordinator node running: ./hypercache-admin -c configs/hypercache-controller.toml controller
+
+# ==============================================================================
+# 1. CONTROLLER NETWORK BINDING
+# ==============================================================================
+
+# IP address to bind the Central Controller service on
+# Set to "0.0.0.0" to listen on all interfaces, or bind to a specific private VPC IP (e.g. "10.0.0.10")
+controller_bind_address = "0.0.0.0"
+
+# Port for incoming worker node registrations, heartbeats, and admin API calls
+controller_port = 9120
+
+# Optional secondary admin port
+controller_admin_port = 9121
+
+# ==============================================================================
+# 2. CLUSTER SECURITY & AUTHENTICATION
+# ==============================================================================
+
+# Shared secret Bearer token for cluster security
+# When configured, worker nodes must provide this token to register, and remote CLI calls require it.
+# Local connections from 127.0.0.1 on the controller host bypass authentication automatically.
+# Can also be set via: export HYPERCACHE_AUTH_TOKEN="your-cluster-token"
+# cluster_auth_token = "your-cluster-token"
+
+# ==============================================================================
+# 3. P2P FLEET PRE-WARMING & CONSISTENT SHARDING
+# ==============================================================================
+
+# When enabled, fleet-wide preload pulls once from S3 onto a seed node and distributes
+# chunks peer-to-peer across remaining worker nodes to eliminate S3 egress amplification.
+p2p_preload_enabled = false
