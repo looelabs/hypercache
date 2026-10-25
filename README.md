@@ -16,7 +16,7 @@
 5. [Hardware & System Requirements](#hardware--system-requirements)
 6. [How to Build & Install HyperCache](#how-to-build--install-hypercache)
 7. [Configuration Guide (`hypercache-agent.toml` & `hypercache-controller.toml`)](#configuration-guide-hypercache-agenttoml--hypercache-controllertoml)
-8. [How to Use HyperCache (Single-Node, Cluster & Laptop Dev)](#how-to-use-hypercache-single-node-cluster--laptop-dev)
+8. [How to Use HyperCache (Single-Node & Multi-Node Cluster)](#how-to-use-hypercache-single-node--multi-node-cluster)
 9. [URI Addressing & Backend Routing](#uri-addressing--backend-routing)
 10. [Python & PyTorch Integration Examples](#python--pytorch-integration-examples)
 11. [Fleet & Node Architecture](#fleet--node-architecture)
@@ -32,11 +32,11 @@
 
 **HyperCache** is an open-source, host-local caching and I/O acceleration engine purpose-built for AI training and inference infrastructure. Written in **Rust** (control plane and cluster coordinator) and **Python** (zero-copy data plane and framework integrations), it runs directly on your compute nodes between remote storage (**Amazon S3, S3-compatible object stores, or NFS**) and your AI frameworks (**PyTorch, Safetensors, Hugging Face, vLLM**).
 
-Instead of pulling multi-gigabyte model weights, training checkpoints, and tokenized datasets across the network every time a job starts, a container scales up, or a training step saves state, HyperCache pools each node's **local Host RAM (`/dev/shm` / HugePages)** and **local NVMe SSDs** into an autonomous, striped high-speed cache tier.
+Instead of pulling multi-gigabyte model weights, training checkpoints, and tokenized datasets across the network every time a job starts, a container scales up, or a training step saves state, HyperCache pools each node's **local NVMe SSDs** into an autonomous, striped high-speed cache pool (with an optional Host RAM tier for specialized in-memory workloads).
 
 When an AI workload reads a model or writes a checkpoint using a `hypercache://` URI:
 1. **Sub-Millisecond Local Resolution (< 1 ms)**: Your Python process queries the local HyperCache daemon over a Unix Domain Socket. The daemon resolves the exact 4 MiB chunk locations in under a millisecond using an embedded in-memory cache—with **zero external databases** (no Redis, etcd, PostgreSQL, or JVM required).
-2. **Direct Hardware Streaming**: Your Python process streams chunks directly from local shared memory (`mmap`) or striped NVMe drives (`O_DIRECT` Direct Block DMA and NVIDIA GPUDirect Storage / `kvikio.CuFile`) straight into GPU VRAM or host memory—bypassing the network stack, the Linux kernel page cache, and redundant CPU memory copies.
+2. **Direct Hardware Streaming**: Your Python process streams chunks directly from striped local NVMe drives (`O_DIRECT` Direct Block DMA and NVIDIA GPUDirect Storage / `kvikio.CuFile`) straight into GPU VRAM or host memory—bypassing the network stack, the Linux kernel page cache, and redundant CPU memory copies.
 
 ```
 +===================================================================================================+
@@ -44,19 +44,19 @@ When an AI workload reads a model or writes a checkpoint using a `hypercache://`
 |                    torch.load("hypercache://s3/models/llama-3-70b/weights.pt")                    |
 +=================================================+=================================================+
                                                   |
-                  1. Locate Chunks (< 1 ms UDS)   |   2. Zero-Copy Direct Read / Write
+                  1. Locate Chunks (< 1 ms UDS)   |   2. Zero-Copy Direct Block DMA / GDS
                      +----------------------------+----------------------------+
                      |                                                         |
                      v                                                         v
 +=========================================+               +=========================================+
 |     HYPERCACHE LOCAL DAEMON (Rust)      |               |       LOCAL HARDWARE DATA PLANE         |
 |                                         |               |                                         |
-| - In-Memory Metadata (Moka W-TinyLFU)   |               | [ Tier 1: Host RAM (/dev/shm / Huge) ]  |
-| - Instant Warm-Boot Manifest (< 20 ms)  |               |   -> 50 - 100+ GB/s DDR5 / CXL Stream   |
-| - Auto Drive Discovery & Root Safety    |               |                                         |
-| - Background Async S3 / NFS Sync        |               | [ Tier 2: Striped Local NVMe Pool ]     |
-| - Peer-to-Peer (P2P) Chunk Exchange     |               |   -> Up to 7 GB/s per PCIe Gen 4 NVMe   |
-+====================+====================+               |   -> Up to 14 GB/s per PCIe Gen 5 NVMe  |
+| - In-Memory Metadata (Moka W-TinyLFU)   |               | [ Striped Local NVMe Pool (Primary) ]   |
+| - Instant Warm-Boot Manifest (< 20 ms)  |               |   -> Up to 7 GB/s per PCIe Gen 4 NVMe   |
+| - Auto Drive Discovery & Root Safety    |               |   -> Up to 14 GB/s per PCIe Gen 5 NVMe  |
+| - Background Async S3 / NFS Sync        |               |                                         |
+| - Peer-to-Peer (P2P) Chunk Exchange     |               | [ Optional: Host RAM (/dev/shm) Tier ]  |
++====================+====================+               |   -> 50 - 100+ GB/s DDR5 / CXL Stream   |
                      |                                    +=========================================+
                      | 3. Cache Miss Ingest / Async Write-Back Flush
                      v
@@ -236,15 +236,14 @@ All HyperCache configuration files live in the [`configs/`](configs/) directory 
 
 | Configuration File | Where It Runs | Binary Used | Purpose |
 | :--- | :--- | :--- | :--- |
-| **[`configs/hypercache-agent.toml`](configs/hypercache-agent.toml)** | **Every GPU / CPU Worker Node** | `./hypercache` | Configures local storage discovery (raw NVMe or filesystem arenas), Tier 1 Host RAM caching, authoritative S3/NFS credentials, write-back/write-through behavior, and optional registration with a Central Controller. |
+| **[`configs/hypercache-agent.toml`](configs/hypercache-agent.toml)** | **Every GPU / CPU Worker Node** | `./hypercache` | Configures local NVMe discovery (raw block drives or filesystem arenas), authoritative S3/NFS credentials, write-back/write-through behavior, and optional registration with a Central Controller. |
 | **[`configs/hypercache-controller.toml`](configs/hypercache-controller.toml)** | **Central Controller / Head Node** *(Multi-node clusters only)* | `./hypercache-admin` | Configures the cluster coordinator bind IP/port (`9120`), shared Bearer token authentication (`cluster_auth_token`), and Peer-to-Peer fleet distribution (`p2p_preload_enabled`). Not needed for single-node setups. |
-| **[`configs/hypercache.toml`](configs/hypercache.toml)** | **Local Dev / Laptop / CI** | `./hypercache` | All-in-one development config with `auto_create_mock_devices = true` (automatically creates 4x 100 MiB mock NVMe files in `/tmp/hypercache_nvme*.raw` so you can test on any laptop without dedicated SSDs). |
 
 ---
 
 ### 1. Choosing Your Storage Backing Mode (`configs/hypercache-agent.toml`)
 
-HyperCache supports three ways to back your Tier 2 NVMe cache pool depending on your environment:
+HyperCache supports two ways to back your local NVMe cache pool depending on your environment:
 
 #### A. Raw Block Device Mode (`storage_backing_mode = "raw_block"` or `"auto"`)
 Best for **bare-metal GPU servers or Cloud VMs** with dedicated, unmounted local NVMe drives (e.g., `/dev/nvme1n1`, `/dev/nvme2n1`, `/dev/vdc`). HyperCache automatically discovers unmounted drives, excludes your OS root disk (`/`), and stripes 4 MiB chunks directly across raw disk sectors with zero filesystem overhead.
@@ -260,15 +259,6 @@ Best for **Kubernetes pods (`emptyDir` / `local-storage` PVCs), shared servers w
 storage_backing_mode = "filesystem"
 filesystem_cache_paths = ["/mnt/nvme0/hypercache", "/mnt/nvme1/hypercache"]
 filesystem_arena_size_bytes = 107374182400 # 100 GiB arena capacity per directory
-```
-
-#### C. Local Laptop / CI Mock Mode (`auto_create_mock_devices = true`)
-Best for **testing on a laptop or CI runner** with no extra disks.
-```toml
-auto_create_mock_devices = true
-dev_mock_device_pattern = "/tmp/hypercache_nvme*.raw"
-dev_mock_auto_count = 4
-mock_device_size_bytes = 104857600 # 100 MiB per mock drive
 ```
 
 ---
@@ -404,46 +394,40 @@ Every critical setting in `hypercache-agent.toml` and `hypercache-controller.tom
 
 ---
 
-## How to Use HyperCache (Single-Node, Cluster & Laptop Dev)
+## How to Use HyperCache (Single-Node & Multi-Node Cluster)
 
 ### Step 1: Run Pre-Flight Host Diagnostics (`./hypercache check`)
 
-Before starting the daemon, run `check` (or `doctor`) to verify your config syntax, drive permissions, `O_DIRECT` alignment support, and shared memory capacity:
+Before starting the daemon, run `check` (or `doctor`) to verify your config syntax, drive permissions, and `O_DIRECT` alignment support:
 
 ```bash
 ./hypercache -c configs/hypercache-agent.toml check
 ```
 
-If any check fails or warns, `./hypercache check` prints the exact remediation command (such as enabling `storage_backing_mode = "filesystem"` if your machine has no unmounted raw drives).
+If any check fails or warns, `./hypercache check` prints the exact remediation command (such as enabling `storage_backing_mode = "filesystem"` if your drives are already formatted and mounted).
 
 ---
 
 ### Step 2: Start the HyperCache Daemon
 
-#### Scenario A: Local Laptop / Workstation Testing (No Dedicated NVMe Required)
-Use [`configs/hypercache.toml`](configs/hypercache.toml) (which automatically creates 4 mock NVMe files in `/tmp`):
-```bash
-./hypercache -c configs/hypercache.toml start --ram
-```
-
-#### Scenario B: Single-Node Production GPU Server
+#### Scenario A: Single-Node Production GPU Server
 On a standalone GPU server, edit [`configs/hypercache-agent.toml`](configs/hypercache-agent.toml) with your S3/NFS settings and start the daemon. By default, it opens **zero network TCP ports** and listens only on the local Unix Domain Socket:
 ```bash
-# Start worker daemon with NVMe pool + Tier 1 Host RAM cache enabled
-./hypercache -c configs/hypercache-agent.toml start --ram
+# Start worker daemon on discovered local NVMe drives
+./hypercache -c configs/hypercache-agent.toml start
 
 # Optional: Also enable Prometheus metrics on http://127.0.0.1:9110/metrics
-./hypercache -c configs/hypercache-agent.toml start --ram --metrics
+./hypercache -c configs/hypercache-agent.toml start --metrics
 ```
 
-#### Scenario C: Multi-Node GPU Cluster (Central Controller + Worker Fleet)
+#### Scenario B: Multi-Node GPU Cluster (Central Controller + Worker Fleet)
 1. **On the Central Controller Host**:
    ```bash
    ./hypercache-admin -c configs/hypercache-controller.toml controller
    ```
 2. **On Each GPU Worker Node** (with `controller_url` and `cluster_auth_token` set in `configs/hypercache-agent.toml`):
    ```bash
-   ./hypercache -c configs/hypercache-agent.toml start --ram --agent
+   ./hypercache -c configs/hypercache-agent.toml start --agent
    ```
 3. **Orchestrate the Fleet from the Controller**:
    ```bash
@@ -461,7 +445,7 @@ On a standalone GPU server, edit [`configs/hypercache-agent.toml`](configs/hyper
 
 ### Step 3: Manage & Benchmark Local Cache from the CLI
 
-On any worker node, use `./hypercache` to inspect drives, preload weights, or benchmark your hardware's DMA throughput:
+On any worker node, use `./hypercache` to inspect drives, preload weights, or benchmark your NVMe hardware's DMA throughput:
 
 ```bash
 # Inspect auto-discovered NVMe drives and NUMA topology
@@ -470,11 +454,10 @@ On any worker node, use `./hypercache` to inspect drives, preload weights, or be
 # Pre-load a model into cache and pin it so it is never evicted
 ./hypercache preload hypercache://s3/my-bucket/models/llama-3-8b/weights.pt --pin
 
-# List all cached objects, their storage tier (RAM / NVMe), sync status, and pin state
+# List all cached objects, their storage tier, sync status, and pin state
 ./hypercache ls
 
-# Benchmark Tier 1 (Host RAM) and Tier 2 (Striped NVMe) DMA read throughput on your hardware
-./hypercache bench --tier ram --size-mb 2500
+# Benchmark Striped NVMe DMA read throughput on your hardware
 ./hypercache bench --tier nvme --size-mb 5000
 ```
 
@@ -599,20 +582,20 @@ for layer_idx, layer_bytes in loader.stream_layers(layer_uris):
 
 ### 6. KV-Cache Prefix Block Store (LMCache / Dynamo KVBM Ready)
 
-Offload and retrieve prompt prefix KV-cache blocks across Tier 1 Host RAM and Tier 2 NVMe:
+Offload and retrieve prompt prefix KV-cache blocks on striped local NVMe (or optional Host RAM):
 
 ```python
 from hypercache import HyperCacheKVStore
 
-kv_store = HyperCacheKVStore(default_tier="ram")
+kv_store = HyperCacheKVStore(default_tier="nvme")
 block_key = kv_store.compute_prefix_hash(
     token_ids=[128000, 9906, 1917],
     model_id="llama-3.1-70b",
     layer_idx=0,
 )
 
-# Store KV-cache block into Tier 1 Host RAM (/dev/shm or HugePages)
-kv_store.put_kv_block(block_key, kv_tensor, tier="ram", pinned=True)
+# Store KV-cache block into local striped NVMe
+kv_store.put_kv_block(block_key, kv_tensor, tier="nvme", pinned=True)
 
 # Retrieve KV-cache block directly into pre-allocated GPU tensor
 kv_store.get_kv_block(block_key, out_tensor=gpu_kv_buffer)
