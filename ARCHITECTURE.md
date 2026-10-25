@@ -1,8 +1,5 @@
 # HyperCache Architecture Whitepaper: High-Performance Host-Based AI Storage & Cache Acceleration
 
-**Version:** 1.0.0  
-**Target Audience:** Infrastructure Engineers, ML Systems Engineers, AI Platform Architects, Kernel & Storage Engineers  
-
 ---
 
 ## 1. Executive Summary & Problem Statement
