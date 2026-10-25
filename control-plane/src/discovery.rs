@@ -254,7 +254,7 @@ impl DeviceDetector {
                     let is_forced = config.force_use_devices.iter().any(|d| d == &dev_path || d == &name);
                     if config.exclude_devices_with_existing_fs && !is_forced {
                         info!(
-                            "Excluding device {} because it contains existing '{}' filesystem signature (add to force_use_devices in configs/hypercache.toml to override)",
+                            "Excluding device {} because it contains existing '{}' filesystem signature (add to force_use_devices in configs/hypercache-agent.toml to override)",
                             dev_path, fs_type
                         );
                         if is_partition {

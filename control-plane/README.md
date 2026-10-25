@@ -1,44 +1,47 @@
-# HyperCache Control Plane Daemon (`control-plane`)
+# HyperCache Control Plane (`control-plane`)
 
-High-performance Rust daemon responsible for:
-1. **Dynamic Storage Pool Auto-Discovery**: Automatically inspects host block devices (`/dev/nvme*`, `/dev/vd*`, `/dev/sd*`) via Linux sysfs while safely excluding the OS root filesystem.
-2. **Ephemeral In-Memory Metadata Store**: High-concurrency **Moka W-TinyLFU cache** for sub-millisecond physical chunk offset lookups with zero external DB dependencies.
-3. **Auto-Ingestion Engine**: Fetches cache misses from authoritative cloud storage (S3 / Spaces / Ceph) and stripes data into 4 MiB chunks across discovered NVMe/SSDs.
-4. **Native Prometheus Exporter**: High-throughput telemetry endpoint on `:9110/metrics` providing real-time hardware DMA bandwidth, Moka latencies, S3 egress savings, and GPU idle time ROI metrics.
+Rust crate containing the HyperCache node daemon, cluster coordinator, and CLI binaries.
+
+For full system requirements, configuration guides (`hypercache-agent.toml` and `hypercache-controller.toml`), and end-to-end usage documentation, see the root **[README.md](../README.md)** and **[ARCHITECTURE.md](../ARCHITECTURE.md)**.
 
 ---
 
-## CLI Subcommands
+## Binaries Built by This Crate
+
+| Binary | Source Entrypoint | Description |
+| :--- | :--- | :--- |
+| `hypercache` | [`src/main.rs`](src/main.rs) | Worker node daemon and local CLI (`start`, `check`, `inspect`, `preload`, `ls`, `rm`, `refresh`, `purge`, `bench`, `status`). |
+| `hypercache-admin` | [`src/bin/admin.rs`](src/bin/admin.rs) | Central Cluster Controller daemon and fleet administration CLI (`controller`, `nodes`, `preload`, `preload-batch`, `evict`, `purge`, `status`). |
+
+---
+
+## Crate Module Map (`src/`)
+
+| File / Module | Responsibility |
+| :--- | :--- |
+| [`src/lib.rs`](src/lib.rs) | Library crate root exposing internal modules. |
+| [`src/config.rs`](src/config.rs) | Strongly-typed TOML configuration structs and environment variable overrides. |
+| [`src/check.rs`](src/check.rs) | Pre-flight host diagnostics (`hypercache check`) for permissions, raw drives, `O_DIRECT`, and sockets. |
+| [`src/discovery.rs`](src/discovery.rs) | Linux `sysfs` block device auto-discovery, NUMA mapping, and OS root/filesystem safety exclusions. |
+| [`src/metadata.rs`](src/metadata.rs) | Moka W-TinyLFU in-memory cache catalog, slab allocator, and async warm-boot manifest persistence. |
+| [`src/ingestion/`](src/ingestion/) | Multi-backend ingestion router (`mod.rs`), 4 MiB chunk striper (`striper.rs`), S3 client (`s3.rs`), and NFS/POSIX reader (`nfs.rs`). |
+| [`src/ram.rs`](src/ram.rs) | Optional POSIX shared memory (`/dev/shm`) and HugePages (`hugetlbfs`) block manager. |
+| [`src/protocol.rs`](src/protocol.rs) | IPC request/response wire protocol over Unix Domain Sockets. |
+| [`src/server.rs`](src/server.rs) | Local Unix Domain Socket server listener and request dispatcher. |
+| [`src/agent_server.rs`](src/agent_server.rs) | Worker Node Agent HTTP API (`:9115`), controller heartbeat loop, and P2P chunk/replica transfer handlers. |
+| [`src/controller/mod.rs`](src/controller/mod.rs) | Central Cluster Controller (`:9120`), `FleetRegistry`, consistent-hash sharding, and parallel node dispatch. |
+| [`src/fleet.rs`](src/fleet.rs) | Client functions for `hypercache-admin` fleet management commands. |
+| [`src/telemetry.rs`](src/telemetry.rs) | Prometheus metrics collector and optional HTTP exporter (`:9110/metrics`). |
+| [`src/bench.rs`](src/bench.rs) | Multi-threaded hardware DMA benchmark runner and SHA-256 verification suite. |
+
+---
+
+## Building & Testing
 
 ```bash
-# Build the native release binary
+# Compile release binaries
 cargo build --release
 
-# Start daemon and Prometheus exporter on :9110
-./target/release/hypercache start
-
-# Start on custom metrics port
-./target/release/hypercache start --metrics-port 9110
-
-# Run native 32-worker parallel verification benchmark
-./target/release/hypercache bench --size-mb 5000
-
-# Run live S3 comparison benchmark
-./target/release/hypercache bench --size-mb 5000 \
-  --s3-endpoint "https://s3.us-east-1.amazonaws.com" \
-  --bucket "my-model-bucket"
-
-# Inspect auto-discovered physical SSDs and pool capacity
-./target/release/hypercache inspect
-
-# Query live daemon status and active drives
-./target/release/hypercache status
-```
-
----
-
-## Unit Tests
-
-```bash
+# Run unit and integration tests
 cargo test
 ```

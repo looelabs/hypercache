@@ -56,7 +56,6 @@ hypercache-poc/
 ├── configs/
 │   ├── hypercache-agent.toml   # Worker Node Agent configuration (drives, S3/NFS, cluster registration)
 │   ├── hypercache-controller.toml # Central Controller configuration (network binding, auth token)
-│   ├── hypercache.toml         # Legacy all-in-one template
 │   └── grafana/                # Grafana provisioning & dashboard templates
 │
 ├── control-plane/              # High-performance Rust control plane & CLI suite

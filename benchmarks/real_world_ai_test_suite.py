@@ -319,7 +319,7 @@ def main():
     if not client.ping():
         print(f"[ERROR] HyperCache daemon is not running on {socket_path}.")
         print("Please start the daemon first:")
-        print("  ./hypercache -c configs/hypercache.toml start --ram")
+        print("  ./hypercache -c configs/hypercache-agent.toml start")
         sys.exit(1)
 
     print("=" * 78)
