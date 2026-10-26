@@ -25,6 +25,7 @@
 14. [Prometheus & Grafana Monitoring Stack](#prometheus--grafana-monitoring-stack)
 15. [Complete CLI Reference](#complete-cli-reference)
 16. [Running Tests & Verification Suites](#running-tests--verification-suites)
+17. [License](#license)
 
 ---
 
@@ -796,3 +797,9 @@ cargo test --manifest-path control-plane/Cargo.toml
 .venv/bin/python benchmarks/verify_writethrough_and_writeback.py
 .venv/bin/python benchmarks/verify_advanced_optimizations.py
 ```
+
+---
+
+## License
+
+HyperCache is licensed under the **[Apache License 2.0](LICENSE)**.
