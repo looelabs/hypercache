@@ -68,6 +68,7 @@ authoritative_backend = "s3"
 s3_endpoint = "http://127.0.0.1:9002"
 s3_region = "us-east-1"
 s3_bucket = "hypercache-authoritative"
+# S3 Credentials: supports literal strings, shell variables ($VAR or "${VAR}"), or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars
 s3_access_key = ""
 s3_secret_key = ""
 

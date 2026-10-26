@@ -35,8 +35,8 @@
 Instead of pulling multi-gigabyte model weights, training checkpoints, and tokenized datasets across the network every time a job starts, a container scales up, or a training step saves state, HyperCache pools each node's **local NVMe SSDs** into an autonomous, striped high-speed cache pool (with an optional Host RAM tier for specialized in-memory workloads).
 
 When an AI workload reads a model or writes a checkpoint using a `hypercache://` URI:
-1. **Sub-Millisecond Local Resolution (< 1 ms)**: Your Python process queries the local HyperCache daemon over a Unix Domain Socket. The daemon resolves the exact 4 MiB chunk locations in under a millisecond using an embedded in-memory cache—with **zero external databases** (no Redis, etcd, PostgreSQL, or JVM required).
-2. **Direct Hardware Streaming**: Your Python process streams chunks directly from striped local NVMe drives (`O_DIRECT` Direct Block DMA and NVIDIA GPUDirect Storage / `kvikio.CuFile`) straight into GPU VRAM or host memory—bypassing the network stack, the Linux kernel page cache, and redundant CPU memory copies.
+1. **Sub-Millisecond Local Resolution (< 1 ms)**: Your Python process queries the local HyperCache daemon over a Unix Domain Socket. The daemon resolves the exact 4 MiB chunk locations in under a millisecond using an embedded in-memory cache - with **zero external databases** (no Redis, etcd, PostgreSQL, or JVM required).
+2. **Direct Hardware Streaming**: Your Python process streams chunks directly from striped local NVMe drives (`O_DIRECT` Direct Block DMA and NVIDIA GPUDirect Storage / `kvikio.CuFile`) straight into GPU VRAM or host memory - bypassing the network stack, the Linux kernel page cache, and redundant CPU memory copies.
 
 ```
 +===================================================================================================+
@@ -78,7 +78,7 @@ Modern GPUs (NVIDIA H100, H200, B200) can execute terabytes of tensor math per s
 3. **Training Stalls During `torch.save()`**:
    Saving multi-gigabyte checkpoints synchronously to remote object storage pauses the entire GPU training cluster at the end of every epoch or checkpoint interval.
 4. **Physical Network Card (NIC) & OS Kernel Bottlenecks**:
-   No matter how fast a central storage cluster is, a compute node cannot ingest data over the network faster than its physical NIC—and standard POSIX file reads copy gigabytes through the Linux kernel VFS and page cache before ever reaching the GPU.
+   No matter how fast a central storage cluster is, a compute node cannot ingest data over the network faster than its physical NIC - and standard POSIX file reads copy gigabytes through the Linux kernel VFS and page cache before ever reaching the GPU.
 
 ---
 
@@ -90,14 +90,14 @@ $$\text{Theoretical Max NIC Throughput (GB/s)} = \frac{\text{NIC Bandwidth (Gbps
 
 | Data Path / Hardware Tier | Per-Device / Per-Link Theoretical Limit | Multi-Drive / Multi-Channel Node Throughput | Network Traffic Generated |
 | :--- | :--- | :--- | :--- |
-| **Remote S3 / Object Store (over 10 GbE)** | 1.25 GB/s wire limit | **~0.2 – 0.9 GB/s** (shared & rate-limited) | 100% over ToR switch |
-| **Remote Storage (over 25 GbE NIC)** | 3.12 GB/s wire limit | **~1.5 – 2.2 GB/s** (after TCP/TLS overhead) | 100% over ToR switch |
-| **Remote Storage (over 100 GbE NIC)** | 12.50 GB/s wire limit | **~8.5 – 10.5 GB/s** (contends with NCCL) | 100% over ToR switch |
+| **Remote S3 / Object Store (over 10 GbE)** | 1.25 GB/s wire limit | **~0.2 - 0.9 GB/s** (shared & rate-limited) | 100% over ToR switch |
+| **Remote Storage (over 25 GbE NIC)** | 3.12 GB/s wire limit | **~1.5 - 2.2 GB/s** (after TCP/TLS overhead) | 100% over ToR switch |
+| **Remote Storage (over 100 GbE NIC)** | 12.50 GB/s wire limit | **~8.5 - 10.5 GB/s** (contends with NCCL) | 100% over ToR switch |
 | **HyperCache Tier 2: PCIe Gen 4 NVMe** | **~7.0 GB/s per NVMe SSD** | **~28 GB/s** (4x NVMe) / **~56 GB/s** (8x NVMe) | **0 Bytes (100% Local PCIe)** |
 | **HyperCache Tier 2: PCIe Gen 5 NVMe** | **~14.0 GB/s per NVMe SSD** | **~56 GB/s** (4x NVMe) / **~112 GB/s** (8x NVMe) | **0 Bytes (100% Local PCIe)** |
-| **HyperCache Tier 1: Host RAM (DDR5 / CXL)**| **50 – 100+ GB/s per stream** | **300 – 460+ GB/s** (8–12 channel DDR5 bus) | **0 Bytes (100% Memory Bus)** |
+| **HyperCache Tier 1: Host RAM (DDR5 / CXL)**| **50 - 100+ GB/s per stream** | **300 - 460+ GB/s** (8-12 channel DDR5 bus) | **0 Bytes (100% Memory Bus)** |
 
-Because each node reads autonomously from its own local RAM and NVMe drives, cluster-wide read bandwidth scales linearly with the number of nodes—with zero central storage ceiling and zero interference with inter-GPU training traffic.
+Because each node reads autonomously from its own local RAM and NVMe drives, cluster-wide read bandwidth scales linearly with the number of nodes - with zero central storage ceiling and zero interference with inter-GPU training traffic.
 
 ---
 
@@ -128,7 +128,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 
 ### 6. Peer-to-Peer (P2P) Fleet Distribution
 * When preloading a large model across a multi-node cluster, you do not want every node pulling the full file from S3 simultaneously.
-* With `p2p_preload_enabled = true`, each node pulls only $1/N$ of the model's 4 MiB chunks from S3 and exchanges the remaining chunks directly with peer nodes over the internal cluster network—cutting S3 egress cost and origin load by **$N\times$**.
+* With `p2p_preload_enabled = true`, each node pulls only $1/N$ of the model's 4 MiB chunks from S3 and exchanges the remaining chunks directly with peer nodes over the internal cluster network - cutting S3 egress cost and origin load by **$N\times$**.
 
 ---
 
@@ -143,7 +143,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
     ```
 * **NVMe SSDs vs. SATA SSDs**:
   * **PCIe Gen 4 / Gen 5 NVMe SSDs (Recommended)**: HyperCache is architected for multi-queue PCIe NVMe drives (`/dev/nvme*`), delivering up to **~7 GB/s per PCIe Gen 4 NVMe** and **~14 GB/s per PCIe Gen 5 NVMe** when striped across local drives.
-  * **SATA SSDs (Supported at Lower Speeds)**: HyperCache can also discover and stripe across standard SATA SSDs (`/dev/sd*`). However, because SATA III is physically limited to a 6 Gbps interface (**~500–550 MB/s per drive**), SATA SSDs will not achieve NVMe-class throughput.
+  * **SATA SSDs (Supported at Lower Speeds)**: HyperCache can also discover and stripe across standard SATA SSDs (`/dev/sd*`). However, because SATA III is physically limited to a 6 Gbps interface (**~500-550 MB/s per drive**), SATA SSDs will not achieve NVMe-class throughput.
 
 ---
 
@@ -169,9 +169,9 @@ In production data centers, it is specifically designed to pool the high-density
 
 ### 3. CPU Architecture Support (`x86_64` Tested vs. `ARM64` Pending)
 
-* **`x86_64` (Intel Xeon & AMD EPYC) — Tested & Supported**:
+* **`x86_64` (Intel Xeon & AMD EPYC) - Tested & Supported**:
   HyperCache has been tested and validated on `x86_64` Linux servers and cloud instances.
-* **`ARM64` (`aarch64` / NVIDIA Grace) — Untested / Pending Validation**:
+* **`ARM64` (`aarch64` / NVIDIA Grace) - Untested / Pending Validation**:
   HyperCache has **not yet been tested on ARM systems**. Specifically, **NVIDIA GB200 / GB300 / NVL72** and **Vera Rubin** rack-scale architectures still require hardware testing and validation.
 
 ---
@@ -254,7 +254,7 @@ exclude_root_device = true
 ```
 
 #### B. Filesystem Direct I/O Arena Mode (`storage_backing_mode = "filesystem"`)
-Best for **Kubernetes pods (`emptyDir` / `local-storage` PVCs), shared servers where drives are already mounted with ext4/XFS, or native NVIDIA GPUDirect Storage (`cuFile`)**. HyperCache pre-allocates aligned arena files inside the specified directories and opens them with `O_DIRECT`—requiring zero raw block privileges.
+Best for **Kubernetes pods (`emptyDir` / `local-storage` PVCs), shared servers where drives are already mounted with ext4/XFS, or native NVIDIA GPUDirect Storage (`cuFile`)**. HyperCache pre-allocates aligned arena files inside the specified directories and opens them with `O_DIRECT` - requiring zero raw block privileges.
 ```toml
 storage_backing_mode = "filesystem"
 filesystem_cache_paths = ["/mnt/nvme0/hypercache", "/mnt/nvme1/hypercache"]
@@ -675,7 +675,7 @@ HyperCache is designed with a **zero-exposure default security posture**:
 2. **Zero-Config Localhost Admin**:
    Running `./hypercache-admin` directly on the Controller host (`127.0.0.1` / `::1`) automatically bypasses token checks so operators can run `./hypercache-admin nodes` or `preload` without flags.
 3. **Bearer Token Authentication for Cluster Traffic**:
-   When `cluster_auth_token` (or `HYPERCACHE_AUTH_TOKEN`) is set, all network requests between the Controller (`:9120`) and Worker Node Agents (`:9115`)—including heartbeats, preload directives, P2P chunk transfers, and $k=2$ checkpoint replication—require `Authorization: Bearer <token>`. Unauthorized requests are rejected with `HTTP 401 Unauthorized`.
+   When `cluster_auth_token` (or `HYPERCACHE_AUTH_TOKEN`) is set, all network requests between the Controller (`:9120`) and Worker Node Agents (`:9115`) - including heartbeats, preload directives, P2P chunk transfers, and $k=2$ checkpoint replication - require `Authorization: Bearer <token>`. Unauthorized requests are rejected with `HTTP 401 Unauthorized`.
 
 | Component / Service | Default Port / Socket | Default State | Who Should Have Access |
 | :--- | :--- | :--- | :--- |
@@ -690,7 +690,7 @@ HyperCache is designed with a **zero-exposure default security posture**:
 
 A common question from infrastructure engineers is: *"How much host system RAM does the HyperCache daemon itself consume?"*
 
-When Tier 1 Host RAM caching is disabled (`ram_cache_enabled = false`), the Rust control plane and Moka metadata catalog have a tiny memory footprint—roughly **~125 MB of host RAM to index a 4 TB NVMe pool (~0.003% metadata-to-storage overhead)**:
+When Tier 1 Host RAM caching is disabled (`ram_cache_enabled = false`), the Rust control plane and Moka metadata catalog have a tiny memory footprint - roughly **~125 MB of host RAM to index a 4 TB NVMe pool (~0.003% metadata-to-storage overhead)**:
 * **Rust Control Plane Base RSS**: `~28 MB`
 * **Moka W-TinyLFU + 4 MiB Chunk Routing Table (per 4 TB NVMe)**: `~96 MB` (`1,048,576 chunks x 80 bytes` + frequency sketch)
 * **Transient Streaming Ring Buffers**: `~16 MB` (`4 concurrent streams x 4 MiB`)

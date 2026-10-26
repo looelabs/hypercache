@@ -510,8 +510,262 @@ impl Config {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())
             .with_context(|| format!("Failed to read config file at {:?}", path.as_ref()))?;
-        let config: Config = toml::from_str(&content)
+        Self::from_toml_str(&content)
+    }
+
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        let preprocessed = preprocess_unquoted_env_vars(content);
+        let mut config: Config = toml::from_str(&preprocessed)
             .with_context(|| "Failed to parse TOML configuration")?;
+        config.expand_and_apply_env_overrides();
         Ok(config)
+    }
+
+    pub fn expand_and_apply_env_overrides(&mut self) {
+        self.socket_path = expand_env_vars(&self.socket_path);
+        self.authoritative_backend = expand_env_vars(&self.authoritative_backend);
+        self.nfs_mount_path = expand_env_vars(&self.nfs_mount_path);
+        self.s3_endpoint = expand_env_vars(&self.s3_endpoint);
+        self.s3_region = expand_env_vars(&self.s3_region);
+        self.s3_bucket = expand_env_vars(&self.s3_bucket);
+        self.s3_access_key = expand_env_vars(&self.s3_access_key);
+        self.s3_secret_key = expand_env_vars(&self.s3_secret_key);
+        self.node_id = expand_env_vars(&self.node_id);
+        self.ram_cache_shm_path = expand_env_vars(&self.ram_cache_shm_path);
+        self.ram_cache_hugepages_path = expand_env_vars(&self.ram_cache_hugepages_path);
+        self.metadata_persistence_path = expand_env_vars(&self.metadata_persistence_path);
+
+        if let Some(ref url) = self.controller_url {
+            let expanded = expand_env_vars(url);
+            self.controller_url = if expanded.trim().is_empty() {
+                None
+            } else {
+                Some(expanded)
+            };
+        }
+        if let Some(ref addr) = self.node_address {
+            let expanded = expand_env_vars(addr);
+            self.node_address = if expanded.trim().is_empty() {
+                None
+            } else {
+                Some(expanded)
+            };
+        }
+        if let Some(ref token) = self.cluster_auth_token {
+            let expanded = expand_env_vars(token);
+            self.cluster_auth_token = if expanded.trim().is_empty() {
+                None
+            } else {
+                Some(expanded)
+            };
+        }
+
+        self.block_devices = self
+            .block_devices
+            .iter()
+            .map(|d| expand_env_vars(d))
+            .collect();
+        self.filesystem_cache_paths = self
+            .filesystem_cache_paths
+            .iter()
+            .map(|p| expand_env_vars(p))
+            .collect();
+
+        // Standard environment variable fallbacks when fields are empty or unset
+        if self.s3_access_key.is_empty() {
+            if let Ok(val) = std::env::var("AWS_ACCESS_KEY_ID").or_else(|_| std::env::var("S3_ACCESS_KEY")) {
+                if !val.trim().is_empty() {
+                    self.s3_access_key = val;
+                }
+            }
+        }
+        if self.s3_secret_key.is_empty() {
+            if let Ok(val) = std::env::var("AWS_SECRET_ACCESS_KEY").or_else(|_| std::env::var("S3_SECRET_KEY")) {
+                if !val.trim().is_empty() {
+                    self.s3_secret_key = val;
+                }
+            }
+        }
+        if self.s3_endpoint.is_empty() || self.s3_endpoint == default_s3_endpoint() {
+            if let Ok(val) = std::env::var("S3_ENDPOINT") {
+                if !val.trim().is_empty() {
+                    self.s3_endpoint = val;
+                }
+            }
+        }
+        if self.s3_region.is_empty() || self.s3_region == default_s3_region() {
+            if let Ok(val) = std::env::var("AWS_DEFAULT_REGION").or_else(|_| std::env::var("S3_REGION")) {
+                if !val.trim().is_empty() {
+                    self.s3_region = val;
+                }
+            }
+        }
+        if self.s3_bucket.is_empty() || self.s3_bucket == default_s3_bucket() {
+            if let Ok(val) = std::env::var("S3_BUCKET") {
+                if !val.trim().is_empty() {
+                    self.s3_bucket = val;
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("HYPERCACHE_SOCKET") {
+            if !val.trim().is_empty() {
+                self.socket_path = val;
+            }
+        }
+        if self.controller_url.is_none() {
+            if let Ok(val) = std::env::var("HYPERCACHE_CONTROLLER_URL") {
+                if !val.trim().is_empty() {
+                    self.controller_url = Some(val);
+                }
+            }
+        }
+        if self.cluster_auth_token.is_none() {
+            if let Ok(val) = std::env::var("HYPERCACHE_AUTH_TOKEN") {
+                if !val.trim().is_empty() {
+                    self.cluster_auth_token = Some(val);
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("RAM_CACHE_ENABLED") {
+            if val.eq_ignore_ascii_case("true") || val == "1" {
+                self.ram_cache_enabled = true;
+            }
+        }
+        if let Ok(val) = std::env::var("RAM_CAPACITY_BYTES") {
+            if let Ok(parsed) = val.trim().parse::<u64>() {
+                self.ram_cache_capacity_bytes = Some(parsed);
+            }
+        }
+    }
+}
+
+/// Converts unquoted `$VAR` or `${VAR}` values in TOML assignments (e.g., `s3_access_key = $six_deep_access`)
+/// into quoted TOML string literals (`s3_access_key = "$six_deep_access"`) prior to parsing.
+fn preprocess_unquoted_env_vars(content: &str) -> String {
+    let mut out = String::with_capacity(content.len() + 64);
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || !trimmed.contains('=') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if let Some((lhs, rhs)) = line.split_once('=') {
+            let rhs_trimmed = rhs.trim_start();
+            if rhs_trimmed.starts_with('$') {
+                // Separate value token from optional inline comment (# ...)
+                let (val_part, comment_part) = match rhs_trimmed.find('#') {
+                    Some(idx) => (&rhs_trimmed[..idx], Some(&rhs_trimmed[idx..])),
+                    None => (rhs_trimmed, None),
+                };
+                let token = val_part.trim();
+                if let Some( comment) = comment_part {
+                    out.push_str(&format!("{}= \"{}\" {}\n", lhs, token, comment));
+                } else {
+                    out.push_str(&format!("{}= \"{}\"\n", lhs, token));
+                }
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Expands `$VAR` and `${VAR}` references within a string using the current process environment.
+fn expand_env_vars(input: &str) -> String {
+    if !input.contains('$') {
+        return input.to_string();
+    }
+
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1] == '{' {
+                // ${VAR_NAME} syntax
+                if let Some(end_offset) = chars[i + 2..].iter().position(|&c| c == '}') {
+                    let var_name: String = chars[i + 2..i + 2 + end_offset].iter().collect();
+                    if !var_name.is_empty()
+                        && var_name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        match std::env::var(&var_name) {
+                            Ok(val) => result.push_str(&val),
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Environment variable '{}' referenced in config is not set (if running with sudo, use 'sudo -E' or export the variable)",
+                                    var_name
+                                );
+                            }
+                        }
+                        i += 2 + end_offset + 1;
+                        continue;
+                    }
+                }
+            } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
+                // $VAR_NAME syntax
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len()
+                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                let var_name: String = chars[start..end].iter().collect();
+                match std::env::var(&var_name) {
+                    Ok(val) => result.push_str(&val),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Environment variable '{}' referenced in config is not set (if running with sudo, use 'sudo -E' or export the variable)",
+                            var_name
+                        );
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toml_unquoted_and_quoted_env_var_expansion() {
+        std::env::set_var("hc_test_access_key", "AKIA_TEST_KEY_123");
+        std::env::set_var("hc_test_secret_key", "SECRET_VALUE_456");
+        std::env::set_var("hc_test_account", "acct99");
+
+        let toml_data = r#"
+s3_endpoint = "https://${hc_test_account}.r2.cloudflarestorage.com"
+s3_access_key = $hc_test_access_key # unquoted env var
+s3_secret_key = "$hc_test_secret_key"
+"#;
+
+        let cfg = Config::from_toml_str(toml_data).expect("should parse and expand env vars");
+        assert_eq!(cfg.s3_access_key, "AKIA_TEST_KEY_123");
+        assert_eq!(cfg.s3_secret_key, "SECRET_VALUE_456");
+        assert_eq!(
+            cfg.s3_endpoint,
+            "https://acct99.r2.cloudflarestorage.com"
+        );
+
+        std::env::remove_var("hc_test_access_key");
+        std::env::remove_var("hc_test_secret_key");
+        std::env::remove_var("hc_test_account");
     }
 }
