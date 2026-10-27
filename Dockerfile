@@ -1,7 +1,7 @@
 # ==============================================================================
 # Stage 1: Rust Release Builder (hypercache & hypercache-admin)
 # ==============================================================================
-FROM rust:1.82-bookworm AS rust-builder
+FROM rust:1-bookworm AS rust-builder
 
 WORKDIR /src/control-plane
 
