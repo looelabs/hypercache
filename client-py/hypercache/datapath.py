@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import mmap
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -97,28 +98,33 @@ class DirectBlockReader(DataReader):
 
     def __init__(self, max_workers: Optional[int] = None):
         self._fd_cache: Dict[str, Tuple[Optional[int], int]] = {}
+        self._lock = threading.Lock()
+        self._closed = False
         if max_workers is None:
             max_workers = min(64, max(16, (os.cpu_count() or 4) * 4))
         self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def _get_fds(self, device_path: str) -> Tuple[Optional[int], int]:
-        if device_path not in self._fd_cache:
-            try:
-                fd_buffered = os.open(device_path, os.O_RDONLY)
-            except OSError as e:
-                logger.error(f"Failed to open device {device_path}: {e}")
-                raise
-
-            fd_direct = None
-            if hasattr(os, "O_DIRECT"):
+        if device_path in self._fd_cache:
+            return self._fd_cache[device_path]
+        with self._lock:
+            if device_path not in self._fd_cache:
                 try:
-                    fd_direct = os.open(device_path, os.O_RDONLY | os.O_DIRECT)
-                except OSError:
-                    pass
+                    fd_buffered = os.open(device_path, os.O_RDONLY)
+                except OSError as e:
+                    logger.error(f"Failed to open device {device_path}: {e}")
+                    raise
 
-            self._fd_cache[device_path] = (fd_direct, fd_buffered)
-        return self._fd_cache[device_path]
+                fd_direct = None
+                if hasattr(os, "O_DIRECT"):
+                    try:
+                        fd_direct = os.open(device_path, os.O_RDONLY | os.O_DIRECT)
+                    except OSError:
+                        pass
+
+                self._fd_cache[device_path] = (fd_direct, fd_buffered)
+            return self._fd_cache[device_path]
 
     def read_range_into(
         self,
@@ -249,17 +255,19 @@ class DirectBlockReader(DataReader):
         return len(data)
 
     def close(self) -> None:
-        for fd_direct, fd_buffered in self._fd_cache.values():
-            if fd_direct is not None:
+        with self._lock:
+            self._closed = True
+            for fd_direct, fd_buffered in self._fd_cache.values():
+                if fd_direct is not None:
+                    try:
+                        os.close(fd_direct)
+                    except Exception:
+                        pass
                 try:
-                    os.close(fd_direct)
+                    os.close(fd_buffered)
                 except Exception:
                     pass
-            try:
-                os.close(fd_buffered)
-            except Exception:
-                pass
-        self._fd_cache.clear()
+            self._fd_cache.clear()
         self._executor.shutdown(wait=False)
 
 
@@ -353,16 +361,30 @@ class GDSReader(DataReader):
         self._fallback_reader.close()
 
 
+_SHARED_READERS: Dict[bool, DataReader] = {}
+_SHARED_READER_LOCK = threading.Lock()
+
+
 def get_data_reader(prefer_gds: bool = True) -> DataReader:
     """
-    Factory to return the optimal DataReader based on hardware environment.
+    Factory to return the optimal shared DataReader based on hardware environment.
+    Reuses open block-device file descriptors and DMA thread pools across requests.
     """
-    if prefer_gds and _KVIKIO_AVAILABLE and _CUDA_AVAILABLE:
-        try:
-            return GDSReader()
-        except Exception as e:
-            logger.warning(f"Failed to initialize GDSReader: {e}. Falling back to DirectBlockReader.")
-    return DirectBlockReader()
+    with _SHARED_READER_LOCK:
+        existing = _SHARED_READERS.get(prefer_gds)
+        if existing is not None and not getattr(existing, "_closed", False):
+            return existing
+
+        if prefer_gds and _KVIKIO_AVAILABLE and _CUDA_AVAILABLE:
+            try:
+                reader: DataReader = GDSReader()
+                _SHARED_READERS[prefer_gds] = reader
+                return reader
+            except Exception as e:
+                logger.warning(f"Failed to initialize GDSReader: {e}. Falling back to DirectBlockReader.")
+        reader = DirectBlockReader()
+        _SHARED_READERS[prefer_gds] = reader
+        return reader
 
 
 class DirectBlockWriter:

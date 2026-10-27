@@ -37,7 +37,7 @@ HyperCache provides host-based caching and acceleration for distributed AI train
 |  +---------------------------------------+  | |  +---------------------------------------+  |
 |  | HyperCache Worker Engine              |  | |  | HyperCache Worker Engine              |  |
 |  | - Moka W-TinyLFU Metadata in RAM      |  | |  | - Moka W-TinyLFU Metadata in RAM      |  |
-|  | - Striped Raw NVMe Pool (/dev/vdc...) |  | |  | - Striped Raw NVMe Pool (/dev/vdc...) |  |
+|  | - Striped Raw NVMe Pool (/dev/nvme*)  |  | |  | - Striped Raw NVMe Pool (/dev/nvme*)  |  |
 |  | - Direct Block DMA / GDS to GPU VRAM  |  | |  | - Direct Block DMA / GDS to GPU VRAM  |  |
 |  | - Prometheus Exporter (Port 9110)     |  | |  | - Prometheus Exporter (Port 9110)     |  |
 |  +---------------------------------------+  | |  +---------------------------------------+  |
@@ -51,8 +51,8 @@ HyperCache provides host-based caching and acceleration for distributed AI train
 Run on all machines (Controller and GPU worker nodes):
 
 ```bash
-git clone https://github.com/your-repo/hypercache-poc.git
-cd hypercache-poc
+git clone https://github.com/looelabs/hypercache.git
+cd hypercache
 
 # Build native Linux release binaries (produces ./hypercache and ./hypercache-admin)
 ./build.sh
@@ -129,9 +129,8 @@ s3_secret_key = "YOUR_SECRET_KEY"
 
 # NVMe Discovery & Striping
 device_discovery_mode = "auto"
-allow_virtual_drives = true
 include_partitions = true
-device_prefixes = ["nvme", "vd", "xvd", "sd"]
+device_prefixes = ["nvme", "sd"]
 exclude_root_device = true
 chunk_size_bytes = 4194304 # 4 MiB chunks
 
@@ -188,9 +187,9 @@ Fleet State: 8/8 Nodes Online | Aggregate Pool: 29.12 TiB | Active Footprint: 14
 ----------------------------------------------------------------------------------------------------
 NODE ID              | STATUS  | LABELS               | STRIPED NVMe DRIVES      |   CAPACITY | CACHED FOOTPRINT
 ----------------------------------------------------------------------------------------------------
-gpu-node-01          | ONLINE  | gpu=h100,pool=train  | /dev/vdc, /dev/vdd       |   3.64 TiB |   35.62 GiB (1 obj)
-gpu-node-02          | ONLINE  | gpu=h100,pool=train  | /dev/vdc, /dev/vdd       |   3.64 TiB |   35.62 GiB (1 obj)
-gpu-node-03          | ONLINE  | gpu=h100,pool=train  | /dev/vdc, /dev/vdd       |   3.64 TiB |   35.62 GiB (1 obj)
+gpu-node-01          | ONLINE  | gpu=h100,pool=train  | /dev/nvme1n1, /dev/nvme2n1 |   7.68 TiB |   35.62 GiB (1 obj)
+gpu-node-02          | ONLINE  | gpu=h100,pool=train  | /dev/nvme1n1, /dev/nvme2n1 |   7.68 TiB |   35.62 GiB (1 obj)
+gpu-node-03          | ONLINE  | gpu=h100,pool=train  | /dev/nvme1n1, /dev/nvme2n1 |   7.68 TiB |   35.62 GiB (1 obj)
 ...
 ====================================================================================================
 ```

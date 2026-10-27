@@ -91,9 +91,8 @@ $$\text{Theoretical Max NIC Throughput (GB/s)} = \frac{\text{NIC Bandwidth (Gbps
 
 | Data Path / Hardware Tier | Per-Device / Per-Link Theoretical Limit | Multi-Drive / Multi-Channel Node Throughput | Network Traffic Generated |
 | :--- | :--- | :--- | :--- |
-| **Remote S3 / Object Store (over 10 GbE)** | 1.25 GB/s wire limit | **~0.2 - 0.9 GB/s** (shared & rate-limited) | 100% over ToR switch |
-| **Remote Storage (over 25 GbE NIC)** | 3.12 GB/s wire limit | **~1.5 - 2.2 GB/s** (after TCP/TLS overhead) | 100% over ToR switch |
-| **Remote Storage (over 100 GbE NIC)** | 12.50 GB/s wire limit | **~8.5 - 10.5 GB/s** (contends with NCCL) | 100% over ToR switch |
+| **Shared Storage over 200GbE / 400GbE (Single Node Idle Fabric)** | 25 - 50 GB/s wire limit | **~15 - 35 GB/s** (uncontended) | 100% over fabric switches |
+| **Shared Storage over 200GbE / 400GbE (32+ Nodes Concurrent Load)** | Shared origin ceiling | **~1.5 - 4.0 GB/s per node** (divided across hosts & contends with NCCL) | 100% over fabric switches |
 | **HyperCache Tier 2: PCIe Gen 4 NVMe** | **~7.0 GB/s per NVMe SSD** | **~28 GB/s** (4x NVMe) / **~56 GB/s** (8x NVMe) | **0 Bytes (100% Local PCIe)** |
 | **HyperCache Tier 2: PCIe Gen 5 NVMe** | **~14.0 GB/s per NVMe SSD** | **~56 GB/s** (4x NVMe) / **~112 GB/s** (8x NVMe) | **0 Bytes (100% Local PCIe)** |
 | **HyperCache Tier 1: Host RAM (DDR5 / CXL)**| **50 - 100+ GB/s per stream** | **300 - 460+ GB/s** (8-12 channel DDR5 bus) | **0 Bytes (100% Memory Bus)** |
@@ -188,15 +187,17 @@ In production data centers, it is specifically designed to pool the high-density
 
 HyperCache compiles into two native, zero-dependency Rust executables (`./hypercache` and `./hypercache-admin`) plus a lightweight Python package (`client-py`).
 
-### Option A: Automated One-Step Install (`./install.sh`)
+### Option A: Automated One-Step Install (`install.sh`)
 
-The repository includes an automated bootstrapper that installs system build tools, the Rust toolchain (`cargo`), a Python virtual environment (`.venv`), the `hypercache` Python client, optional NVIDIA GPUDirect Storage (`kvikio`) bindings if a GPU is detected, and compiles the release binaries:
+The repository includes an automated bootstrapper that installs system build tools, clones the repository (if run standalone), installs the Rust toolchain (`cargo`), sets up a Python virtual environment (`.venv`) with the `hypercache` Python client and optional NVIDIA GPUDirect Storage (`kvikio`) bindings, and compiles the release binaries:
 
 ```bash
-git clone https://github.com/your-org/hypercache.git
-cd hypercache
+# One-liner bootstrap install:
+curl -fsSL https://hypercache.sh/install.sh | bash
 
-# Run full automated setup (Ubuntu, Debian, RHEL/Rocky, Arch, macOS)
+# Or clone and run locally:
+git clone https://github.com/looelabs/hypercache.git
+cd hypercache
 ./install.sh
 ```
 
@@ -220,8 +221,11 @@ cp control-plane/target/release/hypercache-admin ./hypercache-admin
 
 #### 2. Install the Python Data Plane & Integrations
 ```bash
-# Install into your active Python environment or virtualenv
+# Install from the local repo into your active Python environment or virtualenv
 pip install -e ./client-py
+
+# Or install directly from GitHub into any container / virtualenv
+pip install "git+https://github.com/looelabs/hypercache.git#subdirectory=client-py"
 
 # Optional: On NVIDIA GPU nodes, install GPUDirect Storage (cuFile / KvikIO) support
 pip install --extra-index-url https://pypi.nvidia.com kvikio-cu12 cupy-cuda12x
@@ -247,7 +251,7 @@ All HyperCache configuration files live in the [`configs/`](configs/) directory 
 HyperCache supports two ways to back your local NVMe cache pool depending on your environment:
 
 #### A. Raw Block Device Mode (`storage_backing_mode = "raw_block"` or `"auto"`)
-Best for **bare-metal GPU servers or Cloud VMs** with dedicated, unmounted local NVMe drives (e.g., `/dev/nvme1n1`, `/dev/nvme2n1`, `/dev/vdc`). HyperCache automatically discovers unmounted drives, excludes your OS root disk (`/`), and stripes 4 MiB chunks directly across raw disk sectors with zero filesystem overhead.
+Best for **bare-metal GPU servers or Cloud VMs** with dedicated, unmounted local NVMe drives (e.g., `/dev/nvme1n1`, `/dev/nvme2n1`). HyperCache automatically discovers unmounted drives, excludes your OS root disk (`/`), and stripes 4 MiB chunks directly across raw disk sectors with zero filesystem overhead.
 ```toml
 storage_backing_mode = "auto"
 device_discovery_mode = "auto" # Or set "manual" and block_devices = ["/dev/nvme1n1", "/dev/nvme2n1"]
@@ -274,9 +278,8 @@ Below is a complete annotated example of [`configs/hypercache-agent.toml`](confi
 # ==============================================================================
 storage_backing_mode = "auto"              # "auto", "raw_block", or "filesystem"
 device_discovery_mode = "auto"             # "auto" (scan /sys/class/block) or "manual"
-allow_virtual_drives = true                # Include cloud virtual NVMe disks (vd*, xvd*)
 include_partitions = true                  # Include unmounted partitions
-device_prefixes = ["nvme", "vd", "xvd", "sd"]
+device_prefixes = ["nvme", "sd"]
 exclude_root_device = true                 # Always protect OS root disk (/)
 chunk_size_bytes = 4194304                 # 4 MiB stripe chunk size
 device_start_offset_bytes = 4096           # 4 KB alignment safety margin

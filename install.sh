@@ -2,9 +2,16 @@
 # ==============================================================================
 # HyperCache Complete Environment Bootstrap & Installation Script
 # Supports: Ubuntu, Debian, RHEL, CentOS, Rocky Linux, Fedora, Arch, macOS
+# Usage:
+#   curl -fsSL https://hypercache.sh/install.sh | bash
+#   OR inside a cloned repo:
+#   ./install.sh
 # ==============================================================================
 
 set -euo pipefail
+
+REPO_URL="${HYPERCACHE_REPO_URL:-https://github.com/looelabs/hypercache.git}"
+INSTALL_DIR="${HYPERCACHE_INSTALL_DIR:-hypercache}"
 
 # ANSI Color Codes
 GREEN='\033[0;32m'
@@ -20,7 +27,7 @@ echo -e "${BOLD}${BLUE}=========================================================
 
 # Detect Sudo
 SUDO=""
-if [ "$EUID" -ne 0 ]; then
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
         SUDO="sudo"
     else
@@ -68,16 +75,36 @@ if [ "$NEED_SYSTEM_PKGS" = true ]; then
         echo -e "  -> Detected macOS with Homebrew."
         brew install pkg-config openssl python3
     else
-        echo -e "${YELLOW}  -> Unknown package manager. Please ensure gcc, pkg-config, openssl, and python3 are installed.${NC}"
+        echo -e "${YELLOW}  -> Unknown package manager. Please ensure gcc, git, pkg-config, openssl, and python3 are installed.${NC}"
     fi
 else
     echo -e "  -> All base build packages are available."
 fi
 
 # ------------------------------------------------------------------------------
-# 2. Install Rust Toolchain (if not present)
+# 2. Ensure HyperCache Repository is Present (Supports curl | bash)
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[2/5] Checking Rust toolchain...${NC}"
+echo -e "\n${BOLD}${GREEN}[2/6] Resolving HyperCache source repository...${NC}"
+
+if [ -f "control-plane/Cargo.toml" ] && [ -d "client-py" ]; then
+    echo -e "  -> Running inside existing HyperCache repository: $(pwd)"
+else
+    if [ -d "$INSTALL_DIR/.git" ] && [ -f "$INSTALL_DIR/control-plane/Cargo.toml" ]; then
+        echo -e "  -> Found existing './$INSTALL_DIR' directory. Pulling latest updates..."
+        cd "$INSTALL_DIR"
+        git pull --ff-only || true
+    else
+        echo -e "  -> Cloning HyperCache from $REPO_URL into ./$INSTALL_DIR..."
+        git clone "$REPO_URL" "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    fi
+    echo -e "  -> Working directory: $(pwd)"
+fi
+
+# ------------------------------------------------------------------------------
+# 3. Install Rust Toolchain (if not present)
+# ------------------------------------------------------------------------------
+echo -e "\n${BOLD}${GREEN}[3/6] Checking Rust toolchain...${NC}"
 
 if [ -f "$HOME/.cargo/env" ]; then
     # shellcheck source=/dev/null
@@ -110,9 +137,9 @@ fi
 echo -e "  -> Rust toolchain ready: $(cargo --version 2>/dev/null || echo "$HOME/.cargo/bin/cargo")"
 
 # ------------------------------------------------------------------------------
-# 3. Setup Python Virtual Environment (with self-healing and sanity check)
+# 4. Setup Python Virtual Environment & Install hypercache Python Client
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[3/5] Setting up Python virtual environment (.venv)...${NC}"
+echo -e "\n${BOLD}${GREEN}[4/6] Setting up Python virtual environment (.venv) & client-py...${NC}"
 
 PYTHON_BIN="python3"
 if ! command -v python3 >/dev/null 2>&1; then
@@ -155,7 +182,7 @@ if ! $VENV_PY -m pip --version >/dev/null 2>&1; then
     $VENV_PY -m ensurepip --upgrade 2>/dev/null || curl -sS https://bootstrap.pypa.io/get-pip.py | $VENV_PY
 fi
 
-echo -e "  -> Installing/updating HyperCache client package and dependencies..."
+echo -e "  -> Installing/updating HyperCache Python client package (client-py)..."
 $VENV_PY -m pip install -q --upgrade pip setuptools wheel numpy
 $VENV_PY -m pip install -q -e "./client-py[dev]"
 
@@ -173,40 +200,37 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     fi
 fi
 
-echo -e "  -> Python virtual environment (.venv) and dependencies ready."
+echo -e "  -> Python virtual environment (.venv) and hypercache client ready."
 
 # ------------------------------------------------------------------------------
-# 4. Compile Rust Control Plane Daemon
+# 5. Compile Rust Control Plane & Admin Binaries
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[4/5] Building HyperCache Control Plane Daemon (Rust Release)...${NC}"
+echo -e "\n${BOLD}${GREEN}[5/6] Building HyperCache Release Binaries (Rust)...${NC}"
 cargo build --release --manifest-path control-plane/Cargo.toml
 
-echo -e "  -> Control plane binary compiled successfully."
-
-# Copy hypercache binary to project root
 cp control-plane/target/release/hypercache ./hypercache
-chmod +x ./hypercache
-echo -e "  -> ${GREEN}Created standalone binary:${NC} ./hypercache"
+cp control-plane/target/release/hypercache-admin ./hypercache-admin
+chmod +x ./hypercache ./hypercache-admin
+echo -e "  -> ${GREEN}Compiled release binaries:${NC} ./hypercache and ./hypercache-admin"
 
 # Optionally install to /usr/local/bin
 if [ -w "/usr/local/bin" ] || [ -n "$SUDO" ]; then
     $SUDO cp ./hypercache /usr/local/bin/hypercache 2>/dev/null || true
-    echo -e "  -> Installed globally to ${GREEN}/usr/local/bin/hypercache${NC}"
+    $SUDO cp ./hypercache-admin /usr/local/bin/hypercache-admin 2>/dev/null || true
+    echo -e "  -> Installed globally to ${GREEN}/usr/local/bin/hypercache${NC} and ${GREEN}/usr/local/bin/hypercache-admin${NC}"
 fi
 
 # ------------------------------------------------------------------------------
-# 5. Storage Hardware & SSD Discovery Check
+# 6. Storage Hardware & NVMe Discovery Check
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[5/5] Inspecting host storage hardware & SSDs...${NC}"
+echo -e "\n${BOLD}${GREEN}[6/6] Inspecting host storage hardware & NVMe drives...${NC}"
 
 REAL_DRIVES_FOUND=false
 if [ -d "/sys/class/block" ]; then
-    echo -e "  -> Scanning for attached NVMe, VirtIO (/dev/vd*), and SSD devices..."
+    echo -e "  -> Scanning for attached NVMe (/dev/nvme*), VirtIO (/dev/vd*), and SSD (/dev/sd*) devices..."
     for dev_path in /sys/class/block/*; do
         dev_name=$(basename "$dev_path")
-        # Check matching prefixes: nvme, vd, xvd, sd
         if [[ "$dev_name" =~ ^(nvme|vd|xvd|sd) ]]; then
-            # Exclude loop, ram
             if [ -f "$dev_path/size" ]; then
                 sectors=$(cat "$dev_path/size" 2>/dev/null || echo 0)
                 if [ "$sectors" -gt 0 ]; then
@@ -223,31 +247,31 @@ if [ -d "/sys/class/block" ]; then
 fi
 
 if [ "$REAL_DRIVES_FOUND" = true ]; then
-    echo -e "  -> ${BOLD}${GREEN}Real hardware/virtual SSDs detected on this host!${NC}"
-    echo -e "     When you start the HyperCache daemon, it will automatically target"
-    echo -e "     your unmounted real SSDs (e.g. /dev/vdc, /dev/vdd, /dev/nvme*) for zero-copy striping."
+    echo -e "  -> ${BOLD}${GREEN}Local block devices detected on this host.${NC}"
+    echo -e "     HyperCache will automatically discover unmounted raw NVMe/SSD drives while excluding the OS root disk."
 else
-    echo -e "  -> No physical/virtual block drives found (dev/laptop environment). Provisioning fallback mock block devices..."
-    chmod +x scripts/setup_mock_devices.sh
-    ./scripts/setup_mock_devices.sh
+    echo -e "  -> ${YELLOW}No unmounted raw block drives detected yet.${NC}"
+    echo -e "     Ensure raw NVMe drives are attached (without a filesystem) or set storage_backing_mode = \"filesystem\" in configs/hypercache-agent.toml."
 fi
 
 echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-echo -e "${BOLD}${GREEN}         HYPERCACHE SINGLE BINARY READY!                         ${NC}"
+echo -e "${BOLD}${GREEN}         HYPERCACHE INSTALLATION COMPLETE                        ${NC}"
 echo -e "${BOLD}${GREEN}=================================================================${NC}"
 echo -e ""
-echo -e "You can now run HyperCache entirely through the single ${BOLD}./hypercache${NC} executable:"
+echo -e "Working Directory: ${BOLD}$(pwd)${NC}"
 echo -e ""
-echo -e "  ${BOLD}1. Start Cache Daemon & Prometheus Exporter:${NC}"
-echo -e "     ${GREEN}./hypercache start${NC}"
-echo -e "     ${YELLOW}• Prometheus Metrics: http://localhost:9110/metrics (Dedicated port to avoid collisions)${NC}"
+echo -e "  ${BOLD}1. Run Pre-Flight Host Diagnostics:${NC}"
+echo -e "     ${GREEN}./hypercache -c configs/hypercache-agent.toml check${NC}"
 echo -e ""
-echo -e "  ${BOLD}2. Run End-to-End Verification Benchmark:${NC}"
-echo -e "     ${GREEN}./hypercache bench --size-mb 5000${NC}"
+echo -e "  ${BOLD}2. Start Worker Node Daemon:${NC}"
+echo -e "     ${GREEN}./hypercache -c configs/hypercache-agent.toml start${NC}"
 echo -e ""
-echo -e "  ${BOLD}3. Inspect Storage Pool & Active Disks:${NC}"
+echo -e "  ${BOLD}3. Inspect Discovered NVMe Drives & NUMA Topology:${NC}"
 echo -e "     ${GREEN}./hypercache inspect${NC}"
 echo -e ""
-echo -e "  ${BOLD}4. Check Live Daemon Status:${NC}"
-echo -e "     ${GREEN}./hypercache status${NC}"
+echo -e "  ${BOLD}4. Run NVMe Hardware DMA Benchmark:${NC}"
+echo -e "     ${GREEN}./hypercache bench --tier nvme --size-mb 5000${NC}"
+echo -e ""
+echo -e "  ${BOLD}5. Install Python Client into Another Conda / Virtualenv (Optional):${NC}"
+echo -e "     ${GREEN}pip install -e $(pwd)/client-py${NC}"
 echo -e ""

@@ -8,7 +8,7 @@ Modern Large Language Model (LLM) and foundation model training and inference wo
 
 ### The Three AI Storage Bottlenecks:
 1. **Network Stack Latency & TTFB**: Remote S3 GET requests suffer from DNS resolution, TLS 1.3 handshake negotiation, TCP slow-start, and HTTP roundtrip overheads, resulting in Time-To-First-Byte (TTFB) latencies of **35 ms to 130 ms** per request.
-2. **Bandwidth Saturation & GPU Starvation**: High-density GPU nodes frequently saturate Top-of-Rack (ToR) network interfaces (10 GbE / 25 GbE) during cold model loads and multi-gigabyte checkpoint restoring, stalling GPU execution units and inflating idle operating costs.
+2. **Shared Storage Contention & GPU Starvation**: Even on 200GbE and 400GbE+ cluster fabrics, central storage bandwidth is shared across all nodes and GPUs pulling checkpoints simultaneously—saturating shared storage links, contending with inter-node NCCL traffic, and stalling GPU execution units.
 3. **Host CPU & Kernel Page Cache Pollution**: Traditional POSIX buffered I/O (`read()`, `fread()`) requires multiple memory copies (`kernel buffer -> page cache -> user buffer -> CUDA pinned host memory -> GPU VRAM`), consuming significant CPU cycles and displacing valuable system memory.
 
 ### The HyperCache Solution:
@@ -71,13 +71,13 @@ HyperCache dynamically scans the host system on startup without requiring manual
 
 ```
 /sys/class/block/
- ├── vda ── (Excluded: Root Mountpoint "/")
- ├── vdc ── (Accepted: Raw Block Device -> Capacity: 1.82 TiB)
- └── vdd ── (Accepted: Raw Block Device -> Capacity: 1.82 TiB)
+ ├── nvme0n1 ── (Excluded: Root Mountpoint "/")
+ ├── nvme1n1 ── (Accepted: Raw NVMe Device -> Capacity: 3.84 TiB)
+ └── nvme2n1 ── (Accepted: Raw NVMe Device -> Capacity: 3.84 TiB)
 ```
 
 #### Discovery Algorithm (`discovery.rs`):
-1. **Sysfs Traversal**: Iterates over all block devices in `/sys/class/block/` matching allowed drive prefixes (`nvme*`, `vd*`, `xvd*`, `sd*`).
+1. **Sysfs Traversal**: Iterates over all block devices in `/sys/class/block/` matching allowed drive prefixes (`nvme*`, `sd*`).
 2. **Root Device & Mount Exclusion**:
    - Parses `/proc/mounts` and `/sys/class/block/<dev>/holders` to identify the OS root mountpoint (`/`).
    - Resolves device major/minor numbers and unconditionally excludes the root drive and parent disks from the striping pool.
@@ -110,10 +110,10 @@ Communication between the Python Data Plane and the Rust Control Plane uses newl
   "object_size": 5242880000,
   "chunk_size": 4194304,
   "chunk_layout": [
-    { "chunk_index": 0, "device": "/dev/vdc", "offset": 4096, "length": 4194304 },
-    { "chunk_index": 1, "device": "/dev/vdd", "offset": 4096, "length": 4194304 },
-    { "chunk_index": 2, "device": "/dev/vdc", "offset": 4198400, "length": 4194304 },
-    { "chunk_index": 3, "device": "/dev/vdd", "offset": 4198400, "length": 4194304 }
+    { "chunk_index": 0, "device": "/dev/nvme1n1", "offset": 4096, "length": 4194304 },
+    { "chunk_index": 1, "device": "/dev/nvme2n1", "offset": 4096, "length": 4194304 },
+    { "chunk_index": 2, "device": "/dev/nvme1n1", "offset": 4198400, "length": 4194304 },
+    { "chunk_index": 3, "device": "/dev/nvme2n1", "offset": 4198400, "length": 4194304 }
   ]
 }
 ```
@@ -127,11 +127,11 @@ When an object is requested for the first time (`Cache MISS`), the Ingestion Eng
 ```
 Authoritative S3 Object (5.00 GB Payload)
   │
-  ├── Chunk 0 (4 MiB) ──► Target: /dev/vdc @ Offset 4096
-  ├── Chunk 1 (4 MiB) ──► Target: /dev/vdd @ Offset 4096
-  ├── Chunk 2 (4 MiB) ──► Target: /dev/vdc @ Offset 4198400
-  ├── Chunk 3 (4 MiB) ──► Target: /dev/vdd @ Offset 4198400
-  └── Chunk N (4 MiB) ──► Target: /dev/vd(N % Count) @ Offset ...
+  ├── Chunk 0 (4 MiB) ──► Target: /dev/nvme1n1 @ Offset 4096
+  ├── Chunk 1 (4 MiB) ──► Target: /dev/nvme2n1 @ Offset 4096
+  ├── Chunk 2 (4 MiB) ──► Target: /dev/nvme1n1 @ Offset 4198400
+  ├── Chunk 3 (4 MiB) ──► Target: /dev/nvme2n1 @ Offset 4198400
+  └── Chunk N (4 MiB) ──► Target: /dev/nvme(N % Count) @ Offset ...
 ```
 
 #### Striping Strategy (`striper.rs`):
@@ -172,8 +172,8 @@ In distributed training workflows, waiting for multi-gigabyte checkpoints to upl
                                           ▼                ▼
 ┌──────────────────────────────────────────────┐        ┌─────────────────────┐
 │          HYPERCACHE WORKER DAEMON            │        │ STRIPED NVMe POOL   │
-│  - StageWrite / Allocate Layout              │───┬───►│ /dev/vdc            │
-│  - CommitWrite / Status: COMMITTED           │   │    │ /dev/vdd            │
+│  - StageWrite / Allocate Layout              │───┬───►│ /dev/nvme1n1        │
+│  - CommitWrite / Status: COMMITTED           │   │    │ /dev/nvme2n1        │
 │  - Immediate Return (GPUs unblocked in 350ms)│   │    └──────────┬──────────┘
 └──────────────────────┬───────────────────────┘   │               │
                        │                           │               │ 3. Background Flush
@@ -181,7 +181,7 @@ In distributed training workflows, waiting for multi-gigabyte checkpoints to upl
                        ▼                           ▼               ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     BACKGROUND EGRESS WORKER POOL                           │
-│  - Reads striped chunks directly from /dev/vdc, /dev/vdd                    │
+│  - Reads striped chunks directly from /dev/nvme1n1, /dev/nvme2n1            │
 │  - Streams payload to Authoritative S3 (PutObject) or NFS (/mnt/nfs)        │
 │  - Updates metadata sync status to SYNCED_BACKEND                           │
 └──────────────────────────────────────┬──────────────────────────────────────┘
@@ -262,7 +262,7 @@ By shifting I/O from remote network links to local PCIe NVMe lanes and DDR5/CXL 
 
 | Storage Tier / Data Path | Per-Device / Per-Link Limit | Multi-Drive / Multi-Channel Node Throughput | Metadata / TTFB Latency |
 | :--- | :--- | :--- | :--- |
-| **Remote S3 / Object Store (10 GbE / 25 GbE)** | 1.25 – 3.12 GB/s wire limit | **~0.2 – 2.2 GB/s** (shared & rate-limited) | 35 – 130 ms |
+| **Shared Storage over 200GbE / 400GbE+ (Concurrent Multi-Node Load)** | 25 – 50+ GB/s wire limit (shared across nodes) | **~1.5 – 4.0 GB/s per node** (under cluster load) | 35 – 130 ms |
 | **Tier 2: PCIe Gen 4 NVMe Pool (`O_DIRECT` / GDS)** | **~7.0 GB/s per NVMe SSD** | **~28 GB/s** (4x NVMe) / **~56 GB/s** (8x NVMe) | **< 1 ms** |
 | **Tier 2: PCIe Gen 5 NVMe Pool (`O_DIRECT` / GDS)** | **~14.0 GB/s per NVMe SSD** | **~56 GB/s** (4x NVMe) / **~112 GB/s** (8x NVMe) | **< 1 ms** |
 | **Tier 1: Host RAM / POSIX SHM (DDR5 / CXL)** | **50 – 100+ GB/s per stream** | **300 – 460+ GB/s** (8–12 channel DDR5 bus) | **< 10 µs** |

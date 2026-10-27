@@ -255,6 +255,23 @@ class HyperCacheClient:
         })
         return resp.get("status") == "PONG"
 
+    def evict(self, uri: str) -> bool:
+        """Evicts a specific URI from the cache and reclaims its 4 MiB blocks."""
+        resp = self._send_request({
+            "action": "evict",
+            "uri": uri,
+        })
+        return resp.get("status") in ("EVICTED", "PONG", "OK")
+
+    def purge(self) -> bool:
+        """Purges all cached objects from the daemon and resets block allocators."""
+        resp = self._send_request({"action": "purge"})
+        return resp.get("status") in ("PURGED", "PONG", "OK")
+
+    def get_status(self) -> dict:
+        """Queries live daemon metrics and pool utilization."""
+        return self._send_request({"action": "get_status"})
+
     def stage_write(
         self,
         uri: str,

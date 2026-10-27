@@ -142,6 +142,10 @@ class HyperCacheFile(io.RawIOBase):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
+            try:
+                self.fs._client.close()
+            except Exception:
+                pass
             super().close()
 
     def __enter__(self) -> HyperCacheFile:
