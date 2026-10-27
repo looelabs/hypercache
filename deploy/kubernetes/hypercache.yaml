@@ -1,0 +1,244 @@
+# ==============================================================================
+# HyperCache Kubernetes Deployment Manifest (Controller + GPU Worker DaemonSet)
+# ==============================================================================
+# Deploy with:
+#   kubectl apply -f deploy/kubernetes/hypercache.yaml
+#
+# Architecture in Kubernetes:
+#   1. hypercache-controller (Deployment + Service on :9120):
+#      Maintains cluster topology, node health, and dispatches parallel preload,
+#      consistent-hashed dataset sharding, and P2P chunk distribution.
+#   2. hypercache-agent (DaemonSet on GPU Worker Nodes):
+#      Runs one agent pod per node, pooling local NVMe storage (via unprivileged
+#      O_DIRECT filesystem arenas or raw /dev block devices) and exposing the
+#      Unix Domain Socket (/run/hypercache/hypercache.sock) to training/inference
+#      pods on the same node via a shared hostPath volume.
+# ==============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hypercache-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hypercache-credentials
+  namespace: hypercache-system
+type: Opaque
+stringData:
+  HYPERCACHE_AUTH_TOKEN: "replace-with-your-cluster-auth-token"
+  AWS_ACCESS_KEY_ID: ""
+  AWS_SECRET_ACCESS_KEY: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hypercache-config
+  namespace: hypercache-system
+data:
+  hypercache-controller.toml: |
+    controller_bind_address = "0.0.0.0"
+    controller_port = 9120
+    cluster_auth_token = "$HYPERCACHE_AUTH_TOKEN"
+    p2p_preload_enabled = true
+
+  hypercache-agent.toml: |
+    socket_path = "/run/hypercache/hypercache.sock"
+
+    # Standard Kubernetes Mode: Direct I/O (O_DIRECT) Arena on Node-Local NVMe Mount
+    # (To use raw unmounted /dev/nvme* block devices instead, set storage_backing_mode = "raw_block"
+    # and uncomment the privileged /dev volumeMount in the DaemonSet below.)
+    storage_backing_mode = "filesystem"
+    filesystem_cache_paths = ["/var/cache/hypercache"]
+    filesystem_arena_size_bytes = 107374182400 # 100 GiB per node NVMe directory
+
+    chunk_size_bytes = 4194304
+    metadata_persistence_enabled = true
+    metadata_persistence_path = "/var/lib/hypercache/metadata.json"
+
+    # Authoritative S3 / Object Store Settings
+    authoritative_backend = "s3"
+    s3_endpoint = "https://s3.us-east-1.amazonaws.com"
+    s3_region = "us-east-1"
+    s3_bucket = "hypercache-authoritative"
+    s3_access_key = "$AWS_ACCESS_KEY_ID"
+    s3_secret_key = "$AWS_SECRET_ACCESS_KEY"
+
+    # Cluster Registration
+    controller_url = "http://hypercache-controller.hypercache-system.svc.cluster.local:9120"
+    cluster_auth_token = "$HYPERCACHE_AUTH_TOKEN"
+    agent_enabled = true
+    agent_bind_address = "0.0.0.0"
+    agent_http_port = 9115
+
+    # Prometheus Telemetry
+    metrics_enabled = true
+    metrics_bind_address = "0.0.0.0"
+    metrics_port = 9110
+---
+# ==============================================================================
+# 1. Central Cluster Controller (Deployment + ClusterIP Service)
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hypercache-controller
+  namespace: hypercache-system
+  labels:
+    app: hypercache-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hypercache-controller
+  template:
+    metadata:
+      labels:
+        app: hypercache-controller
+    spec:
+      containers:
+        - name: controller
+          image: ghcr.io/looelabs/hypercache:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/hypercache-admin"]
+          args: ["-c", "/etc/hypercache/hypercache-controller.toml", "controller"]
+          envFrom:
+            - secretRef:
+                name: hypercache-credentials
+          ports:
+            - name: controller-http
+              containerPort: 9120
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hypercache
+              readOnly: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: hypercache-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hypercache-controller
+  namespace: hypercache-system
+  labels:
+    app: hypercache-controller
+spec:
+  selector:
+    app: hypercache-controller
+  ports:
+    - name: http
+      port: 9120
+      targetPort: 9120
+      protocol: TCP
+---
+# ==============================================================================
+# 2. GPU Worker Node Agent (DaemonSet)
+# ==============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hypercache-agent
+  namespace: hypercache-system
+  labels:
+    app: hypercache-agent
+spec:
+  selector:
+    matchLabels:
+      app: hypercache-agent
+  template:
+    metadata:
+      labels:
+        app: hypercache-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9110"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Optional: Restrict DaemonSet to GPU worker nodes
+      # nodeSelector:
+      #   nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: ghcr.io/looelabs/hypercache:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/hypercache"]
+          args: ["-c", "/etc/hypercache/hypercache-agent.toml", "start", "--agent", "--metrics"]
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HYPERCACHE_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          envFrom:
+            - secretRef:
+                name: hypercache-credentials
+          # Uncomment securityContext below ONLY if using storage_backing_mode = "raw_block" on raw /dev/nvme* devices:
+          # securityContext:
+          #   privileged: true
+          ports:
+            - name: agent-api
+              containerPort: 9115
+              protocol: TCP
+            - name: metrics
+              containerPort: 9110
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hypercache
+              readOnly: true
+            - name: socket-dir
+              mountPath: /run/hypercache
+            - name: nvme-cache-dir
+              mountPath: /var/cache/hypercache
+            - name: metadata-dir
+              mountPath: /var/lib/hypercache
+            # Uncomment /dev mount below ONLY if using storage_backing_mode = "raw_block":
+            # - name: host-dev
+            #   mountPath: /dev
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: hypercache-config
+        - name: socket-dir
+          hostPath:
+            path: /run/hypercache
+            type: DirectoryOrCreate
+        - name: nvme-cache-dir
+          hostPath:
+            # Point this to the node's local NVMe mount (e.g., /mnt/nvme0/hypercache)
+            path: /var/cache/hypercache
+            type: DirectoryOrCreate
+        - name: metadata-dir
+          hostPath:
+            path: /var/lib/hypercache
+            type: DirectoryOrCreate
+        # Uncomment host-dev volume ONLY if using storage_backing_mode = "raw_block":
+        # - name: host-dev
+        #   hostPath:
+        #     path: /dev
+        #     type: Directory

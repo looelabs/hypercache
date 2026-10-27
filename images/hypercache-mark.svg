@@ -1,0 +1,20 @@
+<svg width="1024" height="1024" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="32" height="32" fill="#0A0B0D"/>
+  <g transform="translate(5.2, 3.2) skewX(-6)">
+    <!-- Row 1: Top pillars of the H -->
+    <rect x="2.5" y="3" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+    <rect x="15" y="3" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+
+    <!-- Row 2: Upper striped crossbar -->
+    <rect x="2.5" y="8.6" width="12" height="3" rx="0.6" fill="#67B7C7"/>
+    <rect x="16.5" y="8.6" width="5" height="3" rx="0.6" fill="#5BA88C"/>
+
+    <!-- Row 3: Lower striped crossbar -->
+    <rect x="2.5" y="14.2" width="5" height="3" rx="0.6" fill="#5BA88C"/>
+    <rect x="9.5" y="14.2" width="12" height="3" rx="0.6" fill="#67B7C7"/>
+
+    <!-- Row 4: Bottom pillars of the H -->
+    <rect x="2.5" y="19.8" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+    <rect x="15" y="19.8" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+  </g>
+</svg>

@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+venv
+ENV
+__pycache__
+*.pyc
+.pytest_cache
+control-plane/target
+/hypercache
+/hypercache-admin
+*.raw
+*.dat
+*.log
+.DS_Store

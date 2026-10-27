@@ -1,6 +1,6 @@
 # HyperCache: Host-Local Storage & Memory Acceleration for AI Workloads
 
-<img src="images/hypercache-logo.jpeg" alt="HyperCache Logo" width="400">
+<img src="images/hypercache-banner.png" alt="HyperCache Logo" width="800">
 
 > **Looking for operator cluster setup instructions?** See the **[Getting Started Guide](GETTING_STARTED.md)** for a step-by-step walkthrough.  
 > **Looking for deep systems internals?** See the **[Architecture Whitepaper](ARCHITECTURE.md)** for block layout, DMA mechanics, and subsystem design.
@@ -219,13 +219,13 @@ cp control-plane/target/release/hypercache-admin ./hypercache-admin
 * **`./hypercache` (Worker Node Daemon & Local CLI)**: Runs on each GPU/CPU compute node to manage local RAM and NVMe pools, serve local Python processes over Unix Domain Sockets, run host readiness checks, and export Prometheus metrics.
 * **`./hypercache-admin` (Cluster Controller & Fleet CLI)**: Runs on the Controller host (or operator terminal) to track cluster topology and dispatch fleet-wide preload, dataset sharding, eviction, and purge commands.
 
-#### 2. Install the Python Data Plane & Integrations
+#### 2. Install the Python Data Plane & Integrations (`hypercache-io`)
 ```bash
-# Install from the local repo into your active Python environment or virtualenv
-pip install -e ./client-py
+# Install from PyPI (imports as `import hypercache` in Python)
+pip install hypercache-io
 
-# Or install directly from GitHub into any container / virtualenv
-pip install "git+https://github.com/looelabs/hypercache.git#subdirectory=client-py"
+# Or install from the local repo into your active Python environment
+pip install -e ./client-py
 
 # Optional: On NVIDIA GPU nodes, install GPUDirect Storage (cuFile / KvikIO) support
 pip install --extra-index-url https://pypi.nvidia.com kvikio-cu12 cupy-cuda12x

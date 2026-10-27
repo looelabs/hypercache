@@ -1,0 +1,133 @@
+name: Release Binaries & Container Image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-linux-binaries:
+    name: Build Linux x86_64 Binaries
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "control-plane -> target"
+
+      - name: Run Rust unit test suite
+        run: cargo test --manifest-path control-plane/Cargo.toml
+
+      - name: Build release binaries (hypercache & hypercache-admin)
+        run: |
+          cargo build --release --manifest-path control-plane/Cargo.toml
+          strip control-plane/target/release/hypercache
+          strip control-plane/target/release/hypercache-admin
+
+      - name: Build Python wheel (client-py)
+        run: |
+          python3 -m pip install --upgrade pip build
+          python3 -m build --wheel client-py --outdir dist/
+
+      - name: Package release archive & checksums
+        run: |
+          mkdir -p dist/hypercache-linux-x86_64/configs
+          cp control-plane/target/release/hypercache dist/hypercache-linux-x86_64/
+          cp control-plane/target/release/hypercache-admin dist/hypercache-linux-x86_64/
+          cp configs/hypercache-agent.toml dist/hypercache-linux-x86_64/configs/
+          cp configs/hypercache-controller.toml dist/hypercache-linux-x86_64/configs/
+          cp -r client-py dist/hypercache-linux-x86_64/client-py
+          cp LICENSE README.md dist/hypercache-linux-x86_64/
+
+          # Create tarball and standalone binaries
+          tar -C dist/hypercache-linux-x86_64 -czf dist/hypercache-linux-x86_64.tar.gz .
+          cp control-plane/target/release/hypercache dist/hypercache-linux-x86_64-bin
+          cp control-plane/target/release/hypercache-admin dist/hypercache-admin-linux-x86_64-bin
+
+          cd dist
+          sha256sum hypercache-linux-x86_64.tar.gz hypercache-linux-x86_64-bin hypercache-admin-linux-x86_64-bin *.whl > SHA256SUMS
+
+      - name: Upload artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/hypercache-linux-x86_64.tar.gz
+            dist/hypercache-linux-x86_64-bin
+            dist/hypercache-admin-linux-x86_64-bin
+            dist/*.whl
+            dist/SHA256SUMS
+
+  publish-container-image:
+    name: Build & Push Docker Image (GHCR)
+    runs-on: ubuntu-22.04
+    needs: build-linux-binaries
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  publish-pypi:
+    name: Publish Python Package (hypercache-io) to PyPI
+    runs-on: ubuntu-22.04
+    needs: build-linux-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel for hypercache-io
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build client-py --outdir dist-pypi/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-pypi/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

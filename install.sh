@@ -102,44 +102,80 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Install Rust Toolchain (if not present)
+# 3. Install or Build HyperCache Binaries (Pre-built Release or Source Build)
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[3/6] Checking Rust toolchain...${NC}"
+echo -e "\n${BOLD}${GREEN}[3/6] Provisioning HyperCache Binaries (hypercache & hypercache-admin)...${NC}"
 
-if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck source=/dev/null
-    source "$HOME/.cargo/env"
+RELEASE_TARBALL_URL="https://github.com/looelabs/hypercache/releases/latest/download/hypercache-linux-x86_64.tar.gz"
+PREBUILT_INSTALLED=false
+
+if [ "${HYPERCACHE_BUILD_FROM_SOURCE:-0}" != "1" ] && [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+    echo -e "  -> Checking for pre-built Linux x86_64 release binaries on GitHub Releases..."
+    TMP_TAR=$(mktemp /tmp/hypercache-release-XXXXXX.tar.gz)
+    if curl -fsSL "$RELEASE_TARBALL_URL" -o "$TMP_TAR" 2>/dev/null; then
+        echo -e "  -> Downloading and extracting pre-built release binaries..."
+        TMP_EXTRACT=$(mktemp -d /tmp/hypercache-extract-XXXXXX)
+        if tar -xzf "$TMP_TAR" -C "$TMP_EXTRACT" 2>/dev/null && [ -f "$TMP_EXTRACT/hypercache" ] && [ -f "$TMP_EXTRACT/hypercache-admin" ]; then
+            cp "$TMP_EXTRACT/hypercache" ./hypercache
+            cp "$TMP_EXTRACT/hypercache-admin" ./hypercache-admin
+            chmod +x ./hypercache ./hypercache-admin
+            PREBUILT_INSTALLED=true
+            echo -e "  -> ${GREEN}Installed pre-built binaries:${NC} ./hypercache and ./hypercache-admin"
+        fi
+        rm -rf "$TMP_EXTRACT"
+    fi
+    rm -f "$TMP_TAR"
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo -e "  -> Rust not found in current PATH. Installing via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    export PATH="$HOME/.cargo/bin:$PATH"
+if [ "$PREBUILT_INSTALLED" = false ]; then
+    echo -e "  -> Building native release binaries from Rust source..."
     if [ -f "$HOME/.cargo/env" ]; then
         # shellcheck source=/dev/null
         source "$HOME/.cargo/env"
     fi
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo -e "  -> Rust not found in current PATH. Installing via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        export PATH="$HOME/.cargo/bin:$PATH"
+        if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck source=/dev/null
+            source "$HOME/.cargo/env"
+        fi
+    fi
+
+    # Ensure ~/.bashrc has cargo env
+    if [ -f "$HOME/.bashrc" ] && ! grep -q ".cargo/env" "$HOME/.bashrc" 2>/dev/null; then
+        echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$HOME/.bashrc"
+        echo '[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"' >> "$HOME/.bashrc"
+    fi
+
+    if [ -d "$HOME/.cargo/bin" ]; then
+        $SUDO ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo 2>/dev/null || true
+        $SUDO ln -sf "$HOME/.cargo/bin/rustc" /usr/local/bin/rustc 2>/dev/null || true
+        $SUDO ln -sf "$HOME/.cargo/bin/rustup" /usr/local/bin/rustup 2>/dev/null || true
+    fi
+
+    echo -e "  -> Rust toolchain ready: $(cargo --version 2>/dev/null || echo "$HOME/.cargo/bin/cargo")"
+    cargo build --release --manifest-path control-plane/Cargo.toml
+
+    cp control-plane/target/release/hypercache ./hypercache
+    cp control-plane/target/release/hypercache-admin ./hypercache-admin
+    chmod +x ./hypercache ./hypercache-admin
+    echo -e "  -> ${GREEN}Compiled release binaries:${NC} ./hypercache and ./hypercache-admin"
 fi
 
-# Ensure ~/.bashrc and ~/.profile have cargo env
-if [ -f "$HOME/.bashrc" ] && ! grep -q ".cargo/env" "$HOME/.bashrc" 2>/dev/null; then
-    echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$HOME/.bashrc"
-    echo '[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"' >> "$HOME/.bashrc"
+# Optionally install to /usr/local/bin
+if [ -w "/usr/local/bin" ] || [ -n "$SUDO" ]; then
+    $SUDO cp ./hypercache /usr/local/bin/hypercache 2>/dev/null || true
+    $SUDO cp ./hypercache-admin /usr/local/bin/hypercache-admin 2>/dev/null || true
+    echo -e "  -> Installed globally to ${GREEN}/usr/local/bin/hypercache${NC} and ${GREEN}/usr/local/bin/hypercache-admin${NC}"
 fi
-
-# Symlink cargo and rustc into /usr/local/bin so it is immediately available in all shells
-if [ -d "$HOME/.cargo/bin" ]; then
-    $SUDO ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo 2>/dev/null || true
-    $SUDO ln -sf "$HOME/.cargo/bin/rustc" /usr/local/bin/rustc 2>/dev/null || true
-    $SUDO ln -sf "$HOME/.cargo/bin/rustup" /usr/local/bin/rustup 2>/dev/null || true
-fi
-
-echo -e "  -> Rust toolchain ready: $(cargo --version 2>/dev/null || echo "$HOME/.cargo/bin/cargo")"
 
 # ------------------------------------------------------------------------------
 # 4. Setup Python Virtual Environment & Install hypercache Python Client
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[4/6] Setting up Python virtual environment (.venv) & client-py...${NC}"
+echo -e "\n${BOLD}${GREEN}[4/5] Setting up Python virtual environment (.venv) & client-py...${NC}"
 
 PYTHON_BIN="python3"
 if ! command -v python3 >/dev/null 2>&1; then
@@ -203,27 +239,9 @@ fi
 echo -e "  -> Python virtual environment (.venv) and hypercache client ready."
 
 # ------------------------------------------------------------------------------
-# 5. Compile Rust Control Plane & Admin Binaries
+# 5. Storage Hardware & NVMe Discovery Check
 # ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[5/6] Building HyperCache Release Binaries (Rust)...${NC}"
-cargo build --release --manifest-path control-plane/Cargo.toml
-
-cp control-plane/target/release/hypercache ./hypercache
-cp control-plane/target/release/hypercache-admin ./hypercache-admin
-chmod +x ./hypercache ./hypercache-admin
-echo -e "  -> ${GREEN}Compiled release binaries:${NC} ./hypercache and ./hypercache-admin"
-
-# Optionally install to /usr/local/bin
-if [ -w "/usr/local/bin" ] || [ -n "$SUDO" ]; then
-    $SUDO cp ./hypercache /usr/local/bin/hypercache 2>/dev/null || true
-    $SUDO cp ./hypercache-admin /usr/local/bin/hypercache-admin 2>/dev/null || true
-    echo -e "  -> Installed globally to ${GREEN}/usr/local/bin/hypercache${NC} and ${GREEN}/usr/local/bin/hypercache-admin${NC}"
-fi
-
-# ------------------------------------------------------------------------------
-# 6. Storage Hardware & NVMe Discovery Check
-# ------------------------------------------------------------------------------
-echo -e "\n${BOLD}${GREEN}[6/6] Inspecting host storage hardware & NVMe drives...${NC}"
+echo -e "\n${BOLD}${GREEN}[5/5] Inspecting host storage hardware & NVMe drives...${NC}"
 
 REAL_DRIVES_FOUND=false
 if [ -d "/sys/class/block" ]; then

@@ -1,0 +1,15 @@
+<svg width="640" height="320" viewBox="0 0 640 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="320" fill="#0A0B0D"/>
+  <g transform="translate(115, 108) scale(3.2) skewX(-6)">
+    <rect x="2.5" y="3" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+    <rect x="15" y="3" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+    <rect x="2.5" y="8.6" width="12" height="3" rx="0.6" fill="#67B7C7"/>
+    <rect x="16.5" y="8.6" width="5" height="3" rx="0.6" fill="#5BA88C"/>
+    <rect x="2.5" y="14.2" width="5" height="3" rx="0.6" fill="#5BA88C"/>
+    <rect x="9.5" y="14.2" width="12" height="3" rx="0.6" fill="#67B7C7"/>
+    <rect x="2.5" y="19.8" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+    <rect x="15" y="19.8" width="6.5" height="3" rx="0.6" fill="#EDEDEF"/>
+  </g>
+  <text x="218" y="166" fill="#EDEDEF" font-family="'JetBrains Mono', 'SF Mono', Menlo, monospace" font-size="48" font-weight="500" letter-spacing="-1">hypercache</text>
+  <text x="220" y="198" fill="#9498A1" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="14.5" font-weight="400">Host-local NVMe &amp; RAM cache for AI clusters</text>
+</svg>

@@ -1,18 +1,43 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hypercache"
-version = "0.9.0b1"
-description = "HyperCache: Host-Based Zero-Copy GPUDirect Storage Cache for AI Models"
+name = "hypercache-io"
+version = "0.9.0"
+description = "HyperCache: Host-Local NVMe Caching and Zero-Copy Direct Block DMA / GPUDirect Storage Acceleration for AI Workloads"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
+authors = [
+    { name = "Looe Labs" }
+]
+keywords = ["ai", "pytorch", "safetensors", "vllm", "nvme", "gpudirect", "cache", "s3", "fsspec"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Filesystems",
+]
 dependencies = [
     "fsspec>=2023.1.0",
     "numpy>=1.22.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/looelabs/hypercache"
+Repository = "https://github.com/looelabs/hypercache"
+Issues = "https://github.com/looelabs/hypercache/issues"
 
 [project.optional-dependencies]
 gpu = [
@@ -32,3 +57,7 @@ dev = [
 
 [project.entry-points."fsspec.specs"]
 hypercache = "hypercache.fsspec_fs:HyperCacheFileSystem"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hypercache*"]

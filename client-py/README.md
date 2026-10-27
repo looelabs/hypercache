@@ -16,11 +16,15 @@ The `hypercache` Python package integrates transparently into AI training and in
 ## Installation
 
 ```bash
+# Install from PyPI (imports as `import hypercache`)
+pip install hypercache-io
+
+# Or install in editable mode from the repository
 cd client-py
 pip install -e .
 
 # Optional GPU Direct Storage acceleration dependencies
-pip install -e ".[gpu]"
+pip install "hypercache-io[gpu]" --extra-index-url https://pypi.nvidia.com
 ```
 
 ---
