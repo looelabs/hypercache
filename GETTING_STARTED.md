@@ -245,8 +245,12 @@ Run directly on any individual GPU worker node:
 
 ## 6. PyTorch Integration
 
-Install the Python client on GPU worker nodes:
+Install the Python client (`hypercache-io`) on your GPU worker nodes or inside your training/inference containers:
 ```bash
+# Install from PyPI (exposes `import hypercache` in Python)
+pip install hypercache-io
+
+# Or install from the local repository
 pip install -e ./client-py
 ```
 

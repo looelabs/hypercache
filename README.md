@@ -228,7 +228,22 @@ pip install hypercache-io
 pip install -e ./client-py
 
 # Optional: On NVIDIA GPU nodes, install GPUDirect Storage (cuFile / KvikIO) support
-pip install --extra-index-url https://pypi.nvidia.com kvikio-cu12 cupy-cuda12x
+pip install "hypercache-io[gpu]" --extra-index-url https://pypi.nvidia.com
+```
+
+### Option C: Pre-Built Release Binaries, Docker & Kubernetes
+
+If you only want the pre-compiled Linux binaries + the PyPI Python library (or are deploying on Kubernetes):
+
+```bash
+# 1. Download pre-built Linux x86_64 binaries (hypercache & hypercache-admin)
+curl -fsSL https://github.com/looelabs/hypercache/releases/latest/download/hypercache-linux-x86_64.tar.gz | tar -xz
+
+# 2. Install the Python library into your PyTorch / vLLM environment from PyPI
+pip install hypercache-io
+
+# 3. Or deploy the Controller + GPU Worker DaemonSet on Kubernetes
+kubectl apply -f deploy/kubernetes/hypercache.yaml
 ```
 
 ---
@@ -482,6 +497,8 @@ HyperCache routes requests automatically based on the URI scheme passed to Pytho
 ---
 
 ## Python & PyTorch Integration Examples
+
+Install the Python package from PyPI (`pip install hypercache-io`) into your training or inference environment. It exposes the `hypercache` module (`import hypercache`).
 
 ### 1. Drop-In PyTorch Model Loading (`torch.load`)
 
