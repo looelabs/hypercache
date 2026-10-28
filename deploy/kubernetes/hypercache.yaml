@@ -42,6 +42,9 @@ data:
     controller_port = 9120
     cluster_auth_token = "$HYPERCACHE_AUTH_TOKEN"
     p2p_preload_enabled = true
+    # In Kubernetes, sidecar proxies and `kubectl port-forward` deliver remote traffic from
+    # 127.0.0.1, so the zero-config loopback bypass must be off: every call needs the token.
+    allow_local_admin_bypass = false
 
   hypercache-agent.toml: |
     socket_path = "/run/hypercache/hypercache.sock"
@@ -64,6 +67,13 @@ data:
     s3_bucket = "hypercache-authoritative"
     s3_access_key = "$AWS_ACCESS_KEY_ID"
     s3_secret_key = "$AWS_SECRET_ACCESS_KEY"
+    # Prefer short-lived credentials (IRSA / EKS Pod Identity): leave the static keys empty in
+    # the Secret and the AWS_SESSION_TOKEN env var injected by the platform is used automatically.
+    s3_parallel_streams = 8
+
+    # file:// / nfs:// URIs are confined to nfs_mount_path and nfs_allowed_paths
+    # nfs_mount_path = "/mnt/nfs"
+    # nfs_allowed_paths = ["/mnt/datasets"]
 
     # Cluster Registration
     controller_url = "http://hypercache-controller.hypercache-system.svc.cluster.local:9120"
@@ -242,3 +252,36 @@ spec:
         #   hostPath:
         #     path: /dev
         #     type: Directory
+---
+# ==============================================================================
+# 3. Network isolation for the Agent Fleet API
+# ==============================================================================
+# The agent API (:9115) can purge the cache and write replicas to local NVMe. Only the
+# controller (fleet dispatch) and other agents (P2P chunk pulls, checkpoint replicas) may
+# reach it. Metrics (:9110) stay reachable for in-cluster Prometheus scraping.
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, AWS VPC CNI with policies, ...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hypercache-agent-api
+  namespace: hypercache-system
+spec:
+  podSelector:
+    matchLabels:
+      app: hypercache-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: hypercache-controller
+        - podSelector:
+            matchLabels:
+              app: hypercache-agent
+      ports:
+        - protocol: TCP
+          port: 9115
+    - ports:
+        - protocol: TCP
+          port: 9110

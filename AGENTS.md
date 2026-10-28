@@ -47,6 +47,8 @@ When modifying or extending this codebase, you **MUST** adhere to the following 
 ```
 hypercache-poc/
 ├── AGENTS.md                   # This AI contributor and developer guide
+├── CLAUDE.md                   # Claude Code entry point; imports this file
+├── CHANGELOG.md                # Release notes per version
 ├── README.md                   # Public project README and architectural summary
 ├── GETTING_STARTED.md          # Operator quickstart and cluster setup walkthrough
 ├── ARCHITECTURE.md             # In-depth systems design document
@@ -59,28 +61,41 @@ hypercache-poc/
 │   └── grafana/                # Grafana provisioning & dashboard templates
 │
 ├── control-plane/              # High-performance Rust control plane & CLI suite
-│   ├── Cargo.toml              # Dependencies: tokio, axum, moka, reqwest, tower, clap, serde
+│   ├── Cargo.toml              # Dependencies: tokio, axum, moka, reqwest, tower, clap, serde, crc32fast
+│   ├── Cargo.lock              # Committed: binaries need reproducible (--locked) builds
+│   ├── rustfmt.toml            # max_width = 120; CI enforces cargo fmt --check
 │   ├── src/
-│   │   ├── lib.rs              # Library crate root exposing internal modules
+│   │   ├── lib.rs              # Library crate root; both binaries build on it
 │   │   ├── main.rs             # Binary: ./hypercache (Worker Node Daemon & Local CLI)
 │   │   ├── bin/
 │   │   │   └── admin.rs        # Binary: ./hypercache-admin (Cluster Administration Suite)
 │   │   ├── config.rs           # Strongly typed configuration structs and TOML loader
-│   │   ├── protocol.rs         # Binary/JSON IPC wire protocol over Unix Domain Socket
-│   │   ├── server.rs           # Unix Domain Socket server listener & request dispatcher
+│   │   ├── protocol.rs         # JSON-lines IPC wire protocol over Unix Domain Socket (SyncStatus, ChunkDescriptor)
+│   │   ├── server.rs           # UDS server (bounded requests), commit/sha256 verification, write-back retry & recovery
+│   │   ├── auth.rs             # Constant-time Bearer token validation shared by controller and agent
 │   │   ├── telemetry.rs        # Prometheus metrics collector and optional HTTP exporter
-│   │   ├── agent_server.rs     # Worker Node Agent HTTP server (port 9115) & heartbeat loop
+│   │   ├── agent_server.rs     # Worker Node Agent HTTP server (port 9115), streaming P2P/replica, heartbeat loop
 │   │   ├── fleet.rs            # CLI client functions for fleet administration commands
-│   │   ├── controller/         # Central Cluster Controller & Fleet Coordinator module
-│   │   │   └── mod.rs          # FleetRegistry, network security, and parallel dispatch handlers
-│   │   ├── discovery/          # Raw block device discovery & safety exclusion engine
-│   │   │   └── mod.rs          # Probes /dev, parses sysfs, excludes OS root and mounted FS
-│   │   ├── metadata/           # Cache metadata store & NVMe persistence engine
-│   │   │   └── mod.rs          # Moka W-TinyLFU cache, memory weighing, atomic JSON manifest
-│   │   └── ingestion/          # Multi-backend data ingestion & NVMe striping engine
-│   │       ├── mod.rs          # Stream router, chunk striping across drives
-│   │       ├── s3.rs           # Streaming S3 client with parallel chunk writes
-│   │       └── nfs.rs          # Zero-copy POSIX / NFS file reader
+│   │   ├── bench.rs            # `hypercache bench` end-to-end benchmark (explicit synthetic opt-in)
+│   │   ├── check.rs            # `hypercache check` pre-flight host readiness checks
+│   │   ├── discovery.rs        # Raw block device discovery & safety exclusion engine
+│   │   ├── metadata.rs         # Moka W-TinyLFU cache, extent allocator + quarantine, generations, manifest writer
+│   │   ├── ram.rs              # Tier 1 POSIX shared memory (/dev/shm) chunk pool
+│   │   ├── controller/
+│   │   │   └── mod.rs          # FleetRegistry, strict node targeting, network security, parallel dispatch
+│   │   └── ingestion/
+│   │       ├── mod.rs          # Backend router, single-flight ingest, digest, write-back flush
+│   │       ├── striper.rs      # Chunk striping across devices with rollback, CRC32 and fdatasync
+│   │       ├── s3.rs           # SigV4 S3 client: parallel ranged GET, multipart upload, ListObjectsV2
+│   │       ├── nfs.rs          # POSIX / NFS reader with path confinement (nfs_allowed_paths)
+│   │       └── synthetic.rs    # Synthetic benchmark payloads (opt-in only)
+│   └── tests/
+│       └── s3_live.rs          # #[ignore]d live S3 tests (run by scripts/verify_release.sh)
+│
+├── scripts/
+│   ├── verify_release.sh       # Release verification harness (static, rust, python, e2e, s3, linux, image)
+│   ├── e2e/hypercache_e2e.py   # End-to-end daemon / fleet / S3 scenarios against the real binaries
+│   └── setup_mock_devices.sh   # Creates sparse mock block device files in /tmp
 │
 └── client-py/                  # Zero-copy Python AI client & framework integration
     ├── pyproject.toml          # Python package specification
@@ -98,7 +113,8 @@ hypercache-poc/
         ├── test_client.py      # Unit tests for UDS protocol and client metadata parsing
         ├── test_fsspec.py      # Unit tests for fsspec file operations and streaming writes
         ├── test_integrations_and_kv.py # Unit tests for Safetensors/vLLM, DCP, and KV-Cache store
-        └── test_pipelined_and_numa.py  # Unit tests for pipelined DMA and NUMA affinity
+        ├── test_pipelined_and_numa.py  # Unit tests for pipelined DMA and NUMA affinity
+        └── test_robustness.py  # Thread/fork safety, framing, O_DIRECT bounce buffers, CRC verification
 ```
 
 ---
@@ -151,11 +167,16 @@ hypercache-poc/
 
 1. **Local Loopback Zero-Config**:
    - Connections originating from `127.0.0.1` / `::1` or the Controller host's bound IP bypass authentication, granting instant access to `./hypercache-admin` on the Controller node.
+   - Controlled by `allow_local_admin_bypass` (default `true`). It must be `false` wherever a local proxy (K8s sidecar, nginx, `kubectl port-forward`) can forward remote traffic; the bundled K8s manifest sets it to `false`.
 2. **Cluster Security Token (`cluster_auth_token` / `HYPERCACHE_AUTH_TOKEN`)**:
    - When set, all remote network calls between the Controller and Worker Agents require `Authorization: Bearer <token>`.
    - Node registrations with missing or invalid tokens are rejected with `HTTP 401 Unauthorized`.
 3. **Zero-Exposure Default Configuration**:
    - Single-node worker runs with `metrics_enabled = false` and `agent_enabled = false`, exposing no network ports.
+   - The agent API refuses to bind a non-loopback address without `cluster_auth_token`.
+4. **Local Data Access Confinement**:
+   - `file://` / `nfs://` URIs are confined to `nfs_mount_path` and `nfs_allowed_paths` (canonicalized; `..` and symlink escapes rejected).
+   - Synthetic data is never served unless `allow_synthetic_s3_fallback = true` or a request explicitly opts in for a `hypercache://models/benchmark/` URI.
 
 ---
 
@@ -176,13 +197,20 @@ cp control-plane/target/release/hypercache-admin ./hypercache-admin
 ```bash
 cargo test --manifest-path control-plane/Cargo.toml
 ```
-*Expected: All unit and integration tests pass (15+ tests covering metadata, persistence, ingestion, RAM memory pool, discovery, network isolation, and controller security).*
+*Expected: All unit and integration tests pass (70+ tests covering metadata, allocator, persistence, ingestion, RAM memory pool, discovery, auth, agent and controller security). The live S3 tests in `tests/s3_live.rs` are `#[ignore]`d and run by the verification harness.*
 
 ### Running Python Test Suite
 ```bash
 .venv/bin/pytest client-py/tests
 ```
-*Expected: All 10 client and fsspec tests pass.*
+*Expected: All 32 client, datapath, fsspec and integration tests pass.*
+
+### Running the Release Verification Harness
+```bash
+scripts/verify_release.sh            # static, rust, python, e2e, s3, linux, image
+scripts/verify_release.sh --quick    # static, rust, python
+```
+*Expected: `RESULT: PASSED`. Docker-based stages (s3, linux, image) are skipped with a notice when Docker is unavailable. Run the full harness before tagging a release.*
 
 ### Running Local Benchmark Verification
 ```bash
@@ -199,7 +227,61 @@ kill $DAEMON_PID
 
 ---
 
-## 7. Master Configuration Reference (`configs/hypercache-agent.toml` & `configs/hypercache-controller.toml`)
+## 7. Working on the Codebase: Invariants, Pitfalls & Workflows
+
+### A. Data-Path Invariants (do not break these)
+- **Never return freed extents straight to the free pool.** Evicted or replaced chunks go to the quarantine in `metadata.rs` and are reusable only after `reclaim_grace_secs`. Readers resolve a layout over IPC and then read raw offsets with no lock, so early reuse makes them silently read another object's bytes.
+- **Every layout mutation bumps `generation`.** `locate` returns it. Write-back status updates must go through `update_sync_status_if_generation` with the generation they were started for, so an old flush cannot mark a newer commit as synced.
+- **Go through single-flight ingest.** Any code path that may ingest a URI (UDS `locate`/`ingest`/`preload`, agent preload, batch) must call `IngestionEngine::get_or_ingest` / `ingest_object_full`, never a backend fetch directly.
+- **Durable before visible.** Chunk data is `fdatasync`ed and its CRC32 recorded before `save_layout` publishes it. Do not publish a layout that points at unsynced data.
+- **One manifest writer.** Mutations signal the coalescing writer in `metadata.rs`. Do not write `metadata.json` from anywhere else. `atomic_write` (unique tmp, fsync, rename, dir fsync) is the only correct way to replace it.
+- **Dirty objects are never evictable.** `COMMITTED`, `SYNCING_BACKEND` and `SYNC_FAILED` weigh 0 for eviction. `resume_pending_writebacks` re-queues them at boot. A new `SyncStatus` variant must be classified in `SyncStatus::is_dirty` (`protocol.rs`).
+- **Allocations roll back on failure.** If striping fails partway, every extent allocated in that call is returned.
+
+### B. Compatibility Rules in Practice
+- New fields on IPC or manifest structs (`ChunkDescriptor`, `StoredMetadata`, `Response`) must be `Option` or `#[serde(default)]`. Manifests and Python clients from 0.9.0 must keep loading.
+- Enums on the wire use `#[serde(rename = "...")]` with the existing strings (`"ONLINE"`, `"SYNC_FAILED"`, ...). Do not rename them.
+- Add new TOML keys with defaults. Never rename or remove a key. Document each new key in `configs/*.toml` and in the table in section 8.
+- The Python client must keep working against an older daemon. Treat missing response fields as optional.
+
+### C. Platform Pitfalls
+- **macOS hosts do not compile the Linux-only code** (`#[cfg(target_os = "linux")]`: sysfs discovery, O_DIRECT, `fdatasync` paths). Clippy and test failures there show up only on Linux. Run `scripts/verify_release.sh --stages linux` (Docker) before calling a change done.
+- **Clippy depends on the toolchain.** CI uses current stable. A local toolchain that is a few releases behind may miss new lints, so run `rustup update` if CI clippy fails but local clippy passes.
+- **Containers expose host disks in sysfs without `/dev` nodes.** Discovery must skip them (it logs at debug). Do not turn that case into an error.
+- **Agents bound to loopback or `0.0.0.0` advertise an unusable address.** The controller dials them through `resolve_agent_address` (falls back to the registration source IP, IPv6 bracketed). Use it for every new dispatch path.
+- **Use `HYPERCACHE_SOCKET_PATH` to isolate test daemons.** It moves the socket and lock file for the daemon, the CLI and the Python client, so tests never touch `/run/hypercache` or another running daemon.
+- **MinIO images are no longer pullable.** The live S3 tests use `versity/versitygw:v1.10.0`. `server_enforces_signatures` proves the server really checks SigV4. Keep it, or signing bugs pass silently.
+- **Do not edit `scripts/verify_release.sh` while it is running.** Bash reads the script incrementally, and an edit mid-run causes bogus syntax errors.
+- **The zero-emoji scanner checks itself.** Write emoji code point ranges as integers (`chr(0x1F300)`), never as literal characters or `\u` escapes that a tool might decode.
+- **Docker buildx on macOS** can fail with a permission error on `~/.docker/buildx`. Run the image stage with `BUILDX_CONFIG=$(mktemp -d)` instead of changing the user's Docker config.
+
+### D. Where Tests Go
+| Change | Add a test in |
+| :--- | :--- |
+| Pure logic (allocator, selectors, auth, config parsing) | `#[cfg(test)]` module in the same `.rs` file |
+| IPC behavior (request handling, commit, write-back) | `server.rs` tests (they run a real UDS round trip) |
+| Anything a real S3 server must confirm (signing, pagination, multipart) | `control-plane/tests/s3_live.rs` (`#[ignore]`, gated on `HYPERCACHE_TEST_S3_*`) |
+| Multi-process behavior (restart, SIGKILL, eviction pressure, fleet dispatch, auth over HTTP) | a check in `scripts/e2e/hypercache_e2e.py` (`scenario_daemon`, `scenario_fleet` or `scenario_s3`) |
+| Python client, datapath, integrations | `client-py/tests/` (`test_robustness.py` for threading, fork, framing, O_DIRECT, CRC) |
+
+A regression test should fail without the fix. When in doubt, revert the fix briefly and confirm that it does.
+
+Run the E2E scenarios directly against release binaries:
+```bash
+cargo build --release --manifest-path control-plane/Cargo.toml
+.venv/bin/python scripts/e2e/hypercache_e2e.py daemon fleet --keep   # add s3 with --s3-endpoint ...
+```
+
+### E. Release Checklist
+1. Bump the version in `control-plane/Cargo.toml`, `client-py/pyproject.toml`, `client-py/hypercache/__init__.py` and the default tag in `.github/workflows/release.yml`. The static stage fails if they disagree. The binaries read their version from Cargo (`env!("CARGO_PKG_VERSION")`), so never hardcode version strings in Rust.
+2. Run `cargo update` only on purpose. `Cargo.lock` is committed and every build uses `--locked`.
+3. Add a section to `CHANGELOG.md`.
+4. Run the full `scripts/verify_release.sh` until it prints `RESULT: PASSED`.
+5. Leave committing, tagging and pushing to the maintainer unless they explicitly ask you to do it.
+
+---
+
+## 8. Master Configuration Reference (`configs/hypercache-agent.toml` & `configs/hypercache-controller.toml`)
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -238,3 +320,11 @@ kill $DAEMON_PID
 | `allow_synthetic_s3_fallback` | bool | `false` | Gate synthetic benchmark fallback on S3 error (`false` in production) |
 | `peer_replication_factor` | integer | `1` | Peer checkpoint replication factor (`2` enables $k=2$ peer replica on `CommitWrite`) |
 | `p2p_preload_enabled` | bool | `false` | Enable P2P fleet pre-warming (1 origin pull + peer chunk distribution) |
+| `nfs_allowed_paths` | list | `[]` | Extra roots `file://` / `nfs://` URIs may access (besides `nfs_mount_path`) |
+| `reclaim_grace_secs` | integer | `30` | Grace period before freed extents are reused (protects in-flight readers) |
+| `s3_parallel_streams` | integer | `8` | Parallel ranged GETs per object during S3 ingest |
+| `s3_read_timeout_secs` | integer | `60` | Per-read idle timeout for S3 transfers (no total-time cap) |
+| `s3_session_token` | string | `$AWS_SESSION_TOKEN` | Session token for temporary S3 credentials |
+| `s3_multipart_threshold_bytes` | integer | `67108864` | Uploads above this size use S3 multipart upload |
+| `allow_local_admin_bypass` | bool | `true` | Controller: loopback callers skip auth (set `false` behind proxies / in K8s) |
+| `node_gc_secs` | integer | `600` | Controller: forget nodes silent for this long |

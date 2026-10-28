@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use std::fs::OpenOptions;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::config::Config;
@@ -13,6 +14,8 @@ pub struct Striper {
     config: Config,
     metadata: MetadataStore,
     ram_pool: Option<Arc<RamMemoryPool>>,
+    // Write handles per device, reused across chunks instead of reopening per write
+    device_files: Arc<Mutex<HashMap<String, Arc<File>>>>,
 }
 
 impl Striper {
@@ -21,10 +24,90 @@ impl Striper {
             config,
             metadata,
             ram_pool,
+            device_files: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    pub fn metadata(&self) -> &MetadataStore {
+        &self.metadata
+    }
+
+    /// Resolves the effective tier: an explicit request wins, otherwise RAM is used when
+    /// enabled and the object fits, else NVMe.
+    fn effective_tier(&self, target_tier: Option<StorageTier>, size_bytes: u64) -> StorageTier {
+        match target_tier {
+            Some(tier) => tier,
+            None => match self.ram_pool {
+                Some(ref pool)
+                    if self.config.ram_cache_enabled
+                        && pool.get_used_bytes() + size_bytes <= pool.get_capacity_bytes() =>
+                {
+                    StorageTier::Ram
+                }
+                _ => StorageTier::Nvme,
+            },
+        }
+    }
+
+    fn device_for_chunk(&self, chunk_idx: usize) -> Result<String> {
+        let num_devices = self.config.block_devices.len();
+        if num_devices == 0 {
+            anyhow::bail!("No secondary raw NVMe block devices configured or discovered (OS root disk protected). Pass --tier ram to cache directly in Tier 1 Host RAM (/dev/shm) or configure secondary block devices in configs/hypercache-agent.toml.");
+        }
+        Ok(self.config.block_devices[chunk_idx % num_devices].clone())
+    }
+
+    fn open_device(&self, device: &str) -> Result<Arc<File>> {
+        let mut files = self.device_files.lock().unwrap();
+        if let Some(f) = files.get(device) {
+            return Ok(Arc::clone(f));
+        }
+        let f = Arc::new(
+            OpenOptions::new()
+                .write(true)
+                .create(false)
+                .open(device)
+                .with_context(|| format!("Failed to open device {}", device))?,
+        );
+        files.insert(device.to_string(), Arc::clone(&f));
+        Ok(f)
+    }
+
+    async fn write_at(&self, device: &str, offset: u64, data: Vec<u8>) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let file = self.open_device(device)?;
+        let dev = device.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            file.write_all_at(&data, offset)
+                .with_context(|| format!("Failed to write chunk at offset {} on {}", offset, dev))
+        })
+        .await
+        .context("Write chunk task panicked")?
+    }
+
+    /// Flushes device write caches for every NVMe device referenced by `chunks`. Must be
+    /// called before a layout is published so a crash can never leave the manifest pointing
+    /// at blocks whose data never reached stable storage.
+    pub async fn sync_chunks(&self, chunks: &[ChunkDescriptor]) -> Result<()> {
+        let mut devices: Vec<String> = chunks
+            .iter()
+            .filter(|c| c.tier != StorageTier::Ram)
+            .map(|c| c.device.clone())
+            .collect();
+        devices.sort();
+        devices.dedup();
+        for dev in devices {
+            let file = self.open_device(&dev)?;
+            tokio::task::spawn_blocking(move || file.sync_data())
+                .await
+                .context("Device sync task panicked")?
+                .with_context(|| format!("Failed to sync device {}", dev))?;
+        }
+        Ok(())
+    }
+
     /// Stripes payload across either RAM (POSIX Shared Memory) or NVMe block devices.
+    /// On any failure every chunk allocated by this call is released again.
     pub async fn stripe_bytes_to_tier(
         &self,
         uri: &str,
@@ -33,125 +116,28 @@ impl Striper {
     ) -> Result<Vec<ChunkDescriptor>> {
         let chunk_size = self.config.chunk_size_bytes;
         let total_len = data.len();
-        let num_chunks = (total_len + chunk_size - 1) / chunk_size;
+        let num_chunks = total_len.div_ceil(chunk_size);
 
-        let effective_tier = match target_tier {
-            Some(tier) => tier,
-            None => {
-                if let Some(ref pool) = self.ram_pool {
-                    if self.config.ram_cache_enabled
-                        && pool.get_used_bytes() + (total_len as u64) <= pool.get_capacity_bytes()
-                    {
-                        StorageTier::Ram
-                    } else {
-                        StorageTier::Nvme
-                    }
-                } else {
-                    StorageTier::Nvme
-                }
-            }
-        };
-
-        if effective_tier == StorageTier::Ram {
-            if let Some(ref pool) = self.ram_pool {
-                info!(
-                    "Striping {} bytes into {} RAM shared memory chunks (chunk_size: {} bytes)",
-                    total_len, num_chunks, chunk_size
-                );
-
-                let mut layout = Vec::with_capacity(num_chunks);
-                for chunk_idx in 0..num_chunks {
-                    let start = chunk_idx * chunk_size;
-                    let end = std::cmp::min(start + chunk_size, total_len);
-                    let chunk_id = format!("{}_chunk_{}", uri, chunk_idx);
-                    let slice = &data[start..end];
-                    match pool.allocate_and_write_chunk(&chunk_id, slice) {
-                        Ok(desc) => layout.push(desc),
-                        Err(e) => {
-                            for written in layout {
-                                let _ = pool.delete_chunk(&written.device);
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-                return Ok(layout);
-            } else {
-                anyhow::bail!("RAM cache tier requested but RAM caching is disabled. Set ram_cache_enabled = true in configs/hypercache-agent.toml or pass --ram to enable Tier 1 Host RAM caching.");
-            }
-        }
-
-        // Otherwise, stripe to NVMe block devices
-        let num_devices = self.config.block_devices.len();
-        if num_devices == 0 {
-            anyhow::bail!("No secondary raw NVMe block devices configured or discovered (OS root disk protected). Pass --tier ram to cache directly in Tier 1 Host RAM (/dev/shm) or configure secondary block devices in configs/hypercache-agent.toml.");
-        }
-
-        let mut layout = Vec::with_capacity(num_chunks);
         info!(
-            "Striping {} bytes into {} NVMe chunks (chunk_size: {} bytes) across {} devices",
-            total_len, num_chunks, chunk_size, num_devices
+            "Striping {} bytes into {} chunks (chunk_size: {} bytes)",
+            total_len, num_chunks, chunk_size
         );
 
-        let mut chunk_tasks = Vec::with_capacity(num_chunks);
-        for chunk_idx in 0..num_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = std::cmp::min(start + chunk_size, total_len);
-            let chunk_len = (end - start) as u64;
-
-            let device_path = self.config.block_devices[chunk_idx % num_devices].clone();
-            let offset = self
-                .metadata
-                .allocate_chunk_offset(
-                    &device_path,
-                    chunk_len,
-                    self.config.device_start_offset_bytes,
-                )
-                .await?;
-
-            layout.push(ChunkDescriptor {
-                tier: StorageTier::Nvme,
-                device: device_path.clone(),
-                offset,
-                length: chunk_len,
-            });
-
-            chunk_tasks.push((device_path, offset, start, end));
+        let mut layout = Vec::with_capacity(num_chunks);
+        for (chunk_idx, slice) in data.chunks(chunk_size).enumerate() {
+            match self.stripe_single_chunk(uri, chunk_idx, slice, target_tier).await {
+                Ok(desc) => layout.push(desc),
+                Err(e) => {
+                    self.metadata.release_unpublished(&layout).await;
+                    return Err(e);
+                }
+            }
         }
 
-        let data_bytes = data.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            use std::collections::HashMap;
-            use std::os::unix::fs::FileExt;
-
-            let mut files = HashMap::new();
-            for (dev_path, offset, start, end) in chunk_tasks {
-                let file = if let Some(f) = files.get_mut(&dev_path) {
-                    f
-                } else {
-                    let f = OpenOptions::new()
-                        .write(true)
-                        .create(false)
-                        .open(&dev_path)
-                        .with_context(|| format!("Failed to open device {}", dev_path))?;
-                    files.entry(dev_path.clone()).or_insert(f)
-                };
-
-                let slice = &data_bytes[start..end];
-                file.write_all_at(slice, offset)
-                    .with_context(|| format!("Failed to write chunk at offset {} on {}", offset, dev_path))?;
-            }
-
-            for (dev_path, file) in files {
-                file.sync_all()
-                    .with_context(|| format!("Failed to sync device {}", dev_path))?;
-            }
-
-            Ok(())
-        })
-        .await
-        .with_context(|| "Write task panicked")??;
-
+        if let Err(e) = self.sync_chunks(&layout).await {
+            self.metadata.release_unpublished(&layout).await;
+            return Err(e);
+        }
         Ok(layout)
     }
 
@@ -173,83 +159,63 @@ impl Striper {
         size_bytes: u64,
         target_tier: Option<StorageTier>,
     ) -> Result<Vec<ChunkDescriptor>> {
-        let chunk_size = self.config.chunk_size_bytes;
-        let num_chunks = ((size_bytes as usize) + chunk_size - 1) / chunk_size;
+        let chunk_size = self.config.chunk_size_bytes as u64;
+        let num_chunks = size_bytes.div_ceil(chunk_size) as usize;
 
-        let effective_tier = match target_tier {
-            Some(tier) => tier,
-            None => {
-                if let Some(ref pool) = self.ram_pool {
-                    if self.config.ram_cache_enabled
-                        && pool.get_used_bytes() + size_bytes <= pool.get_capacity_bytes()
-                    {
-                        StorageTier::Ram
-                    } else {
-                        StorageTier::Nvme
-                    }
-                } else {
-                    StorageTier::Nvme
-                }
-            }
-        };
-
-        if effective_tier == StorageTier::Ram {
-            if let Some(ref pool) = self.ram_pool {
-                let mut layout = Vec::with_capacity(num_chunks);
-                for local_idx in 0..num_chunks {
-                    let chunk_idx = start_chunk_idx + local_idx;
-                    let start = (local_idx * chunk_size) as u64;
-                    let end = std::cmp::min(start + (chunk_size as u64), size_bytes);
-                    let chunk_len = end - start;
-                    let chunk_id = format!("{}_chunk_{}", uri, chunk_idx);
-                    let chunk_path = pool.get_chunk_path(&chunk_id);
-                    layout.push(ChunkDescriptor {
-                        tier: StorageTier::Ram,
-                        device: chunk_path.to_string_lossy().to_string(),
-                        offset: 0,
-                        length: chunk_len,
-                    });
-                }
-                return Ok(layout);
-            } else {
+        if self.effective_tier(target_tier, size_bytes) == StorageTier::Ram {
+            let Some(ref pool) = self.ram_pool else {
                 anyhow::bail!("RAM cache tier requested but RAM caching is disabled.");
-            }
-        }
-
-        let num_devices = self.config.block_devices.len();
-        if num_devices == 0 {
-            anyhow::bail!("No secondary raw NVMe block devices configured or discovered.");
+            };
+            let layout = (0..num_chunks)
+                .map(|local_idx| {
+                    let start = local_idx as u64 * chunk_size;
+                    let chunk_len = (start + chunk_size).min(size_bytes) - start;
+                    let chunk_id = format!("{}_chunk_{}", uri, start_chunk_idx + local_idx);
+                    ChunkDescriptor::new(
+                        StorageTier::Ram,
+                        pool.get_chunk_path(&chunk_id).to_string_lossy().to_string(),
+                        0,
+                        chunk_len,
+                    )
+                })
+                .collect();
+            return Ok(layout);
         }
 
         let mut layout = Vec::with_capacity(num_chunks);
         for local_idx in 0..num_chunks {
-            let chunk_idx = start_chunk_idx + local_idx;
-            let start = (local_idx * chunk_size) as u64;
-            let end = std::cmp::min(start + (chunk_size as u64), size_bytes);
-            let chunk_len = end - start;
+            let start = local_idx as u64 * chunk_size;
+            let chunk_len = (start + chunk_size).min(size_bytes) - start;
+            let allocated = async {
+                let device_path = self.device_for_chunk(start_chunk_idx + local_idx)?;
+                let offset = self
+                    .metadata
+                    .allocate_chunk_offset_for(
+                        Some(uri),
+                        &device_path,
+                        chunk_len,
+                        self.config.device_start_offset_bytes,
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(ChunkDescriptor::new(StorageTier::Nvme, device_path, offset, chunk_len))
+            }
+            .await;
 
-            let device_path = self.config.block_devices[chunk_idx % num_devices].clone();
-            let offset = self
-                .metadata
-                .allocate_chunk_offset(
-                    &device_path,
-                    chunk_len,
-                    self.config.device_start_offset_bytes,
-                )
-                .await?;
-
-            layout.push(ChunkDescriptor {
-                tier: StorageTier::Nvme,
-                device: device_path,
-                offset,
-                length: chunk_len,
-            });
+            match allocated {
+                Ok(desc) => layout.push(desc),
+                Err(e) => {
+                    self.metadata.release_unpublished(&layout).await;
+                    return Err(e);
+                }
+            }
         }
 
         Ok(layout)
     }
 
     /// Writes a single chunk at `chunk_idx` directly to the target tier (or spills over from RAM to NVMe if full).
+    /// The returned descriptor carries the chunk's CRC32. NVMe data is not yet fsynced; callers
+    /// publish a layout only after `sync_chunks`.
     pub async fn stripe_single_chunk(
         &self,
         uri: &str,
@@ -258,78 +224,128 @@ impl Striper {
         target_tier: Option<StorageTier>,
     ) -> Result<ChunkDescriptor> {
         let chunk_len = chunk_data.len() as u64;
-        let effective_tier = match target_tier {
-            Some(tier) => tier,
-            None => {
-                if let Some(ref pool) = self.ram_pool {
-                    if self.config.ram_cache_enabled
-                        && pool.get_used_bytes() + chunk_len <= pool.get_capacity_bytes()
-                    {
-                        StorageTier::Ram
-                    } else {
-                        StorageTier::Nvme
-                    }
-                } else {
-                    StorageTier::Nvme
-                }
-            }
-        };
 
-        if effective_tier == StorageTier::Ram {
-            if let Some(ref pool) = self.ram_pool {
-                let chunk_id = format!("{}_chunk_{}", uri, chunk_idx);
-                if let Ok(desc) = pool.allocate_and_write_chunk(&chunk_id, chunk_data) {
-                    return Ok(desc);
-                } else if target_tier == Some(StorageTier::Ram) {
-                    anyhow::bail!("RAM cache capacity exceeded while writing chunk {} for {}", chunk_idx, uri);
-                }
-                // If target_tier was None (Auto), fall through seamlessly to NVMe spillover!
-            } else {
+        if self.effective_tier(target_tier, chunk_len) == StorageTier::Ram {
+            let Some(ref pool) = self.ram_pool else {
                 anyhow::bail!("RAM cache tier requested but RAM caching is disabled.");
+            };
+            let chunk_id = format!("{}_chunk_{}", uri, chunk_idx);
+            match pool.allocate_and_write_chunk(&chunk_id, chunk_data) {
+                Ok(desc) => return Ok(desc),
+                Err(e) if target_tier == Some(StorageTier::Ram) => {
+                    return Err(e.context(format!(
+                        "RAM cache capacity exceeded while writing chunk {} for {}",
+                        chunk_idx, uri
+                    )));
+                }
+                // Auto tier: fall through to NVMe spillover
+                Err(_) => {}
             }
         }
 
-        let num_devices = self.config.block_devices.len();
-        if num_devices == 0 {
-            anyhow::bail!("No secondary raw NVMe block devices configured or discovered (OS root disk protected). Pass --tier ram to cache directly in Tier 1 Host RAM (/dev/shm) or configure secondary block devices in configs/hypercache-agent.toml.");
-        }
-
-        let device_path = self.config.block_devices[chunk_idx % num_devices].clone();
+        let device_path = self.device_for_chunk(chunk_idx)?;
         let offset = self
             .metadata
-            .allocate_chunk_offset(
+            .allocate_chunk_offset_for(
+                Some(uri),
                 &device_path,
                 chunk_len,
                 self.config.device_start_offset_bytes,
             )
             .await?;
+        let desc =
+            ChunkDescriptor::new(StorageTier::Nvme, device_path.clone(), offset, chunk_len).with_checksum(chunk_data);
 
-        let data_vec = chunk_data.to_vec();
-        let dev_clone = device_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            use std::os::unix::fs::FileExt;
-            let file = OpenOptions::new()
-                .write(true)
-                .create(false)
-                .open(&dev_clone)
-                .with_context(|| format!("Failed to open device {}", dev_clone))?;
-            file.write_all_at(&data_vec, offset)
-                .with_context(|| format!("Failed to write chunk at offset {} on {}", offset, dev_clone))?;
-            Ok(())
-        })
-        .await
-        .with_context(|| "Write chunk task panicked")??;
+        if let Err(e) = self.write_at(&device_path, offset, chunk_data.to_vec()).await {
+            self.metadata.release_unpublished(std::slice::from_ref(&desc)).await;
+            return Err(e);
+        }
 
-        Ok(ChunkDescriptor {
-            tier: StorageTier::Nvme,
-            device: device_path,
-            offset,
-            length: chunk_len,
-        })
+        Ok(desc)
     }
 
     #[allow(dead_code)]
     pub async fn stripe_bytes(&self, data: &[u8]) -> Result<Vec<ChunkDescriptor>> {
         self.stripe_bytes_to_tier("unspecified", data, None).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "hypercache_striper_{}_{}",
+            tag,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn test_failed_stripe_releases_allocated_extents() {
+        let dir = temp_dir("rollback");
+        let good = dir.join("good.raw");
+        std::fs::write(&good, vec![0u8; 16 * 1024 * 1024]).unwrap();
+        // Second device does not exist: writes to it fail
+        let missing = dir.join("missing.raw");
+
+        let config = Config {
+            block_devices: vec![
+                good.to_string_lossy().to_string(),
+                missing.to_string_lossy().to_string(),
+            ],
+            chunk_size_bytes: 1024 * 1024,
+            ..Config::default()
+        };
+        let metadata = MetadataStore::new(1 << 30, None, None);
+        let striper = Striper::new(config, metadata.clone(), None);
+
+        let data = vec![7u8; 3 * 1024 * 1024];
+        assert!(striper
+            .stripe_bytes_to_tier("hypercache://x", &data, Some(StorageTier::Nvme))
+            .await
+            .is_err());
+
+        // Every extent allocated on the good device was returned: the next allocation starts at the beginning
+        let off = metadata
+            .allocate_chunk_offset(&good.to_string_lossy(), 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        assert_eq!(off, 4096);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stripe_writes_checksummed_chunks() {
+        let dir = temp_dir("crc");
+        let dev = dir.join("dev.raw");
+        std::fs::write(&dev, vec![0u8; 8 * 1024 * 1024]).unwrap();
+        let config = Config {
+            block_devices: vec![dev.to_string_lossy().to_string()],
+            chunk_size_bytes: 1024 * 1024,
+            ..Config::default()
+        };
+        let striper = Striper::new(config, MetadataStore::new(1 << 30, None, None), None);
+
+        let data: Vec<u8> = (0..(2 * 1024 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+        let layout = striper
+            .stripe_bytes_to_tier("hypercache://y", &data, None)
+            .await
+            .unwrap();
+        assert_eq!(layout.len(), 3);
+
+        let raw = std::fs::read(&dev).unwrap();
+        for (i, chunk) in layout.iter().enumerate() {
+            let expected = &data[i * 1024 * 1024..((i + 1) * 1024 * 1024).min(data.len())];
+            let on_disk = &raw[chunk.offset as usize..(chunk.offset + chunk.length) as usize];
+            assert_eq!(on_disk, expected);
+            assert_eq!(chunk.checksum, Some(crc32fast::hash(expected)));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

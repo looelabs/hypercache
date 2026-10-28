@@ -147,11 +147,11 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 
 ---
 
-### 2. Supported Server Platforms & Reference Systems
+### 2. Recommended Node Chassis (`x86_64`)
 
-HyperCache is hardware-vendor agnostic and runs on **any standard `x86_64` Linux server, GPU workstation, or cloud VM** equipped with local NVMe or SATA drives.
+HyperCache is hardware-vendor agnostic and works on **any `x86_64` Linux system with available NVMe drives** - including custom builds, GPU workstations, OEM servers, and cloud instances.
 
-In production data centers, it is specifically designed to pool the high-density local NVMe bays (`8x` to `16x` `E1.S/L`, `E3.S/L`, `U.2`, or `M.2` drives) built into modern 8-GPU enterprise AI servers. Below are common reference platforms where HyperCache is deployed:
+For 8-GPU data center deployments, below are recommended enterprise node chassis equipped with high-density local NVMe bays (`8x` to `16x` `E1.S/L`, `E3.S/L`, `U.2`, or `M.2` drives):
 
 | Server Vendor | System Model | GPU Platform | Host CPU Architecture |
 | :--- | :--- | :--- | :--- |
@@ -324,9 +324,14 @@ s3_bucket = "model-weights-bucket"
 s3_access_key = "YOUR_ACCESS_KEY"          # Or set via env: export AWS_ACCESS_KEY_ID="..."
 s3_secret_key = "YOUR_SECRET_KEY"          # Or set via env: export AWS_SECRET_ACCESS_KEY="..."
 allow_synthetic_s3_fallback = false        # Keep false in production so S3 errors fail fast
+# s3_session_token = "$AWS_SESSION_TOKEN"  # STS / IRSA temporary credentials (env var used by default)
+s3_parallel_streams = 8                    # Parallel ranged GETs per object during ingest
+s3_multipart_threshold_bytes = 67108864    # Uploads above 64 MiB use S3 multipart (required above 5 GiB)
 
 # Used when authoritative_backend = "nfs" or URI starts with file:// or nfs://
 nfs_mount_path = "/mnt/nfs"
+# file:// and nfs:// URIs are confined to nfs_mount_path plus these roots (symlink/.. escapes rejected)
+# nfs_allowed_paths = ["/mnt/datasets"]
 
 # Checkpoint Write Semantics & Fault Tolerance
 write_through_enabled = false              # false = async Write-Back, true = sync Write-Through
@@ -340,7 +345,7 @@ node_id = "gpu-node-01"                    # Defaults to system hostname if omit
 # cluster_auth_token = "your-cluster-token"# Or set via env: export HYPERCACHE_AUTH_TOKEN="..."
 
 agent_enabled = false                      # Auto-enabled when controller_url is set (or pass --agent)
-agent_bind_address = "0.0.0.0"
+agent_bind_address = "0.0.0.0"             # Non-loopback binds REQUIRE cluster_auth_token (agent refuses otherwise)
 agent_http_port = 9115
 
 [node_labels]                              # Optional labels for --selector targeting
@@ -372,6 +377,10 @@ controller_port = 9120
 # Can also be set via: export HYPERCACHE_AUTH_TOKEN="your-cluster-token"
 cluster_auth_token = "your-cluster-token"
 
+# Set to false when a local proxy can forward remote traffic (Kubernetes sidecars,
+# nginx, kubectl port-forward): such connections also arrive from 127.0.0.1.
+allow_local_admin_bypass = true
+
 # Peer-to-Peer (P2P) Fleet Pre-Warming
 # When true, fleet-wide preload pulls 1/N of chunks from S3 per node and distributes
 # the remaining chunks peer-to-peer across worker nodes to eliminate S3 egress storms.
@@ -386,7 +395,7 @@ Every critical setting in `hypercache-agent.toml` and `hypercache-controller.tom
 
 | Config Key | Env Variable Override | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `socket_path` | `HYPERCACHE_SOCKET` | `"/run/hypercache/hypercache.sock"` | Local Unix Domain Socket path (falls back to `/tmp/hypercache/hypercache.sock`). |
+| `socket_path` | `HYPERCACHE_SOCKET_PATH` | `"/run/hypercache/hypercache.sock"` | Local Unix Domain Socket path (falls back to `/tmp/hypercache/hypercache.sock`). The env var is honored by the daemon, CLI and Python client. |
 | `storage_backing_mode` | -- | `"auto"` | `"auto"`, `"raw_block"`, or `"filesystem"` (`O_DIRECT` arena files). |
 | `filesystem_cache_paths` | -- | `[]` | List of mounted ext4/XFS directories for `O_DIRECT` arena files. |
 | `filesystem_arena_size_bytes`| -- | `10737418240` (10 GiB) | Pre-allocated size per filesystem arena file in bytes. |
@@ -403,11 +412,19 @@ Every critical setting in `hypercache-agent.toml` and `hypercache-controller.tom
 | `s3_bucket` | `S3_BUCKET` | `"hypercache-authoritative"`| Default S3 bucket name when not specified in the URI. |
 | `s3_access_key` | `AWS_ACCESS_KEY_ID` | `""` | S3 access key ID. |
 | `s3_secret_key` | `AWS_SECRET_ACCESS_KEY` | `""` | S3 secret access key. |
+| `s3_session_token` | `AWS_SESSION_TOKEN` | `None` | Session token for temporary credentials (STS, IRSA, EKS Pod Identity). |
+| `s3_parallel_streams` | -- | `8` | Parallel ranged GETs per object during ingest. |
+| `s3_read_timeout_secs` | -- | `60` | Abort an S3 transfer only after this long without receiving data (no total-time cap). |
+| `s3_multipart_threshold_bytes` | -- | `67108864` (64 MiB) | Write-back/write-through uploads above this size use S3 multipart upload. |
 | `nfs_mount_path` | -- | `"/mnt/nfs"` | Root mount path for NFS / POSIX shared filesystem backend. |
+| `nfs_allowed_paths` | -- | `[]` | Extra directories `file://` / `nfs://` URIs may access. Anything outside `nfs_mount_path` and these roots is rejected. |
+| `reclaim_grace_secs` | -- | `30` | Seconds freed blocks are held before reuse, so readers holding an old layout never see another object's bytes. |
 | `write_through_enabled` | -- | `false` | `false` = async Write-Back; `true` = synchronous Write-Through to S3/NFS. |
 | `peer_replication_factor` | -- | `1` | Set to `2` to enable $k=2$ peer checkpoint replication on `CommitWrite`. |
 | `controller_url` | `HYPERCACHE_CONTROLLER_URL`| `None` | URL of Central Controller (e.g. `"http://10.0.0.10:9120"`). |
-| `cluster_auth_token` | `HYPERCACHE_AUTH_TOKEN` | `None` | Shared secret Bearer token for Controller <-> Worker Agent security. |
+| `cluster_auth_token` | `HYPERCACHE_AUTH_TOKEN` | `None` | Shared secret Bearer token for Controller <-> Worker Agent security. Required for any non-loopback agent bind. |
+| `allow_local_admin_bypass` | -- | `true` | Controller: loopback callers skip the token check. Set `false` behind sidecars, proxies or port-forwards. |
+| `node_gc_secs` | -- | `600` | Controller: forget nodes that have not sent a heartbeat for this long. |
 | `p2p_preload_enabled` | -- | `false` | Enable 1/N origin pull + peer-to-peer chunk exchange during fleet preload. |
 | `metrics_enabled` | -- | `false` | Enable Prometheus HTTP exporter on `metrics_port` (`9110`). |
 
@@ -493,6 +510,8 @@ HyperCache routes requests automatically based on the URI scheme passed to Pytho
 | `hypercache://<key>` | **Default Configured Backend** | Uses `authoritative_backend` (`"s3"` + default `s3_bucket`, or `"nfs"` + `nfs_mount_path`) from `hypercache-agent.toml`. |
 | `hypercache://file/<abs/path>` | **POSIX / Shared NFS** | Reads/writes directly to `/<abs/path>` on the local or NFS-mounted filesystem. |
 | `file:///<abs/path>` or `nfs://<rel/path>` | **POSIX / Shared NFS** | Reads/writes to `/<abs/path>` (or `<nfs_mount_path>/<rel/path>`). |
+
+POSIX paths are confined to `nfs_mount_path` plus any `nfs_allowed_paths`. A URI such as `file:///etc/shadow`, or one escaping the roots through `..` or a symlink, is rejected, so clients cannot use the daemon (which often runs as root for raw block access) to read or write arbitrary host files.
 
 ---
 
@@ -695,8 +714,13 @@ HyperCache is designed with a **zero-exposure default security posture**:
    Running `./hypercache -c configs/hypercache-agent.toml start` without `controller_url` or `--metrics` opens **zero TCP network ports**. All communication between Python and the Rust daemon occurs over the local Unix Domain Socket (`/run/hypercache/hypercache.sock`).
 2. **Zero-Config Localhost Admin**:
    Running `./hypercache-admin` directly on the Controller host (`127.0.0.1` / `::1`) automatically bypasses token checks so operators can run `./hypercache-admin nodes` or `preload` without flags.
+   Set `allow_local_admin_bypass = false` on the controller whenever remote traffic can arrive through a local proxy (Kubernetes sidecars such as Istio/Envoy, nginx, `kubectl port-forward`), because those connections also originate from `127.0.0.1`. The bundled Kubernetes manifest does this.
 3. **Bearer Token Authentication for Cluster Traffic**:
-   When `cluster_auth_token` (or `HYPERCACHE_AUTH_TOKEN`) is set, all network requests between the Controller (`:9120`) and Worker Node Agents (`:9115`) - including heartbeats, preload directives, P2P chunk transfers, and $k=2$ checkpoint replication - require `Authorization: Bearer <token>`. Unauthorized requests are rejected with `HTTP 401 Unauthorized`.
+   When `cluster_auth_token` (or `HYPERCACHE_AUTH_TOKEN`) is set, all network requests between the Controller (`:9120`) and Worker Node Agents (`:9115`) - including heartbeats, preload directives, P2P chunk transfers, and $k=2$ checkpoint replication - require `Authorization: Bearer <token>`. Unauthorized requests are rejected with `HTTP 401 Unauthorized`. Tokens are compared in constant time.
+4. **Agent API Never Runs Open on the Network**:
+   The agent API can purge the cache and write replicas to raw devices, so it refuses to start on a non-loopback `agent_bind_address` unless `cluster_auth_token` is set. The daemon keeps serving the local socket and logs the reason. In Kubernetes, the bundled `NetworkPolicy` additionally limits `:9115` to the controller and peer agents.
+5. **Node Identity Protection**:
+   The controller rejects a registration that reuses a live node's `node_id` from a different source IP (HTTP 409), so a rogue registrant cannot redirect fleet traffic and the bearer token to another host.
 
 | Component / Service | Default Port / Socket | Default State | Who Should Have Access |
 | :--- | :--- | :--- | :--- |
@@ -806,11 +830,20 @@ Runs on the Controller host (zero configuration required on `127.0.0.1` loopback
 ## Running Tests & Verification Suites
 
 ```bash
-# 1. Run the Rust Control Plane unit & integration test suite (27 tests)
+# Full release verification harness: static checks (fmt, clippy, versions, zero-emoji),
+# Rust + Python suites, end-to-end daemon / fleet scenarios on real binaries, live S3
+# (throwaway versitygw container), a clean Linux container run, and the Docker image.
+scripts/verify_release.sh            # everything (Docker stages skipped if unavailable)
+scripts/verify_release.sh --quick    # static, rust, python only
+
+# 1. Run the Rust Control Plane unit & integration test suite (73 tests + 6 live S3 tests)
 cargo test --manifest-path control-plane/Cargo.toml
 
-# 2. Run the Python Data Plane & framework integration test suite (21 tests)
+# 2. Run the Python Data Plane & framework integration test suite (32 tests)
 .venv/bin/pytest client-py/tests
+
+# 2b. End-to-end scenarios against the release binaries (no daemon needed beforehand)
+.venv/bin/python scripts/e2e/hypercache_e2e.py daemon fleet
 
 # 3. Run end-to-end PyTorch verification & endurance suites (with daemon running)
 .venv/bin/python benchmarks/real_world_ai_test_suite.py

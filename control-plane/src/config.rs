@@ -165,6 +165,41 @@ pub struct Config {
 
     #[serde(default)]
     pub p2p_preload_enabled: bool,
+
+    /// Extra directories (besides `nfs_mount_path`) that file:// / nfs:// URIs may read or write
+    #[serde(default)]
+    pub nfs_allowed_paths: Vec<String>,
+
+    /// Concurrent ranged GETs / multipart part uploads per S3 object (1 = single stream)
+    #[serde(default = "default_s3_parallel_streams")]
+    pub s3_parallel_streams: usize,
+
+    /// Idle timeout for a single S3 socket read; there is no whole-request timeout
+    #[serde(default = "default_s3_read_timeout_secs")]
+    pub s3_read_timeout_secs: u64,
+
+    /// Temporary-credential session token (STS / assumed roles); defaults to $AWS_SESSION_TOKEN
+    #[serde(default = "default_s3_session_token")]
+    pub s3_session_token: Option<String>,
+
+    /// Objects larger than this are uploaded to S3 with multipart upload
+    #[serde(default = "default_s3_multipart_threshold_bytes")]
+    pub s3_multipart_threshold_bytes: u64,
+
+    /// Grace period before blocks of evicted / replaced objects are reused, so in-flight
+    /// readers of the old layout never observe overwritten data
+    #[serde(default = "default_reclaim_grace_secs")]
+    pub reclaim_grace_secs: u64,
+
+    /// Controller only: let loopback / controller-host connections skip token authentication.
+    /// Disable when the controller sits behind a local proxy or sidecar (all traffic then
+    /// appears to come from 127.0.0.1).
+    #[serde(default = "default_true")]
+    pub allow_local_admin_bypass: bool,
+
+    /// Controller only: seconds without heartbeat after which an OFFLINE node is forgotten
+    #[serde(default = "default_node_gc_secs")]
+    pub node_gc_secs: u64,
 }
 
 pub const PRIMARY_METADATA_PATH: &str = "/var/lib/hypercache/metadata.json";
@@ -281,7 +316,25 @@ pub const FALLBACK_SOCKET_PATH: &str = "/tmp/hypercache/hypercache.sock";
 pub const PRIMARY_LOCK_PATH: &str = "/run/hypercache/hypercache.lock";
 pub const FALLBACK_LOCK_PATH: &str = "/tmp/hypercache/hypercache.lock";
 
+/// Environment override for the daemon socket (isolated test instances, containers).
+/// When set, the daemon lock file lives next to the socket.
+pub const SOCKET_PATH_ENV: &str = "HYPERCACHE_SOCKET_PATH";
+
+fn socket_path_override() -> Option<std::path::PathBuf> {
+    std::env::var(SOCKET_PATH_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub fn get_socket_path() -> std::path::PathBuf {
+    if let Some(p) = socket_path_override() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return p;
+    }
     if std::fs::create_dir_all("/run/hypercache").is_ok() {
         let test_probe = "/run/hypercache/.probe_sock";
         if std::fs::write(test_probe, b"").is_ok() {
@@ -294,6 +347,9 @@ pub fn get_socket_path() -> std::path::PathBuf {
 }
 
 pub fn get_lock_path() -> std::path::PathBuf {
+    if let Some(p) = socket_path_override() {
+        return p.with_file_name("hypercache.lock");
+    }
     if std::fs::create_dir_all("/run/hypercache").is_ok() {
         let test_probe = "/run/hypercache/.probe_lock";
         if std::fs::write(test_probe, b"").is_ok() {
@@ -306,6 +362,9 @@ pub fn get_lock_path() -> std::path::PathBuf {
 }
 
 pub fn probe_active_socket_path() -> std::path::PathBuf {
+    if let Some(p) = socket_path_override() {
+        return p;
+    }
     if Path::new(PRIMARY_SOCKET_PATH).exists() {
         std::path::PathBuf::from(PRIMARY_SOCKET_PATH)
     } else if Path::new(FALLBACK_SOCKET_PATH).exists() {
@@ -370,7 +429,9 @@ fn default_node_id() -> String {
 }
 
 fn default_node_address() -> Option<String> {
-    std::env::var("HYPERCACHE_NODE_IP").ok().filter(|s| !s.trim().is_empty())
+    std::env::var("HYPERCACHE_NODE_IP")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn default_metrics_bind_address() -> String {
@@ -402,7 +463,9 @@ fn default_controller_admin_port() -> u16 {
 }
 
 fn default_cluster_auth_token() -> Option<String> {
-    std::env::var("HYPERCACHE_AUTH_TOKEN").ok().filter(|s| !s.trim().is_empty())
+    std::env::var("HYPERCACHE_AUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn default_auto_create() -> bool {
@@ -423,6 +486,34 @@ fn default_filesystem_arena_size_bytes() -> u64 {
 
 fn default_peer_replication_factor() -> usize {
     1
+}
+
+fn default_s3_parallel_streams() -> usize {
+    8
+}
+
+fn default_s3_read_timeout_secs() -> u64 {
+    60
+}
+
+fn default_s3_session_token() -> Option<String> {
+    std::env::var("AWS_SESSION_TOKEN").ok().filter(|s| !s.trim().is_empty())
+}
+
+fn default_s3_multipart_threshold_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_reclaim_grace_secs() -> u64 {
+    30
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_node_gc_secs() -> u64 {
+    600
 }
 
 pub fn get_ram_pool_path(config: &Config) -> std::path::PathBuf {
@@ -502,6 +593,14 @@ impl Default for Config {
             filesystem_arena_size_bytes: default_filesystem_arena_size_bytes(),
             peer_replication_factor: default_peer_replication_factor(),
             p2p_preload_enabled: false,
+            nfs_allowed_paths: Vec::new(),
+            s3_parallel_streams: default_s3_parallel_streams(),
+            s3_read_timeout_secs: default_s3_read_timeout_secs(),
+            s3_session_token: default_s3_session_token(),
+            s3_multipart_threshold_bytes: default_s3_multipart_threshold_bytes(),
+            reclaim_grace_secs: default_reclaim_grace_secs(),
+            allow_local_admin_bypass: true,
+            node_gc_secs: default_node_gc_secs(),
         }
     }
 }
@@ -515,8 +614,7 @@ impl Config {
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
         let preprocessed = preprocess_unquoted_env_vars(content);
-        let mut config: Config = toml::from_str(&preprocessed)
-            .with_context(|| "Failed to parse TOML configuration")?;
+        let mut config: Config = toml::from_str(&preprocessed).with_context(|| "Failed to parse TOML configuration")?;
         config.expand_and_apply_env_overrides();
         Ok(config)
     }
@@ -534,6 +632,15 @@ impl Config {
         self.ram_cache_shm_path = expand_env_vars(&self.ram_cache_shm_path);
         self.ram_cache_hugepages_path = expand_env_vars(&self.ram_cache_hugepages_path);
         self.metadata_persistence_path = expand_env_vars(&self.metadata_persistence_path);
+        self.nfs_allowed_paths = self.nfs_allowed_paths.iter().map(|p| expand_env_vars(p)).collect();
+        if let Some(ref token) = self.s3_session_token {
+            let expanded = expand_env_vars(token);
+            self.s3_session_token = if expanded.trim().is_empty() {
+                None
+            } else {
+                Some(expanded)
+            };
+        }
 
         if let Some(ref url) = self.controller_url {
             let expanded = expand_env_vars(url);
@@ -560,16 +667,8 @@ impl Config {
             };
         }
 
-        self.block_devices = self
-            .block_devices
-            .iter()
-            .map(|d| expand_env_vars(d))
-            .collect();
-        self.filesystem_cache_paths = self
-            .filesystem_cache_paths
-            .iter()
-            .map(|p| expand_env_vars(p))
-            .collect();
+        self.block_devices = self.block_devices.iter().map(|d| expand_env_vars(d)).collect();
+        self.filesystem_cache_paths = self.filesystem_cache_paths.iter().map(|p| expand_env_vars(p)).collect();
 
         // Standard environment variable fallbacks when fields are empty or unset
         if self.s3_access_key.is_empty() {
@@ -619,6 +718,13 @@ impl Config {
                 }
             }
         }
+        if self.s3_session_token.is_none() {
+            if let Ok(val) = std::env::var("AWS_SESSION_TOKEN") {
+                if !val.trim().is_empty() {
+                    self.s3_session_token = Some(val);
+                }
+            }
+        }
         if self.cluster_auth_token.is_none() {
             if let Ok(val) = std::env::var("HYPERCACHE_AUTH_TOKEN") {
                 if !val.trim().is_empty() {
@@ -660,7 +766,7 @@ fn preprocess_unquoted_env_vars(content: &str) -> String {
                     None => (rhs_trimmed, None),
                 };
                 let token = val_part.trim();
-                if let Some( comment) = comment_part {
+                if let Some(comment) = comment_part {
                     out.push_str(&format!("{}= \"{}\" {}\n", lhs, token, comment));
                 } else {
                     out.push_str(&format!("{}= \"{}\"\n", lhs, token));
@@ -691,11 +797,7 @@ fn expand_env_vars(input: &str) -> String {
                 // ${VAR_NAME} syntax
                 if let Some(end_offset) = chars[i + 2..].iter().position(|&c| c == '}') {
                     let var_name: String = chars[i + 2..i + 2 + end_offset].iter().collect();
-                    if !var_name.is_empty()
-                        && var_name
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
+                    if !var_name.is_empty() && var_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                         match std::env::var(&var_name) {
                             Ok(val) => result.push_str(&val),
                             Err(_) => {
@@ -713,9 +815,7 @@ fn expand_env_vars(input: &str) -> String {
                 // $VAR_NAME syntax
                 let start = i + 1;
                 let mut end = start;
-                while end < chars.len()
-                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
-                {
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
                     end += 1;
                 }
                 let var_name: String = chars[start..end].iter().collect();
@@ -759,10 +859,7 @@ s3_secret_key = "$hc_test_secret_key"
         let cfg = Config::from_toml_str(toml_data).expect("should parse and expand env vars");
         assert_eq!(cfg.s3_access_key, "AKIA_TEST_KEY_123");
         assert_eq!(cfg.s3_secret_key, "SECRET_VALUE_456");
-        assert_eq!(
-            cfg.s3_endpoint,
-            "https://acct99.r2.cloudflarestorage.com"
-        );
+        assert_eq!(cfg.s3_endpoint, "https://acct99.r2.cloudflarestorage.com");
 
         std::env::remove_var("hc_test_access_key");
         std::env::remove_var("hc_test_secret_key");

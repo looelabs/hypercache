@@ -45,42 +45,53 @@ impl DeviceDetector {
         }
 
         if mode == "manual" && !config.block_devices.is_empty() {
-            info!("Manual device mode enabled. Using {} configured device(s).", config.block_devices.len());
-            return config.block_devices.iter().map(|p| {
-                let dev_name = p.strip_prefix("/dev/").unwrap_or(p);
-                let sysfs_size_path = format!("/sys/class/block/{}/size", dev_name);
-                let real_size = if let Ok(size_str) = fs::read_to_string(&sysfs_size_path) {
-                    size_str.trim().parse::<u64>().unwrap_or(0) * 512
-                } else if let Ok(meta) = fs::metadata(p) {
-                    meta.len()
-                } else {
-                    config.mock_device_size_bytes
-                };
+            info!(
+                "Manual device mode enabled. Using {} configured device(s).",
+                config.block_devices.len()
+            );
+            return config
+                .block_devices
+                .iter()
+                .map(|p| {
+                    let dev_name = p.strip_prefix("/dev/").unwrap_or(p);
+                    let sysfs_size_path = format!("/sys/class/block/{}/size", dev_name);
+                    let real_size = if let Ok(size_str) = fs::read_to_string(&sysfs_size_path) {
+                        size_str.trim().parse::<u64>().unwrap_or(0) * 512
+                    } else if let Ok(meta) = fs::metadata(p) {
+                        meta.len()
+                    } else {
+                        config.mock_device_size_bytes
+                    };
 
-                let sysfs_model_path = format!("/sys/class/block/{}/device/model", dev_name);
-                let model = fs::read_to_string(&sysfs_model_path)
-                    .map(|s| s.trim().to_string())
-                    .ok()
-                    .or_else(|| Some("Explicit Block Device".to_string()));
+                    let sysfs_model_path = format!("/sys/class/block/{}/device/model", dev_name);
+                    let model = fs::read_to_string(&sysfs_model_path)
+                        .map(|s| s.trim().to_string())
+                        .ok()
+                        .or_else(|| Some("Explicit Block Device".to_string()));
 
-                let sysfs_numa_path = format!("/sys/class/block/{}/device/numa_node", dev_name);
-                let numa_node = fs::read_to_string(&sysfs_numa_path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i32>().ok())
-                    .filter(|&n| n >= 0);
+                    let sysfs_numa_path = format!("/sys/class/block/{}/device/numa_node", dev_name);
+                    let numa_node = fs::read_to_string(&sysfs_numa_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .filter(|&n| n >= 0);
 
-                DiscoveredDevice {
-                    path: p.clone(),
-                    is_nvme: p.contains("nvme"),
-                    is_virtual: p.contains("/dev/vd") || p.contains("/dev/xvd"),
-                    is_partition: p.chars().last().map(|c| c.is_numeric()).unwrap_or(false) && !p.ends_with("n1"),
-                    is_rotational: false,
-                    size_bytes: if real_size > 0 { real_size } else { config.mock_device_size_bytes },
-                    model,
-                    existing_fs: None,
-                    numa_node,
-                }
-            }).collect();
+                    DiscoveredDevice {
+                        path: p.clone(),
+                        is_nvme: p.contains("nvme"),
+                        is_virtual: p.contains("/dev/vd") || p.contains("/dev/xvd"),
+                        is_partition: p.chars().last().map(|c| c.is_numeric()).unwrap_or(false) && !p.ends_with("n1"),
+                        is_rotational: false,
+                        size_bytes: if real_size > 0 {
+                            real_size
+                        } else {
+                            config.mock_device_size_bytes
+                        },
+                        model,
+                        existing_fs: None,
+                        numa_node,
+                    }
+                })
+                .collect();
         }
 
         // 1. Attempt Linux hardware and virtual drive detection
@@ -89,7 +100,10 @@ impl DeviceDetector {
             let linux_devices = Self::detect_linux_devices(config);
             if !linux_devices.is_empty() {
                 info!("------------------------------------------------------------");
-                info!("Discovered {} Safe, Unmounted Block Device(s) for Striping Pool:", linux_devices.len());
+                info!(
+                    "Discovered {} Safe, Unmounted Block Device(s) for Striping Pool:",
+                    linux_devices.len()
+                );
                 for dev in &linux_devices {
                     let type_str = if dev.is_nvme {
                         "NVMe"
@@ -99,7 +113,11 @@ impl DeviceDetector {
                         "SSD/Block Device"
                     };
 
-                    let part_str = if dev.is_partition { " [Partition]" } else { " [Whole Disk]" };
+                    let part_str = if dev.is_partition {
+                        " [Partition]"
+                    } else {
+                        " [Whole Disk]"
+                    };
                     let size_str = if dev.size_bytes >= 1024 * 1024 * 1024 * 1024 {
                         format!("{:.2} TiB", dev.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
                     } else {
@@ -133,7 +151,11 @@ impl DeviceDetector {
             let pattern = &config.dev_mock_device_pattern;
             let mock_devices = Self::scan_mock_devices(pattern);
             if !mock_devices.is_empty() {
-                info!("Discovered {} existing mock block device file(s) matching '{}':", mock_devices.len(), pattern);
+                info!(
+                    "Discovered {} existing mock block device file(s) matching '{}':",
+                    mock_devices.len(),
+                    pattern
+                );
                 for d in &mock_devices {
                     info!("  -> {} ({:.2} MiB)", d.path, d.size_bytes as f64 / (1024.0 * 1024.0));
                 }
@@ -216,10 +238,20 @@ impl DeviceDetector {
 
                 let dev_path = format!("/dev/{}", name);
 
+                // sysfs can list devices that have no node in this mount namespace (containers
+                // and pods without a /dev mount see the host VM's disks); they are unusable here.
+                if !Path::new(&dev_path).exists() {
+                    tracing::debug!("Skipping {}: listed in sysfs but no device node exists", dev_path);
+                    continue;
+                }
+
                 // 2. Check if this device or its parent disk is in the mounted set (e.g. vda1, vda14, vda)
                 let base_disk = Self::extract_base_disk_name(&name);
                 if mounted_set.contains(&name) || mounted_set.contains(&base_disk) || mounted_set.contains(&dev_path) {
-                    info!("Excluding mounted / in-use device: {} (base disk: {})", dev_path, base_disk);
+                    info!(
+                        "Excluding mounted / in-use device: {} (base disk: {})",
+                        dev_path, base_disk
+                    );
                     continue;
                 }
 
@@ -262,7 +294,10 @@ impl DeviceDetector {
                         }
                         continue;
                     } else if is_forced {
-                        warn!("Device {} has existing '{}' filesystem, but force_use_devices is set. Proceeding.", dev_path, fs_type);
+                        warn!(
+                            "Device {} has existing '{}' filesystem, but force_use_devices is set. Proceeding.",
+                            dev_path, fs_type
+                        );
                     }
                 }
 
@@ -301,7 +336,9 @@ impl DeviceDetector {
 
                 if !d.is_partition {
                     // If partition exists or partition was excluded due to existing fs, exclude parent disk
-                    if partition_bases.contains(&base.to_string()) || (excluded_by_partition_fs.contains(base) && !is_forced) {
+                    if partition_bases.contains(&base.to_string())
+                        || (excluded_by_partition_fs.contains(base) && !is_forced)
+                    {
                         return false;
                     }
                 }
@@ -376,12 +413,12 @@ impl DeviceDetector {
             }
             return clean.to_string();
         }
-        
+
         let mut non_digit_len = clean.len();
         while non_digit_len > 0 && clean.as_bytes()[non_digit_len - 1].is_ascii_digit() {
             non_digit_len -= 1;
         }
-        
+
         if non_digit_len > 0 && non_digit_len < clean.len() {
             clean[..non_digit_len].to_string()
         } else {
@@ -423,17 +460,13 @@ impl DeviceDetector {
         }
 
         // 5. VFAT / FAT Superblock (Offset 54: "FAT12" or "FAT16", Offset 82: "FAT32")
-        if buf.len() > 90 {
-            if &buf[54..59] == b"FAT12" || &buf[54..59] == b"FAT16" || &buf[82..87] == b"FAT32" {
-                return Some("vfat/fat".to_string());
-            }
+        if buf.len() > 90 && (&buf[54..59] == b"FAT12" || &buf[54..59] == b"FAT16" || &buf[82..87] == b"FAT32") {
+            return Some("vfat/fat".to_string());
         }
 
         // 6. Linux Swap (Offset 4086: "SWAPSPACE2" or "SWAP-SPACE")
-        if buf.len() > 4096 {
-            if &buf[4086..4096] == b"SWAPSPACE2" || &buf[4086..4096] == b"SWAP-SPACE" {
-                return Some("swap".to_string());
-            }
+        if buf.len() > 4096 && (&buf[4086..4096] == b"SWAPSPACE2" || &buf[4086..4096] == b"SWAP-SPACE") {
+            return Some("swap".to_string());
         }
 
         // 7. NTFS (Offset 3: "NTFS    ")
@@ -551,8 +584,7 @@ impl DeviceDetector {
             let _ = fs::create_dir_all(parent);
         }
         if !path.exists() {
-            let file = fs::File::create(path)
-                .with_context(|| format!("Failed to create file {:?}", path))?;
+            let file = fs::File::create(path).with_context(|| format!("Failed to create file {:?}", path))?;
             file.set_len(size_bytes)
                 .with_context(|| format!("Failed to set length for {:?}", path))?;
         }
@@ -576,13 +608,14 @@ impl DeviceDetector {
 
             let arena_str = arena_file.to_string_lossy().to_string();
             if let Err(e) = Self::ensure_file_size(&arena_str, arena_size) {
-                warn!("Failed to provision filesystem Direct I/O arena at {}: {}", arena_str, e);
+                warn!(
+                    "Failed to provision filesystem Direct I/O arena at {}: {}",
+                    arena_str, e
+                );
                 continue;
             }
 
-            let actual_size = fs::metadata(&arena_file)
-                .map(|m| m.len())
-                .unwrap_or(arena_size);
+            let actual_size = fs::metadata(&arena_file).map(|m| m.len()).unwrap_or(arena_size);
 
             info!(
                 "Provisioned Filesystem Direct I/O Arena: {} ({:.2} GiB)",
@@ -626,13 +659,16 @@ mod tests {
 
     #[test]
     fn test_numa_node_extraction() {
-        let temp_dir = std::env::temp_dir().join(format!("hypercache_numa_test_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hypercache_numa_test_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
         let dev_dir = temp_dir.join("device");
         std::fs::create_dir_all(&dev_dir).unwrap();
-        
+
         let numa_file = dev_dir.join("numa_node");
         std::fs::write(&numa_file, "1\n").unwrap();
-        
+
         let extracted = DeviceDetector::extract_numa_node(&temp_dir);
         assert_eq!(extracted, Some(1));
 
@@ -668,10 +704,7 @@ mod tests {
         assert!(devices[0].path.ends_with("hypercache_arena.dat"));
         assert!(devices[1].path.ends_with("hypercache_arena.dat"));
         assert_eq!(devices[0].size_bytes, 64 * 1024 * 1024);
-        assert_eq!(
-            devices[0].model.as_deref(),
-            Some("Filesystem-DirectIO-Arena")
-        );
+        assert_eq!(devices[0].model.as_deref(), Some("Filesystem-DirectIO-Arena"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -25,6 +25,16 @@ controller_admin_port = 9121
 # Can also be set via: export HYPERCACHE_AUTH_TOKEN="your-cluster-token"
 # cluster_auth_token = "your-cluster-token"
 
+# Zero-config local admin: loopback callers skip the token check (default true).
+# Set to false whenever traffic can reach the controller through a local proxy (Kubernetes
+# sidecars such as Istio/Envoy, nginx, kubectl port-forward): those connections also arrive
+# from 127.0.0.1 and would otherwise bypass authentication.
+allow_local_admin_bypass = true
+
+# Nodes that have not sent a heartbeat for this many seconds are removed from the registry
+# (they show as OFFLINE after 15 s and are never sent fleet operations).
+node_gc_secs = 600
+
 # ==============================================================================
 # 3. P2P FLEET PRE-WARMING & CONSISTENT SHARDING
 # ==============================================================================

@@ -1,4 +1,5 @@
 pub mod agent_server;
+pub mod auth;
 pub mod bench;
 pub mod check;
 pub mod config;

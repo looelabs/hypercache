@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to create/update on GitHub Releases (e.g. v0.9.0)"
+        description: "Release tag to create/update on GitHub Releases (e.g. v0.9.1)"
         required: false
-        default: "v0.9.0"
+        default: "v0.9.1"
 
 permissions:
   contents: write
@@ -32,11 +32,17 @@ jobs:
           workspaces: "control-plane -> target"
 
       - name: Run Rust unit test suite
-        run: cargo test --manifest-path control-plane/Cargo.toml
+        run: cargo test --locked --manifest-path control-plane/Cargo.toml
+
+      - name: Run Python client test suite
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "numpy>=1.22" "fsspec>=2023.1.0" pytest
+          python3 -m pytest -q client-py/tests
 
       - name: Build release binaries (hypercache & hypercache-admin)
         run: |
-          cargo build --release --manifest-path control-plane/Cargo.toml
+          cargo build --locked --release --manifest-path control-plane/Cargo.toml
           strip control-plane/target/release/hypercache
           strip control-plane/target/release/hypercache-admin
 

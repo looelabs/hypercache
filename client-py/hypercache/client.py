@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
+import threading
 from dataclasses import dataclass
 from typing import List, Optional
 
 from hypercache.datapath import ChunkLocation
 
-import os
+logger = logging.getLogger("hypercache.client")
+
+# Sentinel meaning "use the client's default request timeout"
+_DEFAULT = object()
 
 PRIMARY_SOCKET_PATH = "/run/hypercache/hypercache.sock"
 FALLBACK_SOCKET_PATH = "/tmp/hypercache/hypercache.sock"
@@ -23,6 +28,9 @@ LEGACY_SOCKET_PATH = "/tmp/hypercache.sock"
 
 def get_default_socket_path() -> str:
     """Discovers and returns the active HyperCache Unix Domain Socket path."""
+    override = os.environ.get("HYPERCACHE_SOCKET_PATH", "").strip()
+    if override:
+        return override
     if os.path.exists(PRIMARY_SOCKET_PATH):
         return PRIMARY_SOCKET_PATH
     if os.path.exists(FALLBACK_SOCKET_PATH):
@@ -44,6 +52,8 @@ class LocateResult:
     chunk_size: int
     chunk_layout: List[ChunkLocation]
     error_message: Optional[str] = None
+    # Layout generation reported by the daemon (changes whenever the URI is re-ingested or rewritten)
+    generation: Optional[int] = None
 
     @property
     def is_hit(self) -> bool:
@@ -92,12 +102,46 @@ class DiscoveredDeviceInfo:
 
 
 class HyperCacheClient:
-    """Client for querying the HyperCache Control Plane daemon via Unix Domain Socket."""
+    """Client for querying the HyperCache Control Plane daemon via Unix Domain Socket.
 
-    def __init__(self, socket_path: Optional[str] = None, timeout: float = 120.0):
+    A client instance is safe to share between threads (requests are serialized on one
+    connection) and across fork() (the child transparently opens its own connection).
+
+    Args:
+        socket_path: daemon socket; auto-discovered when omitted.
+        timeout: per-request timeout in seconds for metadata calls.
+        ingest_timeout: timeout for calls that may download a whole object from S3/NFS
+            (locate with auto_ingest, ingest, preload). None waits indefinitely, since
+            multi-GB ingests legitimately take minutes.
+    """
+
+    def __init__(
+        self,
+        socket_path: Optional[str] = None,
+        timeout: float = 120.0,
+        ingest_timeout: Optional[float] = None,
+    ):
         self.socket_path = socket_path or get_default_socket_path()
         self.timeout = timeout
+        self.ingest_timeout = ingest_timeout
         self._sock: Optional[socket.socket] = None
+        self._rbuf = bytearray()
+        self._lock = threading.RLock()
+        self._pid = os.getpid()
+
+    def _check_fork(self) -> None:
+        # A socket inherited from the parent process is shared with it, so a response could
+        # be read by the wrong process. Close this process's copy and reconnect lazily.
+        if self._pid != os.getpid():
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+            self._sock = None
+            self._rbuf = bytearray()
+            self._lock = threading.RLock()
+            self._pid = os.getpid()
 
     def _connect(self) -> socket.socket:
         if self._sock is not None:
@@ -108,37 +152,43 @@ class HyperCacheClient:
             sock.settimeout(self.timeout)
             sock.connect(self.socket_path)
             self._sock = sock
+            self._rbuf = bytearray()
             return sock
         except Exception as e:
-            logger.error(f"Failed to connect to HyperCache daemon at {self.socket_path}: {e}")
+            logger.debug(f"Failed to connect to HyperCache daemon at {self.socket_path}: {e}")
             raise ConnectionError(
                 f"HyperCache daemon unreachable at {self.socket_path}. Is the daemon running?"
             ) from e
 
-    def _send_request(self, payload: dict) -> dict:
-        sock = self._connect()
-        data = (json.dumps(payload) + "\n").encode("utf-8")
-        try:
-            sock.sendall(data)
-            
-            # Read newline-terminated response
-            resp_buf = bytearray()
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                resp_buf.extend(chunk)
-                if b"\n" in chunk:
-                    break
-
-            if not resp_buf:
+    def _read_line(self, sock: socket.socket) -> bytes:
+        while True:
+            idx = self._rbuf.find(b"\n")
+            if idx >= 0:
+                line = bytes(self._rbuf[:idx])
+                del self._rbuf[: idx + 1]
+                return line
+            chunk = sock.recv(65536)
+            if not chunk:
                 raise ConnectionResetError("Connection closed by server without response")
+            self._rbuf.extend(chunk)
 
-            line = bytes(resp_buf).split(b"\n", 1)[0].decode("utf-8")
-            return json.loads(line)
-        except (socket.error, ConnectionError):
-            self.close()
-            raise
+    def _send_request(self, payload: dict, timeout=_DEFAULT) -> dict:
+        self._check_fork()
+        with self._lock:
+            sock = self._connect()
+            data = (json.dumps(payload) + "\n").encode("utf-8")
+            try:
+                sock.settimeout(self.timeout if timeout is _DEFAULT else timeout)
+                sock.sendall(data)
+                while True:
+                    line = self._read_line(sock)
+                    if line.strip():
+                        return json.loads(line.decode("utf-8"))
+            except (OSError, ConnectionError, ValueError):
+                # Timeouts, resets and garbled frames leave the stream in an unknown
+                # position; drop the connection so the next request starts clean.
+                self.close()
+                raise
 
     def ping(self) -> bool:
         """Checks if the control plane is alive."""
@@ -174,7 +224,7 @@ class HyperCacheClient:
         if tier is not None:
             req["tier"] = tier.lower()
 
-        resp = self._send_request(req)
+        resp = self._send_request(req, timeout=self.ingest_timeout if auto_ingest else _DEFAULT)
         status = resp.get("status", "ERROR")
 
         if status == "HIT":
@@ -186,6 +236,7 @@ class HyperCacheClient:
                 object_size=resp.get("object_size", 0),
                 chunk_size=resp.get("chunk_size", 4194304),
                 chunk_layout=chunk_layout,
+                generation=resp.get("generation"),
             )
         elif status == "MISS":
             return LocateResult(
@@ -218,7 +269,7 @@ class HyperCacheClient:
         }
         if tier is not None:
             req["tier"] = tier.lower()
-        resp = self._send_request(req)
+        resp = self._send_request(req, timeout=self.ingest_timeout)
         status = resp.get("status", "ERROR")
         if status in ("HIT", "INGESTED"):
             chunk_layout = [
@@ -229,6 +280,7 @@ class HyperCacheClient:
                 object_size=resp.get("object_size", 0),
                 chunk_size=resp.get("chunk_size", 4194304),
                 chunk_layout=chunk_layout,
+                generation=resp.get("generation"),
             )
         else:
             err = resp.get("error_message", "Ingestion failed")
@@ -382,13 +434,17 @@ class HyperCacheClient:
         if sha256 is not None:
             req["sha256"] = sha256
 
-        resp = self._send_request(req)
+        # Commit hashes the staged data (when sha256 is given) and, for write-through, uploads it
+        resp = self._send_request(req, timeout=self.ingest_timeout)
         status = resp.get("status", "ERROR")
-        return status in ("WRITECOMMITTED", "WRITE_COMMITTED")
+        if status not in ("WRITECOMMITTED", "WRITE_COMMITTED"):
+            logger.error(f"Commit of '{uri}' failed: {resp.get('error_message', 'unknown error')}")
+            return False
+        return True
 
     def get_write_status(self, uri: str) -> dict:
         """
-        Queries current sync status (STAGED, COMMITTED, SYNCING_BACKEND, SYNCED_BACKEND).
+        Queries current sync status (STAGED, COMMITTED, SYNCING_BACKEND, SYNCED_BACKEND, SYNC_FAILED).
         """
         req = {
             "action": "get_write_status",
@@ -448,6 +504,7 @@ class HyperCacheClient:
             except Exception:
                 pass
             self._sock = None
+        self._rbuf = bytearray()
 
     def __enter__(self) -> HyperCacheClient:
         return self

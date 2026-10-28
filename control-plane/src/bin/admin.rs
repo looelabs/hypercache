@@ -10,8 +10,8 @@ use hypercache_control_plane::fleet;
 #[derive(Parser, Debug)]
 #[command(
     name = "hypercache-admin",
-    author = "HyperCache Team",
-    version = "0.9.0-beta",
+    author = "Looe Labs",
+    version = env!("CARGO_PKG_VERSION"),
     about = "HyperCache Central Cluster Controller & Fleet Administration Suite",
     long_about = "Dedicated administrative CLI for managing multi-node HyperCache AI clusters. Provides cluster topology visibility, node health monitoring, and parallel fleet-wide model pre-loading and eviction."
 )]
@@ -142,17 +142,14 @@ async fn main() -> Result<()> {
         Config::default()
     };
 
-    let controller_url = cli
-        .controller
-        .or(config.controller_url)
-        .unwrap_or_else(|| {
-            let host = if config.controller_bind_address == "0.0.0.0" {
-                "127.0.0.1".to_string()
-            } else {
-                config.controller_bind_address.clone()
-            };
-            format!("http://{}:{}", host, config.controller_port)
-        });
+    let controller_url = cli.controller.or(config.controller_url).unwrap_or_else(|| {
+        let host = if config.controller_bind_address == "0.0.0.0" {
+            "127.0.0.1".to_string()
+        } else {
+            config.controller_bind_address.clone()
+        };
+        format!("http://{}:{}", host, config.controller_port)
+    });
 
     let auth_token = cli.token.or(config.cluster_auth_token);
 
@@ -178,7 +175,9 @@ async fn main() -> Result<()> {
                     eprintln!("Please specify the configuration file using -c <path>:");
                     eprintln!("  ./hypercache-admin -c /path/to/hypercache-controller.toml controller");
                     eprintln!("====================================================================================================");
-                    return Err(anyhow::anyhow!("Missing required configuration file. Please provide -c <path>."));
+                    return Err(anyhow::anyhow!(
+                        "Missing required configuration file. Please provide -c <path>."
+                    ));
                 }
             };
             let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -188,14 +187,27 @@ async fn main() -> Result<()> {
             let p = port.unwrap_or(config.controller_port);
             controller::run_controller_server_with_config(&bind_addr, p, auth_token, config).await
         }
-        AdminCommands::Nodes { json } => {
-            fleet::run_fleet_nodes(&controller_url, auth_token, json).await
-        }
+        AdminCommands::Nodes { json } => fleet::run_fleet_nodes(&controller_url, auth_token, json).await,
         AdminCommands::Preload { uri, nodes, selector } => {
             fleet::run_fleet_preload(&controller_url, auth_token, &uri, Some(nodes), selector).await
         }
-        AdminCommands::PreloadBatch { prefix, uris, sharded, nodes, selector } => {
-            fleet::run_fleet_preload_batch(&controller_url, auth_token, prefix, uris, Some(nodes), selector, sharded).await
+        AdminCommands::PreloadBatch {
+            prefix,
+            uris,
+            sharded,
+            nodes,
+            selector,
+        } => {
+            fleet::run_fleet_preload_batch(
+                &controller_url,
+                auth_token,
+                prefix,
+                uris,
+                Some(nodes),
+                selector,
+                sharded,
+            )
+            .await
         }
         AdminCommands::Evict { uri, nodes, selector } => {
             fleet::run_fleet_evict(&controller_url, auth_token, &uri, Some(nodes), selector).await
@@ -203,8 +215,6 @@ async fn main() -> Result<()> {
         AdminCommands::Purge { nodes, selector } => {
             fleet::run_fleet_purge(&controller_url, auth_token, Some(nodes), selector).await
         }
-        AdminCommands::Status => {
-            fleet::run_fleet_nodes(&controller_url, auth_token, false).await
-        }
+        AdminCommands::Status => fleet::run_fleet_nodes(&controller_url, auth_token, false).await,
     }
 }

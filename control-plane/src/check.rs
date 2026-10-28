@@ -63,9 +63,7 @@ pub fn evaluate_host(
                     name: "Configuration File".to_string(),
                     status: CheckStatus::Fail,
                     detail: format!("Specified configuration file {:?} does not exist", p),
-                    remediation: Some(
-                        "Provide a valid path via -c configs/hypercache-agent.toml".to_string(),
-                    ),
+                    remediation: Some("Provide a valid path via -c configs/hypercache-agent.toml".to_string()),
                 });
                 Config::default()
             } else {
@@ -86,9 +84,7 @@ pub fn evaluate_host(
                             name: "Configuration File".to_string(),
                             status: CheckStatus::Fail,
                             detail: format!("Failed to parse TOML at {}: {}", p.display(), e),
-                            remediation: Some(
-                                "Fix syntax errors in the TOML configuration file".to_string(),
-                            ),
+                            remediation: Some("Fix syntax errors in the TOML configuration file".to_string()),
                         });
                         Config::default()
                     }
@@ -101,9 +97,7 @@ pub fn evaluate_host(
                 name: "Configuration File".to_string(),
                 status: CheckStatus::Warn,
                 detail: "No -c <config> specified; evaluating with default parameters".to_string(),
-                remediation: Some(
-                    "Pass -c configs/hypercache-agent.toml when starting the daemon".to_string(),
-                ),
+                remediation: Some("Pass -c configs/hypercache-agent.toml when starting the daemon".to_string()),
             });
             Config::default()
         }
@@ -140,16 +134,13 @@ pub fn evaluate_host(
                 config.chunk_size_bytes
             ),
             remediation: Some(
-                "Set chunk_size_bytes = 4194304 (4 MiB) and device_start_offset_bytes = 4096"
-                    .to_string(),
+                "Set chunk_size_bytes = 4194304 (4 MiB) and device_start_offset_bytes = 4096".to_string(),
             ),
         });
     }
 
     // 2. Host OS, CPU Concurrency & Hardware Acceleration Capabilities
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let worker_threads = (cores * 4).clamp(16, 64);
     checks.push(CheckItem {
         category: "Host".to_string(),
@@ -197,9 +188,7 @@ pub fn evaluate_host(
     // 3. IPC Socket, Host Lockfile & Metadata Persistence Paths
     let socket_path = config::get_socket_path();
     let lock_path = config::get_lock_path();
-    let ipc_dir = socket_path
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp/hypercache"));
+    let ipc_dir = socket_path.parent().unwrap_or_else(|| Path::new("/tmp/hypercache"));
 
     match fs::create_dir_all(ipc_dir) {
         Ok(_) => {
@@ -247,10 +236,7 @@ pub fn evaluate_host(
                         name: "Socket & Lockfile Directory".to_string(),
                         status: CheckStatus::Fail,
                         detail: format!("Cannot open or create lockfile {:?}: {}", lock_path, e),
-                        remediation: Some(format!(
-                            "Ensure write permissions on {}",
-                            ipc_dir.display()
-                        )),
+                        remediation: Some(format!("Ensure write permissions on {}", ipc_dir.display())),
                     });
                 }
             }
@@ -271,7 +257,13 @@ pub fn evaluate_host(
         let parent = meta_path.parent().unwrap_or_else(|| Path::new("/var/lib/hypercache"));
         let writable = if fs::create_dir_all(parent).is_ok() {
             let probe = parent.join(".hypercache_write_probe");
-            if OpenOptions::new().write(true).create(true).truncate(true).open(&probe).is_ok() {
+            if OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&probe)
+                .is_ok()
+            {
                 let _ = fs::remove_file(&probe);
                 true
             } else {
@@ -379,8 +371,7 @@ pub fn evaluate_host(
             status: CheckStatus::Warn,
             detail: "No Tier 2 block devices or arenas detected; operating in Tier 1 Host RAM-only mode".to_string(),
             remediation: Some(
-                "Attach unformatted NVMe drives or configure filesystem_cache_paths for Tier 2 persistence"
-                    .to_string(),
+                "Attach unformatted NVMe drives or configure filesystem_cache_paths for Tier 2 persistence".to_string(),
             ),
         });
     } else {
@@ -415,7 +406,11 @@ pub fn evaluate_host(
                     let _ = fs::remove_file(&probe_file);
                     let avail = fs2::available_space(&shm_dir).unwrap_or(0);
                     let auto_cap = config.ram_cache_capacity_bytes.unwrap_or(8 * 1024 * 1024 * 1024);
-                    let status_label = if config.ram_cache_enabled { "ENABLED" } else { "READY (Disabled in config)" };
+                    let status_label = if config.ram_cache_enabled {
+                        "ENABLED"
+                    } else {
+                        "READY (Disabled in config)"
+                    };
                     checks.push(CheckItem {
                         category: "Memory".to_string(),
                         name: "Tier 1 Shared Memory Pool".to_string(),
@@ -441,9 +436,7 @@ pub fn evaluate_host(
                         name: "Tier 1 Shared Memory Pool".to_string(),
                         status: st,
                         detail: format!("Shared memory probe failed at {}: {}", shm_dir.display(), e),
-                        remediation: Some(
-                            "Ensure /dev/shm or /tmp/hypercache/shm is mounted and writable".to_string(),
-                        ),
+                        remediation: Some("Ensure /dev/shm or /tmp/hypercache/shm is mounted and writable".to_string()),
                     });
                 }
             }
@@ -578,12 +571,9 @@ fn probe_http_endpoint(url: &str, timeout: Duration) -> std::result::Result<Sock
         .to_socket_addrs()
         .map_err(|e| format!("DNS/address resolution failed: {}", e))?;
 
-    let first_addr = addrs
-        .next()
-        .ok_or_else(|| "No socket address resolved".to_string())?;
+    let first_addr = addrs.next().ok_or_else(|| "No socket address resolved".to_string())?;
 
-    TcpStream::connect_timeout(&first_addr, timeout)
-        .map_err(|e| format!("TCP connect timeout/refused: {}", e))?;
+    TcpStream::connect_timeout(&first_addr, timeout).map_err(|e| format!("TCP connect timeout/refused: {}", e))?;
 
     Ok(first_addr)
 }

@@ -209,7 +209,7 @@ impl TelemetryCollector {
                                     let body = state.render_prometheus();
                                     let response = format!(
                                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-                                        body.as_bytes().len(),
+                                        body.len(),
                                         body
                                     );
                                     let _ = stream.write_all(response.as_bytes()).await;
@@ -232,25 +232,41 @@ impl TelemetryCollector {
         match event.event_type.as_str() {
             "CACHE_HIT" => {
                 self.state.cache_hits.fetch_add(1, Ordering::Relaxed);
-                self.state.bytes_served.fetch_add(event.object_size_bytes, Ordering::Relaxed);
-                self.state.s3_egress_bytes_saved.fetch_add(event.object_size_bytes, Ordering::Relaxed);
+                self.state
+                    .bytes_served
+                    .fetch_add(event.object_size_bytes, Ordering::Relaxed);
+                self.state
+                    .s3_egress_bytes_saved
+                    .fetch_add(event.object_size_bytes, Ordering::Relaxed);
                 if event.bandwidth_mbps > 0.0 {
-                    self.state.last_bandwidth_x100.store((event.bandwidth_mbps * 100.0) as u64, Ordering::Relaxed);
+                    self.state
+                        .last_bandwidth_x100
+                        .store((event.bandwidth_mbps * 100.0) as u64, Ordering::Relaxed);
                 }
                 if event.local_meta_us > 0 {
-                    self.state.last_local_meta_us.store(event.local_meta_us, Ordering::Relaxed);
+                    self.state
+                        .last_local_meta_us
+                        .store(event.local_meta_us, Ordering::Relaxed);
                 }
                 if event.remote_meta_us > 0 {
-                    self.state.last_remote_meta_us.store(event.remote_meta_us, Ordering::Relaxed);
+                    self.state
+                        .last_remote_meta_us
+                        .store(event.remote_meta_us, Ordering::Relaxed);
                 }
                 if event.local_ttfb_us > 0 {
-                    self.state.last_local_ttfb_us.store(event.local_ttfb_us, Ordering::Relaxed);
+                    self.state
+                        .last_local_ttfb_us
+                        .store(event.local_ttfb_us, Ordering::Relaxed);
                 }
                 if event.remote_ttfb_us > 0 {
-                    self.state.last_remote_ttfb_us.store(event.remote_ttfb_us, Ordering::Relaxed);
+                    self.state
+                        .last_remote_ttfb_us
+                        .store(event.remote_ttfb_us, Ordering::Relaxed);
                 }
                 if event.time_saved_ms > 0 {
-                    self.state.gpu_idle_time_saved_ms.fetch_add(event.time_saved_ms, Ordering::Relaxed);
+                    self.state
+                        .gpu_idle_time_saved_ms
+                        .fetch_add(event.time_saved_ms, Ordering::Relaxed);
                 }
             }
             "CACHE_MISS" => {
@@ -258,7 +274,9 @@ impl TelemetryCollector {
             }
             "INGESTION" => {
                 self.state.ingestions.fetch_add(1, Ordering::Relaxed);
-                self.state.storage_used_bytes.fetch_add(event.object_size_bytes, Ordering::Relaxed);
+                self.state
+                    .storage_used_bytes
+                    .fetch_add(event.object_size_bytes, Ordering::Relaxed);
                 self.state.cached_objects_count.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}

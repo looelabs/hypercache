@@ -11,13 +11,13 @@ RUN mkdir -p src/bin && \
     echo "fn main() {}" > src/main.rs && \
     echo "fn main() {}" > src/bin/admin.rs && \
     echo "" > src/lib.rs && \
-    cargo build --release && \
+    cargo build --locked --release && \
     rm -rf src
 
 # Copy actual control-plane source and compile release binaries
 COPY control-plane/src ./src
 RUN touch src/lib.rs src/main.rs src/bin/admin.rs && \
-    cargo build --release --bins && \
+    cargo build --locked --release --bins && \
     strip target/release/hypercache target/release/hypercache-admin
 
 # ==============================================================================

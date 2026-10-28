@@ -14,8 +14,10 @@ pub struct FleetClient {
 
 impl FleetClient {
     pub fn new(controller_url: String, auth_token: Option<String>) -> Self {
+        // No total request timeout: fleet preloads of large models can legitimately run for many
+        // minutes. The controller bounds per-node work; here we only bound connection setup.
         let client = Client::builder()
-            .timeout(Duration::from_secs(180))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -26,22 +28,73 @@ impl FleetClient {
         }
     }
 
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        crate::auth::with_bearer(req, self.auth_token.as_deref())
+    }
+
+    /// Turns a non-2xx controller response into a readable error (the controller returns
+    /// `{"error": "..."}` or a list of per-node failures).
+    async fn error_from(resp: reqwest::Response, url: &str) -> anyhow::Error {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str().map(str::to_string))
+                    .or_else(|| {
+                        v.as_array().map(|arr| {
+                            arr.iter()
+                                .filter_map(|r| r.get("message").and_then(|m| m.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                    })
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| body.trim().to_string());
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::anyhow!(
+                "Controller at {} rejected the request (HTTP 401). Set --token or HYPERCACHE_AUTH_TOKEN to the cluster_auth_token. {}",
+                url,
+                detail
+            )
+        } else {
+            anyhow::anyhow!("Controller at {} returned HTTP {}: {}", url, status, detail)
+        }
+    }
+
+    async fn post_fleet<T: serde::Serialize>(
+        &self,
+        path: &str,
+        payload: &T,
+        what: &str,
+    ) -> Result<Vec<FleetOperationResult>> {
+        let url = format!("{}{}", self.controller_url, path);
+        let resp = self
+            .authorize(self.client.post(&url).json(payload))
+            .send()
+            .await
+            .with_context(|| format!("Failed to dispatch {} to Controller at {}", what, url))?;
+        if !resp.status().is_success() {
+            return Err(Self::error_from(resp, &url).await);
+        }
+        resp.json()
+            .await
+            .with_context(|| format!("Controller returned an unreadable {} response", what))
+    }
+
     pub async fn get_nodes(&self) -> Result<FleetSummary> {
         let url = format!("{}/api/v1/nodes", self.controller_url);
-        let mut req = self.client.get(&url);
-        if let Some(ref tok) = self.auth_token {
-            if !tok.trim().is_empty() {
-                req = req.bearer_auth(tok.trim());
-            }
-        }
-
-        let resp = req
+        let resp = self
+            .authorize(self.client.get(&url))
             .send()
             .await
             .with_context(|| format!("Failed to connect to HyperCache Controller at {}", url))?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("Controller returned error status {}", resp.status());
+            return Err(Self::error_from(resp, &url).await);
         }
 
         let summary: FleetSummary = resp.json().await?;
@@ -54,28 +107,13 @@ impl FleetClient {
         nodes: Option<String>,
         selector: Option<String>,
     ) -> Result<Vec<FleetOperationResult>> {
-        let url = format!("{}/api/v1/fleet/preload", self.controller_url);
         let payload = FleetPreloadRequest {
             uri: uri.to_string(),
             nodes,
             selector,
             p2p: false,
         };
-
-        let mut req = self.client.post(&url).json(&payload);
-        if let Some(ref tok) = self.auth_token {
-            if !tok.trim().is_empty() {
-                req = req.bearer_auth(tok.trim());
-            }
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to dispatch preload to Controller at {}", url))?;
-
-        let results: Vec<FleetOperationResult> = resp.json().await?;
-        Ok(results)
+        self.post_fleet("/api/v1/fleet/preload", &payload, "preload").await
     }
 
     pub async fn preload_batch(
@@ -86,7 +124,6 @@ impl FleetClient {
         selector: Option<String>,
         sharded: bool,
     ) -> Result<Vec<FleetOperationResult>> {
-        let url = format!("{}/api/v1/fleet/preload_batch", self.controller_url);
         let payload = crate::controller::FleetPreloadBatchRequest {
             uris,
             prefix,
@@ -94,21 +131,8 @@ impl FleetClient {
             selector,
             sharded,
         };
-
-        let mut req = self.client.post(&url).json(&payload);
-        if let Some(ref tok) = self.auth_token {
-            if !tok.trim().is_empty() {
-                req = req.bearer_auth(tok.trim());
-            }
-        }
-
-        let resp = req
-            .send()
+        self.post_fleet("/api/v1/fleet/preload_batch", &payload, "preload_batch")
             .await
-            .with_context(|| format!("Failed to dispatch preload_batch to Controller at {}", url))?;
-
-        let results: Vec<FleetOperationResult> = resp.json().await?;
-        Ok(results)
     }
 
     pub async fn evict(
@@ -117,51 +141,17 @@ impl FleetClient {
         nodes: Option<String>,
         selector: Option<String>,
     ) -> Result<Vec<FleetOperationResult>> {
-        let url = format!("{}/api/v1/fleet/evict", self.controller_url);
         let payload = FleetEvictRequest {
             uri: uri.to_string(),
             nodes,
             selector,
         };
-
-        let mut req = self.client.post(&url).json(&payload);
-        if let Some(ref tok) = self.auth_token {
-            if !tok.trim().is_empty() {
-                req = req.bearer_auth(tok.trim());
-            }
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to dispatch evict to Controller at {}", url))?;
-
-        let results: Vec<FleetOperationResult> = resp.json().await?;
-        Ok(results)
+        self.post_fleet("/api/v1/fleet/evict", &payload, "evict").await
     }
 
-    pub async fn purge(
-        &self,
-        nodes: Option<String>,
-        selector: Option<String>,
-    ) -> Result<Vec<FleetOperationResult>> {
-        let url = format!("{}/api/v1/fleet/purge", self.controller_url);
+    pub async fn purge(&self, nodes: Option<String>, selector: Option<String>) -> Result<Vec<FleetOperationResult>> {
         let payload = FleetPurgeRequest { nodes, selector };
-
-        let mut req = self.client.post(&url).json(&payload);
-        if let Some(ref tok) = self.auth_token {
-            if !tok.trim().is_empty() {
-                req = req.bearer_auth(tok.trim());
-            }
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to dispatch purge to Controller at {}", url))?;
-
-        let results: Vec<FleetOperationResult> = resp.json().await?;
-        Ok(results)
+        self.post_fleet("/api/v1/fleet/purge", &payload, "purge").await
     }
 }
 
@@ -178,7 +168,8 @@ pub async fn run_fleet_nodes(controller_url: &str, auth_token: Option<String>, j
     println!("                               HYPERCACHE FLEET TOPOLOGY & INVENTORY                                ");
     println!("====================================================================================================");
     println!("Controller:  {}", controller_url);
-    println!("Fleet State: {}/{} Nodes Online | Aggregate Pool: {} | Active Footprint: {} ({} models)",
+    println!(
+        "Fleet State: {}/{} Nodes Online | Aggregate Pool: {} | Active Footprint: {} ({} models)",
         summary.online_nodes,
         summary.total_nodes,
         format_bytes(summary.aggregate_capacity_bytes),
@@ -284,7 +275,7 @@ pub async fn run_fleet_preload(
         format_bytes(total_bytes)
     );
     println!("====================================================================================================");
-    Ok(())
+    ensure_all_succeeded(&results, "preload")
 }
 
 pub async fn run_fleet_preload_batch(
@@ -301,7 +292,14 @@ pub async fn run_fleet_preload_batch(
     println!("                          HYPERCACHE FLEET BATCH PRELOAD & DATASET SHARDING                          ");
     println!("====================================================================================================");
     println!("Controller:  {}", controller_url);
-    println!("Sharded:     {}", if sharded { "ENABLED (Targeted modulo worker partition)" } else { "DISABLED (Full replication)" });
+    println!(
+        "Sharded:     {}",
+        if sharded {
+            "ENABLED (Targeted modulo worker partition)"
+        } else {
+            "DISABLED (Full replication)"
+        }
+    );
     if let Some(ref p) = prefix {
         println!("Prefix:      {}", p);
     }
@@ -342,7 +340,7 @@ pub async fn run_fleet_preload_batch(
         format_bytes(total_bytes)
     );
     println!("====================================================================================================");
-    Ok(())
+    ensure_all_succeeded(&results, "preload_batch")
 }
 
 pub async fn run_fleet_evict(
@@ -363,7 +361,7 @@ pub async fn run_fleet_evict(
             println!("  [FAIL] {:<20} -> {}", res.node_id, res.message);
         }
     }
-    Ok(())
+    ensure_all_succeeded(&results, "evict")
 }
 
 pub async fn run_fleet_purge(
@@ -382,6 +380,19 @@ pub async fn run_fleet_purge(
         } else {
             println!("  [FAIL] {:<20} -> {}", res.node_id, res.message);
         }
+    }
+    ensure_all_succeeded(&results, "purge")
+}
+
+/// Fleet commands exit non-zero when any targeted node failed (or none matched), so they can be
+/// used in scripts and CI.
+fn ensure_all_succeeded(results: &[FleetOperationResult], what: &str) -> Result<()> {
+    let failed = results.iter().filter(|r| !r.success).count();
+    if results.is_empty() {
+        anyhow::bail!("Fleet {} matched no online nodes", what);
+    }
+    if failed > 0 {
+        anyhow::bail!("Fleet {} failed on {} of {} node(s)", what, failed, results.len());
     }
     Ok(())
 }

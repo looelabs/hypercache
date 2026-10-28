@@ -301,8 +301,11 @@ scrape_configs:
 ## 8. Network Security & Production Hardening Checklist
 
 1. **Private Subnets Only**: Ensure `controller_bind_address` and `agent_bind_address` are bound to your private cluster network (e.g. `10.0.0.x`), never public IPs.
-2. **Bearer Token Authentication**: Set `cluster_auth_token` in `configs/hypercache-agent.toml` / `configs/hypercache-controller.toml` or `export HYPERCACHE_AUTH_TOKEN="your-cluster-secret"`.
+2. **Bearer Token Authentication**: Set `cluster_auth_token` in `configs/hypercache-agent.toml` / `configs/hypercache-controller.toml` or `export HYPERCACHE_AUTH_TOKEN="your-cluster-secret"`. The agent API refuses to start on a non-loopback `agent_bind_address` without a token.
 3. **Firewall Rules (Security Groups)**:
    - Port `9120` (Controller): Open only to GPU Worker node IPs.
-   - Port `9115` (Agent API): Open only to Controller IP.
+   - Port `9115` (Agent API): Open only to the Controller IP and peer GPU worker IPs (P2P chunk pulls and checkpoint replicas travel agent-to-agent).
    - Port `9110` (Prometheus): Open only to Prometheus scraper IP or `127.0.0.1`.
+4. **Proxies and Sidecars**: If the controller sits behind a local proxy (Istio/Envoy sidecar, nginx, `kubectl port-forward`), set `allow_local_admin_bypass = false` in `hypercache-controller.toml`. Otherwise forwarded remote calls arrive from `127.0.0.1` and skip the token check.
+5. **Restrict Filesystem Access**: `file://` and `nfs://` URIs may only reach `nfs_mount_path` and the directories listed in `nfs_allowed_paths`. Add dataset or checkpoint directories there explicitly instead of widening `nfs_mount_path` to `/`.
+6. **Verify Before Rollout**: Run `scripts/verify_release.sh` on the build you deploy. It exercises the daemon, the fleet controller and a live S3 endpoint end to end.

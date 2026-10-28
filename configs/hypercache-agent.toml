@@ -71,8 +71,19 @@ s3_bucket = "hypercache-authoritative"
 # S3 Credentials: supports literal strings, shell variables ($VAR or "${VAR}"), or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars
 s3_access_key = ""
 s3_secret_key = ""
+# Temporary credentials (STS / IRSA / instance roles). Defaults to the AWS_SESSION_TOKEN env var.
+# s3_session_token = "$AWS_SESSION_TOKEN"
+
+# Ingest throughput: number of parallel ranged GETs per object (one 4 MiB chunk each)
+s3_parallel_streams = 8
+# Abort a GET/PUT only if no bytes arrive for this long (no cap on total transfer time)
+s3_read_timeout_secs = 60
+# Objects larger than this are uploaded with S3 multipart upload (required above 5 GiB)
+s3_multipart_threshold_bytes = 67108864 # 64 MiB
 
 # Synthetic S3 Fallback for Offline Benchmarks (Disabled by default so real S3 errors fail fast)
+# When false, synthetic data is never cached for any URI. The `hypercache bench` command opts in
+# explicitly for its own hypercache://models/benchmark/ URIs only.
 allow_synthetic_s3_fallback = false
 
 # Peer-to-Peer (P2P) Checkpoint Replication Factor (1 = local + S3 write-back, 2 = k=2 peer replica + S3)
@@ -81,6 +92,14 @@ peer_replication_factor = 1
 # NFS / Shared POSIX Filesystem Settings (used when authoritative_backend = "nfs" or URI is file:///nfs://)
 nfs_mount_path = "/mnt/nfs"
 nfs_read_buffer_bytes = 4194304 # 4 MiB
+# file:// and nfs:// URIs are confined to nfs_mount_path plus these extra roots. Paths outside
+# them (or escaping via ".." / symlinks) are rejected, so a client cannot make the daemon read
+# or write arbitrary host files such as /etc/shadow.
+# nfs_allowed_paths = ["/mnt/datasets", "/scratch/checkpoints"]
+
+# Freed blocks are held for this many seconds before reuse, so a reader that resolved a layout
+# just before an eviction or re-ingest never reads another object's bytes.
+reclaim_grace_secs = 30
 
 # Write-Through vs. Write-Back Caching Mode
 # Disabled by default (false = asynchronous Write-Back for ultra-fast non-blocking checkpoint saves).
@@ -106,6 +125,8 @@ agent_bind_address = "0.0.0.0"
 agent_http_port = 9115
 
 # Cluster Security Token (Required when talking to an authenticated Controller)
+# REQUIRED for the agent API on any non-loopback agent_bind_address: without it the agent API
+# refuses to start (it can purge the cache and write to raw devices).
 # Can also be set via: export HYPERCACHE_AUTH_TOKEN="your-cluster-token"
 # cluster_auth_token = "your-cluster-token"
 

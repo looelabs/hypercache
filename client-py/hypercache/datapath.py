@@ -11,6 +11,7 @@ import logging
 import mmap
 import os
 import threading
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -35,6 +36,38 @@ try:
 except (ImportError, Exception):
     pass
 
+# Opt-in end-to-end integrity check: when set, full-chunk reads are verified against the
+# per-chunk CRC32 recorded by the daemon (adds one zlib.crc32 pass over the data).
+VERIFY_CHECKSUMS_ENV = "HYPERCACHE_VERIFY_CHECKSUMS"
+DEFAULT_BLOCK_SIZE = 4096
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class ChecksumMismatchError(IOError):
+    """Raised when chunk data does not match the CRC32 recorded at ingest time."""
+
+
+def logical_block_size(device_path: str) -> int:
+    """Returns the O_DIRECT alignment for a device (sysfs logical_block_size), or 4096."""
+    try:
+        name = os.path.basename(os.path.realpath(device_path))
+        for candidate in (
+            f"/sys/class/block/{name}/queue/logical_block_size",
+            # Partitions inherit the queue limits of their parent disk
+            os.path.join(os.path.dirname(os.path.realpath(f"/sys/class/block/{name}")), "queue", "logical_block_size"),
+        ):
+            if os.path.exists(candidate):
+                with open(candidate) as f:
+                    value = int(f.read().strip())
+                if value > 0 and value & (value - 1) == 0:
+                    return max(value, 512)
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_BLOCK_SIZE
+
 
 @dataclass(frozen=True)
 class ChunkLocation:
@@ -43,23 +76,34 @@ class ChunkLocation:
     offset: int
     length: int
     tier: str = "nvme"
+    # CRC32 (zlib.crc32) of the chunk bytes, when the daemon recorded one
+    checksum: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> ChunkLocation:
+        checksum = data.get("checksum")
         return cls(
             device=str(data["device"]),
             offset=int(data["offset"]),
             length=int(data["length"]),
             tier=str(data.get("tier", "nvme")).lower(),
+            checksum=int(checksum) if checksum is not None else None,
         )
 
+    @property
+    def is_shm(self) -> bool:
+        return self.tier == "ram" or self.device.endswith(".shm")
+
     def to_dict(self) -> dict:
-        return {
+        out = {
             "device": self.device,
             "offset": self.offset,
             "length": self.length,
             "tier": self.tier,
         }
+        if self.checksum is not None:
+            out["checksum"] = self.checksum
+        return out
 
 
 class DataReader:
@@ -96,14 +140,66 @@ class DirectBlockReader(DataReader):
     Uses multi-threaded I/O submission to saturate SSD controller queue depth.
     """
 
-    def __init__(self, max_workers: Optional[int] = None):
+    def __init__(self, max_workers: Optional[int] = None, verify_checksums: Optional[bool] = None):
         self._fd_cache: Dict[str, Tuple[Optional[int], int]] = {}
+        self._block_sizes: Dict[str, int] = {}
         self._lock = threading.Lock()
         self._closed = False
+        self._pid = os.getpid()
+        self._local = threading.local()
+        self.verify_checksums = _env_flag(VERIFY_CHECKSUMS_ENV) if verify_checksums is None else verify_checksums
+        self._stats = {"direct_reads": 0, "direct_fallbacks": 0, "buffered_reads": 0, "shm_reads": 0}
+        self._stats_lock = threading.Lock()
         if max_workers is None:
             max_workers = min(64, max(16, (os.cpu_count() or 4) * 4))
         self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    def _count(self, key: str) -> None:
+        with self._stats_lock:
+            self._stats[key] += 1
+
+    def get_stats(self) -> Dict[str, int]:
+        """Read path counters. A growing `direct_fallbacks` means O_DIRECT is not engaging."""
+        with self._stats_lock:
+            return dict(self._stats)
+
+    def _bounce_buffer(self, size: int) -> mmap.mmap:
+        # Anonymous mmaps are page-aligned, which satisfies O_DIRECT buffer alignment.
+        # One buffer per worker thread, grown on demand.
+        buf = getattr(self._local, "buf", None)
+        if buf is None or len(buf) < size:
+            if buf is not None:
+                buf.close()
+            buf = mmap.mmap(-1, size)
+            self._local.buf = buf
+        return buf
+
+    def _block_size(self, device_path: str) -> int:
+        bs = self._block_sizes.get(device_path)
+        if bs is None:
+            bs = logical_block_size(device_path)
+            self._block_sizes[device_path] = bs
+        return bs
+
+    def _read_direct(self, fd_direct: int, dev_path: str, target_slice: memoryview, phys_offset: int) -> bool:
+        """O_DIRECT read via an aligned bounce buffer. Returns False if the caller must fall back."""
+        length = len(target_slice)
+        bs = self._block_size(dev_path)
+        aligned_start = phys_offset - (phys_offset % bs)
+        head = phys_offset - aligned_start
+        aligned_len = -(-(head + length) // bs) * bs
+        buf = self._bounce_buffer(aligned_len)
+        try:
+            n = os.preadv(fd_direct, [memoryview(buf)[:aligned_len]], aligned_start)
+        except OSError as e:
+            logger.debug(f"O_DIRECT read failed on {dev_path} at {aligned_start}: {e}")
+            return False
+        # A short read is fine as long as it covers the requested bytes (e.g. at end of a file)
+        if n < head + length:
+            return False
+        target_slice[:] = memoryview(buf)[head : head + length]
+        return True
 
     def _get_fds(self, device_path: str) -> Tuple[Optional[int], int]:
         if device_path in self._fd_cache:
@@ -161,42 +257,51 @@ class DirectBlockReader(DataReader):
             physical_device_offset = chunk.offset + offset_in_chunk
 
             dest_pos = target_offset + (overlap_start - start_offset)
-            tasks.append((chunk.device, overlap_len, physical_device_offset, dest_pos))
+            tasks.append((chunk, overlap_len, physical_device_offset, dest_pos))
 
         if not tasks:
             return 0
 
         def _read_task(t):
-            dev_path, overlap_len, phys_offset, dest_pos = t
+            chunk, overlap_len, phys_offset, dest_pos = t
+            dev_path = chunk.device
             target_slice = view[dest_pos : dest_pos + overlap_len]
 
-            if dev_path.endswith(".shm") or "/shm" in dev_path:
+            if chunk.is_shm:
+                # Tier 1 chunks are files in /dev/shm: a positioned read copies straight from
+                # the shared pages into the destination buffer.
                 try:
-                    with open(dev_path, "rb") as f:
-                        with mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ) as mm:
-                            target_slice[:] = mm[phys_offset : phys_offset + overlap_len]
-                            return overlap_len
+                    fd = os.open(dev_path, os.O_RDONLY)
+                    try:
+                        n = os.preadv(fd, [target_slice], phys_offset) if hasattr(os, "preadv") else None
+                        if n is None:
+                            data = os.pread(fd, overlap_len, phys_offset)
+                            n = len(data)
+                            target_slice[:n] = data
+                    finally:
+                        os.close(fd)
                 except OSError as e:
                     logger.error(f"Failed reading SHM chunk {dev_path}: {e}")
                     raise
+                if n != overlap_len:
+                    raise IOError(f"Short read from SHM chunk {dev_path}: expected {overlap_len}, got {n}")
+                self._count("shm_reads")
+                return self._verify(chunk, overlap_len, target_slice)
 
             fd_direct, fd_buffered = self._get_fds(dev_path)
 
-            # Try direct DMA first if O_DIRECT is active and offsets are sector aligned
-            if fd_direct is not None and hasattr(os, "preadv") and overlap_len % 512 == 0 and phys_offset % 512 == 0:
-                try:
-                    n = os.preadv(fd_direct, [target_slice], phys_offset)
-                    if n == overlap_len:
-                        return n
-                except OSError:
-                    pass
+            if fd_direct is not None and hasattr(os, "preadv"):
+                if self._read_direct(fd_direct, dev_path, target_slice, phys_offset):
+                    self._count("direct_reads")
+                    return self._verify(chunk, overlap_len, target_slice)
+                self._count("direct_fallbacks")
 
-            # Robust fallback to buffered handle
+            self._count("buffered_reads")
             if hasattr(os, "preadv"):
                 try:
                     n = os.preadv(fd_buffered, [target_slice], phys_offset)
                     if n == overlap_len:
-                        return n
+                        return self._verify(chunk, overlap_len, target_slice)
                 except OSError:
                     pass
 
@@ -207,7 +312,7 @@ class DirectBlockReader(DataReader):
                     f"expected {overlap_len} bytes, got {len(chunk_data)}"
                 )
             target_slice[:] = chunk_data
-            return len(chunk_data)
+            return self._verify(chunk, overlap_len, target_slice)
 
         if len(tasks) == 1:
             return _read_task(tasks[0])
@@ -215,6 +320,18 @@ class DirectBlockReader(DataReader):
         # Parallel chunk I/O across SSD queue depth
         results = list(self._executor.map(_read_task, tasks))
         return sum(results)
+
+    def _verify(self, chunk: ChunkLocation, read_len: int, data: memoryview) -> int:
+        # Only whole-chunk reads can be checked against the per-chunk CRC
+        if self.verify_checksums and chunk.checksum is not None and read_len == chunk.length:
+            actual = zlib.crc32(data) & 0xFFFFFFFF
+            if actual != chunk.checksum:
+                raise ChecksumMismatchError(
+                    f"CRC32 mismatch for chunk at {chunk.device}+{chunk.offset}: "
+                    f"expected {chunk.checksum:08x}, got {actual:08x}. The cached layout may be stale; "
+                    f"locate the object again."
+                )
+        return read_len
 
     def read_range(
         self,
@@ -363,6 +480,7 @@ class GDSReader(DataReader):
 
 _SHARED_READERS: Dict[bool, DataReader] = {}
 _SHARED_READER_LOCK = threading.Lock()
+_SHARED_READER_PID = os.getpid()
 
 
 def get_data_reader(prefer_gds: bool = True) -> DataReader:
@@ -370,7 +488,13 @@ def get_data_reader(prefer_gds: bool = True) -> DataReader:
     Factory to return the optimal shared DataReader based on hardware environment.
     Reuses open block-device file descriptors and DMA thread pools across requests.
     """
+    global _SHARED_READER_PID
     with _SHARED_READER_LOCK:
+        if _SHARED_READER_PID != os.getpid():
+            # After fork() the parent's thread pools do not exist in the child and its file
+            # descriptors / CUDA handles must not be shared: start fresh in this process.
+            _SHARED_READERS.clear()
+            _SHARED_READER_PID = os.getpid()
         existing = _SHARED_READERS.get(prefer_gds)
         if existing is not None and not getattr(existing, "_closed", False):
             return existing

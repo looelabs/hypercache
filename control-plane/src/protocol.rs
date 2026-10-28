@@ -2,17 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoveredDevice;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageTier {
     Ram,
+    #[default]
     Nvme,
-}
-
-impl Default for StorageTier {
-    fn default() -> Self {
-        StorageTier::Nvme
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,13 +111,83 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChunkDescriptor {
     #[serde(default)]
     pub tier: StorageTier,
     pub device: String,
     pub offset: u64,
     pub length: u64,
+    /// CRC32 (IEEE, zlib-compatible) of the chunk payload, when known
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<u32>,
+}
+
+impl ChunkDescriptor {
+    pub fn new(tier: StorageTier, device: impl Into<String>, offset: u64, length: u64) -> Self {
+        Self {
+            tier,
+            device: device.into(),
+            offset,
+            length,
+            checksum: None,
+        }
+    }
+
+    pub fn with_checksum(mut self, data: &[u8]) -> Self {
+        self.checksum = Some(crc32fast::hash(data));
+        self
+    }
+}
+
+/// Write-back / replication lifecycle of a cached object. Serialized as the legacy
+/// upper-case strings so manifests and IPC clients from earlier releases stay compatible.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SyncStatus {
+    #[serde(rename = "STAGED")]
+    Staged,
+    #[serde(rename = "COMMITTED")]
+    Committed,
+    #[serde(rename = "SYNCING_BACKEND")]
+    SyncingBackend,
+    #[serde(rename = "SYNCED_BACKEND")]
+    SyncedBackend,
+    #[serde(rename = "SYNC_FAILED")]
+    SyncFailed,
+    #[serde(rename = "REPLICA_COMMITTED")]
+    ReplicaCommitted,
+}
+
+impl SyncStatus {
+    /// Dirty objects hold data that has not reached the authoritative backend yet and
+    /// must never be evicted under capacity pressure.
+    pub fn is_dirty(self) -> bool {
+        matches!(
+            self,
+            SyncStatus::Staged | SyncStatus::Committed | SyncStatus::SyncingBackend | SyncStatus::SyncFailed
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncStatus::Staged => "STAGED",
+            SyncStatus::Committed => "COMMITTED",
+            SyncStatus::SyncingBackend => "SYNCING_BACKEND",
+            SyncStatus::SyncedBackend => "SYNCED_BACKEND",
+            SyncStatus::SyncFailed => "SYNC_FAILED",
+            SyncStatus::ReplicaCommitted => "REPLICA_COMMITTED",
+        }
+    }
+
+    pub fn progress_percent(self) -> f64 {
+        match self {
+            SyncStatus::Staged => 25.0,
+            SyncStatus::Committed => 50.0,
+            SyncStatus::SyncingBackend => 75.0,
+            SyncStatus::SyncFailed => 0.0,
+            SyncStatus::SyncedBackend | SyncStatus::ReplicaCommitted => 100.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,16 +200,17 @@ pub struct CachedObjectSummary {
     #[serde(default)]
     pub tier: StorageTier,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync_status: Option<String>,
+    pub sync_status: Option<SyncStatus>,
     #[serde(default)]
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ResponseStatus {
     Hit,
     Miss,
+    #[default]
     Error,
     Pong,
     Devices,
@@ -156,7 +222,7 @@ pub enum ResponseStatus {
     WriteStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Response {
     pub status: ResponseStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,6 +231,9 @@ pub struct Response {
     pub chunk_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_layout: Option<Vec<ChunkDescriptor>>,
+    /// Monotonic layout generation; changes whenever the object is re-ingested or re-staged
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devices: Option<Vec<DiscoveredDevice>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,9 +255,13 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ram_capacity_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync_status: Option<String>,
+    pub sync_status: Option<SyncStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_progress_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingested_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_uris: Option<Vec<String>>,
 }
 
 impl Response {
@@ -198,169 +271,83 @@ impl Response {
             object_size: Some(object_size),
             chunk_size: Some(chunk_size),
             chunk_layout: Some(chunk_layout),
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
+    }
+
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = Some(generation);
+        self
     }
 
     pub fn devices(devices: Vec<DiscoveredDevice>, ram_cache_enabled: bool, ram_capacity_bytes: Option<u64>) -> Self {
         Self {
             status: ResponseStatus::Devices,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
             devices: Some(devices),
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
             ram_cache_enabled: Some(ram_cache_enabled),
             ram_capacity_bytes,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
     }
 
-    pub fn cached_list(
-        objects: Vec<CachedObjectSummary>,
-        total_bytes_used: u64,
-        max_capacity_bytes: u64,
-    ) -> Self {
+    pub fn cached_list(objects: Vec<CachedObjectSummary>, total_bytes_used: u64, max_capacity_bytes: u64) -> Self {
         Self {
             status: ResponseStatus::List,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
             objects: Some(objects),
             total_bytes_used: Some(total_bytes_used),
             max_capacity_bytes: Some(max_capacity_bytes),
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
     }
 
     pub fn evicted(uri: String, freed_bytes: u64) -> Self {
         Self {
             status: ResponseStatus::Evicted,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
             evicted_uri: Some(uri),
             freed_bytes: Some(freed_bytes),
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
     }
 
     pub fn purged(purged_count: usize, freed_bytes: u64) -> Self {
         Self {
             status: ResponseStatus::Purged,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
             freed_bytes: Some(freed_bytes),
             purged_count: Some(purged_count),
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
     }
 
     pub fn miss() -> Self {
         Self {
             status: ResponseStatus::Miss,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
     }
 
     pub fn pong() -> Self {
         Self {
             status: ResponseStatus::Pong,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
+        }
+    }
+
+    /// Batch preload summary. Status stays PONG for backward compatibility with existing clients.
+    pub fn batch_result(ingested_count: usize, failed_uris: Vec<String>, total_bytes: u64) -> Self {
+        Self {
+            status: ResponseStatus::Pong,
+            ingested_count: Some(ingested_count),
+            failed_uris: Some(failed_uris),
+            total_bytes_used: Some(total_bytes),
+            ..Default::default()
         }
     }
 
     pub fn error(msg: impl Into<String>) -> Self {
         Self {
             status: ResponseStatus::Error,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
             error_message: Some(msg.into()),
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: None,
-            sync_progress_percent: None,
+            ..Default::default()
         }
     }
 
@@ -370,18 +357,9 @@ impl Response {
             object_size: Some(object_size),
             chunk_size: Some(chunk_size),
             chunk_layout: Some(chunk_layout),
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: Some("STAGED".to_string()),
+            sync_status: Some(SyncStatus::Staged),
             sync_progress_percent: Some(0.0),
+            ..Default::default()
         }
     }
 
@@ -389,41 +367,19 @@ impl Response {
         Self {
             status: ResponseStatus::WriteCommitted,
             object_size: Some(object_size),
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
             evicted_uri: Some(uri),
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
-            sync_status: Some("COMMITTED".to_string()),
+            sync_status: Some(SyncStatus::Committed),
             sync_progress_percent: Some(100.0),
+            ..Default::default()
         }
     }
 
-    pub fn write_status(sync_status: String, progress: f64) -> Self {
+    pub fn write_status(sync_status: SyncStatus, progress: f64) -> Self {
         Self {
             status: ResponseStatus::WriteStatus,
-            object_size: None,
-            chunk_size: None,
-            chunk_layout: None,
-            devices: None,
-            objects: None,
-            total_bytes_used: None,
-            max_capacity_bytes: None,
-            evicted_uri: None,
-            freed_bytes: None,
-            purged_count: None,
-            error_message: None,
-            ram_cache_enabled: None,
-            ram_capacity_bytes: None,
             sync_status: Some(sync_status),
             sync_progress_percent: Some(progress),
+            ..Default::default()
         }
     }
 }
@@ -448,14 +404,7 @@ mod tests {
         let resp = Response::hit(
             20971520,
             4194304,
-            vec![
-                ChunkDescriptor {
-                    tier: StorageTier::Nvme,
-                    device: "/tmp/nvme0.raw".to_string(),
-                    offset: 4096,
-                    length: 4194304,
-                },
-            ],
+            vec![ChunkDescriptor::new(StorageTier::Nvme, "/tmp/nvme0.raw", 4096, 4194304)],
         );
         let resp_json = serde_json::to_string(&resp).unwrap();
         assert!(resp_json.contains("HIT"));
@@ -463,4 +412,3 @@ mod tests {
         assert!(resp_json.contains("nvme"));
     }
 }
-

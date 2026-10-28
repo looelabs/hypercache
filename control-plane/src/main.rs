@@ -1,16 +1,6 @@
-mod agent_server;
-mod bench;
-mod check;
-mod config;
-#[allow(dead_code)]
-mod controller;
-mod discovery;
-mod ingestion;
-mod metadata;
-mod protocol;
-mod ram;
-mod server;
-mod telemetry;
+use hypercache_control_plane::{
+    agent_server, bench, check, config, discovery, ingestion, metadata, protocol, ram, server, telemetry,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -35,8 +25,8 @@ use telemetry::TelemetryCollector;
 #[derive(Parser, Debug)]
 #[command(
     name = "hypercache",
-    author = "HyperCache Team",
-    version = "0.9.0-beta",
+    author = "Looe Labs",
+    version = env!("CARGO_PKG_VERSION"),
     about = "HyperCache: High-Performance Host-Based AI Storage & Cache Acceleration Engine",
     long_about = "HyperCache is a host-based caching engine designed to accelerate AI model loading (PyTorch, Safetensors, HuggingFace) by striping raw NVMe/SSD block devices and serving directly via zero-copy DMA / GPUDirect Storage."
 )]
@@ -247,12 +237,8 @@ async fn main() -> Result<()> {
             };
             bench::run_benchmark(&sock, uri, size_mb, iterations, s3_config, target_tier).await
         }
-        Commands::Inspect => {
-            run_inspect(cli.config, cli.devices).await
-        }
-        Commands::Check { json, ram } => {
-            run_check(cli.config, cli.devices, json, ram).await
-        }
+        Commands::Inspect => run_inspect(cli.config, cli.devices).await,
+        Commands::Check { json, ram } => run_check(cli.config, cli.devices, json, ram).await,
         Commands::Ls { json } => {
             let sock = config::probe_active_socket_path().to_string_lossy().to_string();
             run_ls(&sock, json).await
@@ -285,6 +271,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon(
     config_path: Option<PathBuf>,
     explicit_devices: Option<Vec<String>>,
@@ -319,7 +306,9 @@ async fn run_daemon(
             eprintln!("Please specify the configuration file using -c <path>:");
             eprintln!("  ./hypercache -c /path/to/hypercache-agent.toml start");
             eprintln!("============================================================");
-            return Err(anyhow::anyhow!("Missing required configuration file. Please provide -c <path>."));
+            return Err(anyhow::anyhow!(
+                "Missing required configuration file. Please provide -c <path>."
+            ));
         }
     };
 
@@ -391,7 +380,10 @@ async fn run_daemon(
                 }
             }
             Err(_) => {
-                info!("Found inactive socket file at {:?}. Cleaning up stale socket.", socket_path);
+                info!(
+                    "Found inactive socket file at {:?}. Cleaning up stale socket.",
+                    socket_path
+                );
                 let _ = std::fs::remove_file(&socket_path);
             }
         }
@@ -407,7 +399,8 @@ async fn run_daemon(
     let metrics_enabled = enable_metrics_flag || custom_metrics_port.is_some() || config.metrics_enabled;
     let metrics_port = custom_metrics_port.unwrap_or(config.metrics_port);
 
-    let agent_enabled = enable_agent_flag || custom_agent_port.is_some() || config.agent_enabled || config.controller_url.is_some();
+    let agent_enabled =
+        enable_agent_flag || custom_agent_port.is_some() || config.agent_enabled || config.controller_url.is_some();
     let agent_port = custom_agent_port.unwrap_or(config.agent_http_port);
     let agent_bind = config.agent_bind_address.clone();
 
@@ -420,7 +413,10 @@ async fn run_daemon(
             println!("Operating with Tier 1 (Host RAM / POSIX /dev/shm) active.");
         }
     } else {
-        println!("Discovered {} Active Block Device(s) in Striping Pool:", detected_devices.len());
+        println!(
+            "Discovered {} Active Block Device(s) in Striping Pool:",
+            detected_devices.len()
+        );
         for (i, dev) in detected_devices.iter().enumerate() {
             let size_str = if dev.size_bytes >= 1024 * 1024 * 1024 * 1024 {
                 format!("{:.2} TiB", dev.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
@@ -428,9 +424,17 @@ async fn run_daemon(
                 format!("{:.2} GiB", dev.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
             };
             let kind_str = if dev.is_virtual {
-                if dev.is_partition { "Virtual Partition" } else { "Virtual Disk" }
+                if dev.is_partition {
+                    "Virtual Partition"
+                } else {
+                    "Virtual Disk"
+                }
             } else if dev.is_nvme {
-                if dev.is_partition { "NVMe Partition" } else { "NVMe Whole Disk" }
+                if dev.is_partition {
+                    "NVMe Partition"
+                } else {
+                    "NVMe Whole Disk"
+                }
             } else {
                 "Block Device"
             };
@@ -462,9 +466,15 @@ async fn run_daemon(
 
     let telemetry = TelemetryCollector::new(&config.metrics_bind_address, metrics_port, metrics_enabled);
     if combined_storage_bytes > 0 {
-        telemetry.state.storage_capacity_bytes.store(combined_storage_bytes, std::sync::atomic::Ordering::Relaxed);
+        telemetry
+            .state
+            .storage_capacity_bytes
+            .store(combined_storage_bytes, std::sync::atomic::Ordering::Relaxed);
     }
-    telemetry.state.active_devices_count.store(detected_devices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    telemetry
+        .state
+        .active_devices_count
+        .store(detected_devices.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
     let persistence_path = if config.metadata_persistence_enabled {
         let resolved = config::resolve_metadata_persistence_path(&config.metadata_persistence_path);
@@ -476,18 +486,24 @@ async fn run_daemon(
 
     let t_boot = Instant::now();
     let (metadata, restored_info) = if let Some(ref ppath) = persistence_path {
-        if let Ok(Some((store, count, total_bytes))) = MetadataStore::load_from_disk(ppath, max_capacity, Some(telemetry.state.clone())).await {
+        if let Ok(Some((store, count, total_bytes))) =
+            MetadataStore::load_from_disk(ppath, max_capacity, Some(telemetry.state.clone())).await
+        {
             (store, Some((count, total_bytes)))
         } else {
-            (MetadataStore::new(max_capacity, Some(telemetry.state.clone()), persistence_path.clone()), None)
+            (
+                MetadataStore::new(max_capacity, Some(telemetry.state.clone()), persistence_path.clone()),
+                None,
+            )
         }
     } else {
-        (MetadataStore::new(max_capacity, Some(telemetry.state.clone()), None), None)
+        (
+            MetadataStore::new(max_capacity, Some(telemetry.state.clone()), None),
+            None,
+        )
     };
     let boot_dur = t_boot.elapsed();
-    metadata
-        .register_device_capacities(&detected_devices)
-        .await;
+    metadata.register_device_capacities(&detected_devices).await;
 
     if let Some((count, total_bytes)) = restored_info {
         let size_str = if total_bytes >= 1024 * 1024 * 1024 {
@@ -495,7 +511,12 @@ async fn run_daemon(
         } else {
             format!("{:.2} MiB", total_bytes as f64 / (1024.0 * 1024.0))
         };
-        println!("Warm-Boot Recovery: Restored {} cached model(s) ({}) from NVMe manifest in {:.2} ms.", count, size_str, boot_dur.as_secs_f64() * 1000.0);
+        println!(
+            "Warm-Boot Recovery: Restored {} cached model(s) ({}) from NVMe manifest in {:.2} ms.",
+            count,
+            size_str,
+            boot_dur.as_secs_f64() * 1000.0
+        );
     }
 
     let ram_pool = if config.ram_cache_enabled {
@@ -530,6 +551,15 @@ async fn run_daemon(
         detected_devices,
     ));
 
+    // Checkpoints committed (or failed to sync) before the last shutdown are flushed again
+    let resumed = server.resume_pending_writebacks().await;
+    if resumed > 0 {
+        info!(
+            "Re-queued {} pending write-back(s) from the persisted manifest",
+            resumed
+        );
+    }
+
     println!("HyperCache Control Plane Daemon started successfully.");
     println!("   - Config Loaded:      {}", canonical_path.display());
     println!("   - Unix Domain Socket: {}", config.socket_path);
@@ -537,13 +567,20 @@ async fn run_daemon(
         if let Some(ref pool) = ram_pool {
             let cap_bytes: u64 = pool.get_capacity_bytes();
             let cap_str = format!("{:.2} GiB", cap_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
-            println!("   - Tier 1 (Host RAM):  ACTIVE (Capacity: {}, Path: {})", cap_str, pool.get_shm_path().display());
+            println!(
+                "   - Tier 1 (Host RAM):  ACTIVE (Capacity: {}, Path: {})",
+                cap_str,
+                pool.get_shm_path().display()
+            );
         }
     } else {
         println!("   - Tier 1 (Host RAM):  DISABLED");
     }
     if metrics_enabled {
-        println!("   - Prometheus Exporter: http://{}:{}/metrics", config.metrics_bind_address, metrics_port);
+        println!(
+            "   - Prometheus Exporter: http://{}:{}/metrics",
+            config.metrics_bind_address, metrics_port
+        );
     } else {
         println!("   - Prometheus Exporter: DISABLED (Off by default, enable via --metrics or config)");
     }
@@ -553,10 +590,16 @@ async fn run_daemon(
         println!("   - Agent Fleet API:    DISABLED (Off by default, enable via --agent or controller_url)");
     }
     if let Some(ref curl) = config.controller_url {
-        println!("   - Cluster Controller: {} (Heartbeat & Fleet Registration Active)", curl);
+        println!(
+            "   - Cluster Controller: {} (Heartbeat & Fleet Registration Active)",
+            curl
+        );
     }
     if config.metadata_persistence_enabled {
-        println!("   - NVMe Persistence:   {} (Async Auto-Sync Active)", config.metadata_persistence_path);
+        println!(
+            "   - NVMe Persistence:   {} (Async Auto-Sync Active)",
+            config.metadata_persistence_path
+        );
     }
     println!("Press Ctrl+C to stop.");
 
@@ -621,15 +664,30 @@ async fn run_inspect(config_path: Option<PathBuf>, explicit_devices: Option<Vec<
         } else {
             format!("{:.2} GiB", dev.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
         };
-        let numa_str = dev.numa_node.map(|n| format!("NUMA: {}", n)).unwrap_or_else(|| "NUMA: N/A".to_string());
-        println!("  [{:02}] {:<20} | Size: {:>9} | {:<9} | NVMe: {:<5} | Model: {}",
-            i, dev.path, size_str, numa_str, dev.is_nvme, dev.model.as_deref().unwrap_or("Generic"));
+        let numa_str = dev
+            .numa_node
+            .map(|n| format!("NUMA: {}", n))
+            .unwrap_or_else(|| "NUMA: N/A".to_string());
+        println!(
+            "  [{:02}] {:<20} | Size: {:>9} | {:<9} | NVMe: {:<5} | Model: {}",
+            i,
+            dev.path,
+            size_str,
+            numa_str,
+            dev.is_nvme,
+            dev.model.as_deref().unwrap_or("Generic")
+        );
     }
     println!("------------------------------------------------------------");
-    println!("Total Aggregate Pool Capacity: {:.2} TiB ({:.2} GiB)",
+    println!(
+        "Total Aggregate Pool Capacity: {:.2} TiB ({:.2} GiB)",
         total_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0),
-        total_bytes as f64 / (1024.0 * 1024.0));
-    println!("Chunk Size:                    {:.2} MiB", config.chunk_size_bytes as f64 / (1024.0 * 1024.0));
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Chunk Size:                    {:.2} MiB",
+        config.chunk_size_bytes as f64 / (1024.0 * 1024.0)
+    );
     println!("Safety Exclusions Active:      Mounted Root Tree + Superblock Filesystem Signatures");
     println!("============================================================");
     Ok(())
@@ -713,7 +771,10 @@ async fn run_status(socket_path: &str) -> Result<()> {
     // 2. Hardware Concurrency
     let detected_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let target_workers = (detected_cores * 4).clamp(16, 64);
-    println!("Hardware Queue:      {} Worker Threads (across {} vCPUs)", target_workers, detected_cores);
+    println!(
+        "Hardware Queue:      {} Worker Threads (across {} vCPUs)",
+        target_workers, detected_cores
+    );
 
     // 3. Query Active Devices
     line.clear();
@@ -728,8 +789,18 @@ async fn run_status(socket_path: &str) -> Result<()> {
         println!("Striped Devices:     {} Active Disk(s)", devices.len());
         for (i, d) in devices.iter().enumerate() {
             total_pool_bytes += d.size_bytes;
-            let numa_str = d.numa_node.map(|n| format!("NUMA: {}", n)).unwrap_or_else(|| "NUMA: N/A".to_string());
-            println!("  [{:02}] {:<18} | {:>9} | {:<9} | {}", i, d.path, format_bytes(d.size_bytes), numa_str, d.model.as_deref().unwrap_or("Generic"));
+            let numa_str = d
+                .numa_node
+                .map(|n| format!("NUMA: {}", n))
+                .unwrap_or_else(|| "NUMA: N/A".to_string());
+            println!(
+                "  [{:02}] {:<18} | {:>9} | {:<9} | {}",
+                i,
+                d.path,
+                format_bytes(d.size_bytes),
+                numa_str,
+                d.model.as_deref().unwrap_or("Generic")
+            );
         }
         println!("Total Storage Pool:  {}", format_bytes(total_pool_bytes));
     }
@@ -744,11 +815,24 @@ async fn run_status(socket_path: &str) -> Result<()> {
     let list_resp: Response = serde_json::from_str(line.trim())?;
     let cached_objs = list_resp.objects.unwrap_or_default();
     let used_bytes = list_resp.total_bytes_used.unwrap_or(0);
-    let max_cap = if total_pool_bytes > 0 { total_pool_bytes } else { list_resp.max_capacity_bytes.unwrap_or(1) };
-    let pct = if max_cap > 0 { (used_bytes as f64 / max_cap as f64) * 100.0 } else { 0.0 };
+    let max_cap = if total_pool_bytes > 0 {
+        total_pool_bytes
+    } else {
+        list_resp.max_capacity_bytes.unwrap_or(1)
+    };
+    let pct = if max_cap > 0 {
+        (used_bytes as f64 / max_cap as f64) * 100.0
+    } else {
+        0.0
+    };
 
     println!("Cached Models:       {} object(s) cached", cached_objs.len());
-    println!("Cache Footprint:     {} / {} ({:.2}% utilized)", format_bytes(used_bytes), format_bytes(max_cap), pct);
+    println!(
+        "Cache Footprint:     {} / {} ({:.2}% utilized)",
+        format_bytes(used_bytes),
+        format_bytes(max_cap),
+        pct
+    );
     println!("Metrics Endpoint:    http://127.0.0.1:9110/metrics");
     println!("============================================================");
     Ok(())
@@ -800,8 +884,10 @@ async fn run_ls(socket_path: &str, json: bool) -> Result<()> {
     if objects.is_empty() {
         println!("  (No model checkpoints currently cached in memory or NVMe)");
     } else {
-        println!("{:<50} | {:>10} | {:>6} | {:<6} | {:<19} | {}",
-            "URI", "SIZE", "CHUNKS", "TIER", "INGESTED AT", "STRIPED TARGETS");
+        println!(
+            "{:<50} | {:>10} | {:>6} | {:<6} | {:<19} | STRIPED TARGETS",
+            "URI", "SIZE", "CHUNKS", "TIER", "INGESTED AT"
+        );
         println!("{}", "-".repeat(110));
 
         for obj in &objects {
@@ -816,8 +902,13 @@ async fn run_ls(socket_path: &str, json: bool) -> Result<()> {
 
             let drives_str = obj.devices.join(", ");
 
-            println!("{:<50} | {:>10} | {:>6} | {:<6} | {:<19} | {}",
-                if obj.uri.len() > 50 { format!("...{}", &obj.uri[obj.uri.len() - 47..]) } else { obj.uri.clone() },
+            println!(
+                "{:<50} | {:>10} | {:>6} | {:<6} | {:<19} | {}",
+                if obj.uri.len() > 50 {
+                    format!("...{}", &obj.uri[obj.uri.len() - 47..])
+                } else {
+                    obj.uri.clone()
+                },
                 format_bytes(obj.object_size),
                 obj.chunk_count,
                 tier_str,
@@ -828,9 +919,18 @@ async fn run_ls(socket_path: &str, json: bool) -> Result<()> {
     }
 
     println!("----------------------------------------------------------------------------------------------------");
-    let pct = if max_cap > 0 { (total_used as f64 / max_cap as f64) * 100.0 } else { 0.0 };
-    println!("Total Cached Objects: {} | Active Cache Footprint: {} / {} ({:.2}% Utilized)",
-        objects.len(), format_bytes(total_used), format_bytes(max_cap), pct);
+    let pct = if max_cap > 0 {
+        (total_used as f64 / max_cap as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "Total Cached Objects: {} | Active Cache Footprint: {} / {} ({:.2}% Utilized)",
+        objects.len(),
+        format_bytes(total_used),
+        format_bytes(max_cap),
+        pct
+    );
     println!("====================================================================================================");
     Ok(())
 }
@@ -853,10 +953,14 @@ async fn run_rm(socket_path: &str, uri: &str) -> Result<()> {
 
     if resp.status == ResponseStatus::Evicted {
         let freed = resp.freed_bytes.unwrap_or(0);
-        println!("Successfully evicted '{}' ({} freed from cache index).", uri, format_bytes(freed));
+        println!(
+            "Successfully evicted '{}' ({} freed from cache index).",
+            uri,
+            format_bytes(freed)
+        );
     } else {
         let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
-        println!("Failed to evict '{}': {}", uri, err);
+        anyhow::bail!("Failed to evict '{}': {}", uri, err);
     }
     Ok(())
 }
@@ -880,11 +984,15 @@ async fn run_purge(socket_path: &str) -> Result<()> {
     if resp.status == ResponseStatus::Purged {
         let count = resp.purged_count.unwrap_or(0);
         let freed = resp.freed_bytes.unwrap_or(0);
-        println!("Successfully purged {} cached model(s) ({} freed from storage pool).", count, format_bytes(freed));
+        println!(
+            "Successfully purged {} cached model(s) ({} freed from storage pool).",
+            count,
+            format_bytes(freed)
+        );
         println!("  -> Drive allocation pointers reset to initial safety offsets.");
     } else {
         let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
-        println!("Failed to purge cache: {}", err);
+        anyhow::bail!("Failed to purge cache: {}", err);
     }
     Ok(())
 }
@@ -928,20 +1036,35 @@ async fn run_refresh(socket_path: &str, uri: &str) -> Result<()> {
         let size = resp.object_size.unwrap_or(0);
         let chunks = resp.chunk_layout.map(|c| c.len()).unwrap_or(0);
         let dur_s = dur.as_secs_f64();
-        let bw = if dur_s > 0.0 { (size as f64 / (1024.0 * 1024.0)) / dur_s } else { 0.0 };
+        let bw = if dur_s > 0.0 {
+            (size as f64 / (1024.0 * 1024.0)) / dur_s
+        } else {
+            0.0
+        };
 
-        println!("  -> Freshly ingested {} ({} chunks) from S3 across striped NVMe in {:.3} s ({:.2} MB/s).",
-            format_bytes(size), chunks, dur_s, bw);
+        println!(
+            "  -> Freshly ingested {} ({} chunks) from S3 across striped NVMe in {:.3} s ({:.2} MB/s).",
+            format_bytes(size),
+            chunks,
+            dur_s,
+            bw
+        );
         println!("Model '{}' successfully refreshed and hot-cached in memory.", uri);
     } else {
         let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
-        println!("Failed to re-ingest '{}': {}", uri, err);
+        anyhow::bail!("Failed to re-ingest '{}': {}", uri, err);
     }
 
     Ok(())
 }
 
-async fn run_preload(socket_path: &str, uri: Option<String>, file_path: Option<PathBuf>, target_tier: Option<protocol::StorageTier>, pinned: bool) -> Result<()> {
+async fn run_preload(
+    socket_path: &str,
+    uri: Option<String>,
+    file_path: Option<PathBuf>,
+    target_tier: Option<protocol::StorageTier>,
+    pinned: bool,
+) -> Result<()> {
     let mut targets = Vec::new();
 
     if let Some(u) = uri {
@@ -949,8 +1072,8 @@ async fn run_preload(socket_path: &str, uri: Option<String>, file_path: Option<P
     }
 
     if let Some(ref fp) = file_path {
-        let content = std::fs::read_to_string(fp)
-            .with_context(|| format!("Failed to read preload manifest file at {:?}", fp))?;
+        let content =
+            std::fs::read_to_string(fp).with_context(|| format!("Failed to read preload manifest file at {:?}", fp))?;
         for line in content.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -974,9 +1097,17 @@ async fn run_preload(socket_path: &str, uri: Option<String>, file_path: Option<P
     println!("====================================================================================================");
     println!("Target Items to Pre-Warm: {}", targets.len());
     println!("Target Storage Tier:      {}", tier_label);
-    println!("Eviction Protection:      {}", if pinned { "PINNED (Protected from W-TinyLFU Eviction)" } else { "Standard W-TinyLFU" });
+    println!(
+        "Eviction Protection:      {}",
+        if pinned {
+            "PINNED (Protected from W-TinyLFU Eviction)"
+        } else {
+            "Standard W-TinyLFU"
+        }
+    );
 
     let mut total_bytes_ingested: u64 = 0;
+    let mut failed_count = 0usize;
     let t_all_start = Instant::now();
 
     for (idx, target_uri) in targets.iter().enumerate() {
@@ -1011,30 +1142,56 @@ async fn run_preload(socket_path: &str, uri: Option<String>, file_path: Option<P
         if resp.status == ResponseStatus::Hit {
             let size = resp.object_size.unwrap_or(0);
             let chunks = resp.chunk_layout.as_ref().map(|c| c.len()).unwrap_or(0);
-            let first_tier = resp.chunk_layout.as_ref().and_then(|c| c.first()).map(|c| c.tier).unwrap_or(protocol::StorageTier::Nvme);
+            let first_tier = resp
+                .chunk_layout
+                .as_ref()
+                .and_then(|c| c.first())
+                .map(|c| c.tier)
+                .unwrap_or(protocol::StorageTier::Nvme);
             let tier_name = match first_tier {
                 protocol::StorageTier::Ram => "RAM Shared Memory",
                 protocol::StorageTier::Nvme => "NVMe Pool",
             };
             let dur_s = dur.as_secs_f64();
-            let bw = if dur_s > 0.0 { (size as f64 / (1024.0 * 1024.0)) / dur_s } else { 0.0 };
+            let bw = if dur_s > 0.0 {
+                (size as f64 / (1024.0 * 1024.0)) / dur_s
+            } else {
+                0.0
+            };
             total_bytes_ingested += size;
 
-            println!("  - Ingested and striped {} ({} chunks) across {} in {:.3} s ({:.2} MB/s).",
-                format_bytes(size), chunks, tier_name, dur_s, bw);
+            println!(
+                "  - Ingested and striped {} ({} chunks) across {} in {:.3} s ({:.2} MB/s).",
+                format_bytes(size),
+                chunks,
+                tier_name,
+                dur_s,
+                bw
+            );
             println!("  - Metadata registered in Moka RAM and synced to NVMe persistence manifest.");
-            println!("Checkpoint '{}' is pre-warmed and ready for line-rate DMA loading.", target_uri);
+            println!(
+                "Checkpoint '{}' is pre-warmed and ready for line-rate DMA loading.",
+                target_uri
+            );
         } else {
             let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
             println!("Failed to pre-load '{}': {}", target_uri, err);
+            failed_count += 1;
         }
     }
 
     let all_dur = t_all_start.elapsed();
     println!("----------------------------------------------------------------------------------------------------");
-    println!("Pre-Loading Complete: Ingested {} across {} object(s) in {:.2} s.",
-        format_bytes(total_bytes_ingested), targets.len(), all_dur.as_secs_f64());
+    println!(
+        "Pre-Loading Complete: Ingested {} across {} object(s) in {:.2} s.",
+        format_bytes(total_bytes_ingested),
+        targets.len(),
+        all_dur.as_secs_f64()
+    );
     println!("====================================================================================================");
 
+    if failed_count > 0 {
+        anyhow::bail!("{} of {} object(s) failed to pre-load", failed_count, targets.len());
+    }
     Ok(())
 }

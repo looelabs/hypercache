@@ -34,7 +34,10 @@ pub async fn run_benchmark(
             Some(crate::protocol::StorageTier::Ram) => "ram",
             _ => "nvme",
         };
-        format!("hypercache://models/benchmark/{}_weights_{}mb.safetensors", tier_label, size_mb)
+        format!(
+            "hypercache://models/benchmark/{}_weights_{}mb.safetensors",
+            tier_label, size_mb
+        )
     });
 
     let tier_name = match target_tier {
@@ -51,9 +54,16 @@ pub async fn run_benchmark(
     let detected_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let target_workers = (detected_cores * 4).clamp(16, 64);
 
-    println!("Target Size:        {} MiB ({:.2} GiB)", size_mb, size_mb as f64 / 1024.0);
+    println!(
+        "Target Size:        {} MiB ({:.2} GiB)",
+        size_mb,
+        size_mb as f64 / 1024.0
+    );
     println!("Iterations:         {}", iterations);
-    println!("Parallel Queue:     {} Worker Threads (across {} vCPUs)", target_workers, detected_cores);
+    println!(
+        "Parallel Queue:     {} Worker Threads (across {} vCPUs)",
+        target_workers, detected_cores
+    );
     if let Some(ref s3) = s3_config {
         println!("Real S3 Endpoint:   {}", s3.endpoint);
         if let Some(ref b) = s3.bucket {
@@ -67,10 +77,13 @@ pub async fn run_benchmark(
 
     // 1. Verify Daemon is reachable over UDS
     println!("[Step 1/5] Checking Control Plane Daemon Connection...");
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .with_context(|| format!("Failed to connect to HyperCache daemon at {}. Is the daemon running? (Run: ./hypercache start)", socket_path))?;
-    
+    let mut stream = UnixStream::connect(socket_path).await.with_context(|| {
+        format!(
+            "Failed to connect to HyperCache daemon at {}. Is the daemon running? (Run: ./hypercache start)",
+            socket_path
+        )
+    })?;
+
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 
@@ -115,21 +128,33 @@ pub async fn run_benchmark(
         } else {
             "Auto-Sized".to_string()
         };
-        println!("  -> Tier 1 (Host RAM / POSIX /dev/shm) is ACTIVE (Capacity: {}).\n", cap_str);
+        println!(
+            "  -> Tier 1 (Host RAM / POSIX /dev/shm) is ACTIVE (Capacity: {}).\n",
+            cap_str
+        );
     } else {
         println!("[Step 2/5] Querying Auto-Discovered Striped Storage Pool...");
         if let Some(devices) = dev_resp.devices {
             if devices.is_empty() {
                 println!("  -> No secondary raw NVMe block devices detected in pool (OS root disk protected).");
             } else {
-                println!("  -> Discovered {} active striped block device(s) in pool:", devices.len());
+                println!(
+                    "  -> Discovered {} active striped block device(s) in pool:",
+                    devices.len()
+                );
                 for (i, d) in devices.iter().enumerate() {
                     let size_str = if d.size_bytes >= 1024 * 1024 * 1024 * 1024 {
                         format!("{:.2} TiB", d.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
                     } else {
                         format!("{:.2} GiB", d.size_bytes as f64 / (1024.0 * 1024.0))
                     };
-                    println!("     [{:02}] {:<22} | Size: {:>9} | Model: {}", i, d.path, size_str, d.model.as_deref().unwrap_or("Generic"));
+                    println!(
+                        "     [{:02}] {:<22} | Size: {:>9} | Model: {}",
+                        i,
+                        d.path,
+                        size_str,
+                        d.model.as_deref().unwrap_or("Generic")
+                    );
                 }
             }
         }
@@ -144,9 +169,7 @@ pub async fn run_benchmark(
 
     if let Some(ref s3) = s3_config {
         println!("[Step 3/5] Benchmarking Real Remote S3 Network Download over HTTPS...");
-        let s3_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()?;
+        let s3_client = Client::builder().timeout(std::time::Duration::from_secs(120)).build()?;
 
         let key = format!("models/benchmark/weights_{}mb.safetensors", size_mb);
         let endpoint = s3.endpoint.trim_end_matches('/');
@@ -166,14 +189,20 @@ pub async fn run_benchmark(
         let _head_res = s3_client.head(&s3_url).send().await;
         let head_dur = t_head_start.elapsed();
         real_s3_meta_ms = Some(head_dur.as_secs_f64() * 1000.0);
-        println!("  -> Remote S3 Metadata / HEAD Latency: {:.2} ms", head_dur.as_secs_f64() * 1000.0);
+        println!(
+            "  -> Remote S3 Metadata / HEAD Latency: {:.2} ms",
+            head_dur.as_secs_f64() * 1000.0
+        );
 
         let t_get_start = Instant::now();
         match s3_client.get(&s3_url).send().await {
             Ok(resp) => {
                 let ttfb_dur = t_get_start.elapsed();
                 real_s3_ttfb_ms = Some(ttfb_dur.as_secs_f64() * 1000.0);
-                println!("  -> Remote S3 Time-To-First-Byte (TTFB): {:.2} ms", ttfb_dur.as_secs_f64() * 1000.0);
+                println!(
+                    "  -> Remote S3 Time-To-First-Byte (TTFB): {:.2} ms",
+                    ttfb_dur.as_secs_f64() * 1000.0
+                );
 
                 if resp.status().is_success() {
                     let mut stream = resp.bytes_stream();
@@ -189,10 +218,17 @@ pub async fn run_benchmark(
                     real_s3_time_s = Some(s3_dur_s);
                     real_s3_speed_mbps = Some(s3_bw);
 
-                    println!("  -> Real S3 Download Complete: {:.2} MiB in {:.4} s ({:.2} MB/s)",
-                        total_s3_bytes as f64 / (1024.0 * 1024.0), s3_dur_s, s3_bw);
+                    println!(
+                        "  -> Real S3 Download Complete: {:.2} MiB in {:.4} s ({:.2} MB/s)",
+                        total_s3_bytes as f64 / (1024.0 * 1024.0),
+                        s3_dur_s,
+                        s3_bw
+                    );
                 } else {
-                    println!("  -> S3 GET returned status {} (bucket private or unseeded). Simulating network line rate.", resp.status());
+                    println!(
+                        "  -> S3 GET returned status {} (bucket private or unseeded). Simulating network line rate.",
+                        resp.status()
+                    );
                 }
             }
             Err(e) => {
@@ -203,14 +239,28 @@ pub async fn run_benchmark(
     }
 
     // 4. Request Metadata Resolution & Ingestion
-    println!("[Step 4/5] Requesting HyperCache Metadata Resolution & Ingestion for {}...", uri);
+    println!(
+        "[Step 4/5] Requesting HyperCache Metadata Resolution & Ingestion for {}...",
+        uri
+    );
     let t_meta_start = Instant::now();
-    let locate_req = serde_json::to_string(&Request::Locate {
-        uri: uri.clone(),
-        auto_ingest: true,
-        tier: target_tier,
-        pinned: false,
-    })? + "\n";
+    // Benchmark URIs explicitly opt in to synthetic data so the benchmark still runs when the
+    // object was not seeded to S3. Production locates never fabricate data.
+    let locate_req = if uri.starts_with(crate::ingestion::synthetic::SYNTHETIC_URI_PREFIX) {
+        serde_json::to_string(&Request::Ingest {
+            uri: uri.clone(),
+            tier: target_tier,
+            pinned: false,
+            allow_synthetic: true,
+        })?
+    } else {
+        serde_json::to_string(&Request::Locate {
+            uri: uri.clone(),
+            auto_ingest: true,
+            tier: target_tier,
+            pinned: false,
+        })?
+    } + "\n";
     writer.write_all(locate_req.as_bytes()).await?;
     writer.flush().await?;
 
@@ -251,13 +301,30 @@ pub async fn run_benchmark(
             Some(crate::protocol::StorageTier::Ram) => "RAM Shared Memory",
             _ => "SSDs",
         };
-        println!("  -> Cold Checkpoint Ingestion & Striping: {:.3} s ({} written across {})", initial_meta_duration.as_secs_f64(), written_str, target_dest);
+        println!(
+            "  -> Cold Checkpoint Ingestion & Striping: {:.3} s ({} written across {})",
+            initial_meta_duration.as_secs_f64(),
+            written_str,
+            target_dest
+        );
     }
-    println!("  -> Warm Moka Metadata Resolution:        {:.3} ms ({:.1} µs)", meta_duration.as_secs_f64() * 1000.0, meta_duration.as_micros() as f64);
-    println!("  -> Striped Checkpoint Layout:            {:.2} MiB ({} chunks, {} KiB each)", obj_size as f64 / (1024.0 * 1024.0), chunk_layout.len(), chunk_size / 1024);
+    println!(
+        "  -> Warm Moka Metadata Resolution:        {:.3} ms ({:.1} µs)",
+        meta_duration.as_secs_f64() * 1000.0,
+        meta_duration.as_micros() as f64
+    );
+    println!(
+        "  -> Striped Checkpoint Layout:            {:.2} MiB ({} chunks, {} KiB each)",
+        obj_size as f64 / (1024.0 * 1024.0),
+        chunk_layout.len(),
+        chunk_size / 1024
+    );
     println!();
 
-    println!("[Step 5/5] Benchmarking Direct Block DMA Parallel Reads ({} Workers across host cores)...", target_workers);
+    println!(
+        "[Step 5/5] Benchmarking Direct Block DMA Parallel Reads ({} Workers across host cores)...",
+        target_workers
+    );
     let mut total_tp_mbps = 0.0;
     let mut best_tp_mbps = 0.0;
     let mut fastest_read_time = std::time::Duration::MAX;
@@ -287,9 +354,9 @@ pub async fn run_benchmark(
 
                     for (idx, chunk) in chunks.iter().enumerate() {
                         if idx % num_workers == worker_id {
-                            let file = fd_cache.entry(chunk.device.clone()).or_insert_with(|| {
-                                File::open(Path::new(&chunk.device))
-                            });
+                            let file = fd_cache
+                                .entry(chunk.device.clone())
+                                .or_insert_with(|| File::open(Path::new(&chunk.device)));
 
                             if let Ok(f) = file {
                                 let mut buf = vec![0u8; chunk.length as usize];
@@ -308,7 +375,8 @@ pub async fn run_benchmark(
             }
 
             Ok(total_read.load(Ordering::Relaxed))
-        }).await??;
+        })
+        .await??;
 
         let read_duration = t_read_start.elapsed();
         let dur_s = read_duration.as_secs_f64();
@@ -324,8 +392,15 @@ pub async fn run_benchmark(
             fastest_read_time = read_duration;
         }
 
-        println!("  Iteration {:02}/{:02}: Read {:.2} MiB in {:.4} s -> {:.2} MiB/s ({:.2} GB/s)",
-            it, iterations, total_bytes as f64 / (1024.0 * 1024.0), dur_s, tp_mbps, tp_mbps / 1024.0);
+        println!(
+            "  Iteration {:02}/{:02}: Read {:.2} MiB in {:.4} s -> {:.2} MiB/s ({:.2} GB/s)",
+            it,
+            iterations,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            dur_s,
+            tp_mbps,
+            tp_mbps / 1024.0
+        );
     }
 
     let avg_tp_mbps = total_tp_mbps / (iterations as f64);
@@ -335,7 +410,11 @@ pub async fn run_benchmark(
     let s3_speed_mbps = real_s3_speed_mbps.unwrap_or(200.0);
     let s3_total_time_s = real_s3_time_s.unwrap_or_else(|| ((size_mb as f64) / s3_speed_mbps) + 0.040);
     let s3_meta_val_ms = real_s3_meta_ms.unwrap_or(40.0);
-    let speedup = if fastest_read_s > 0.0 { s3_total_time_s / fastest_read_s } else { 1.0 };
+    let speedup = if fastest_read_s > 0.0 {
+        s3_total_time_s / fastest_read_s
+    } else {
+        1.0
+    };
     let time_saved_s = (s3_total_time_s - fastest_read_s).max(0.0);
 
     let tier_label = match target_tier {
@@ -350,18 +429,45 @@ pub async fn run_benchmark(
     println!();
     println!("===========================================================================");
     if s3_config.is_some() && real_s3_time_s.is_some() {
-        println!("       HEAD-TO-HEAD COMPARISON: LIVE REAL S3 vs HYPERCACHE {}       ", tier_label);
+        println!(
+            "       HEAD-TO-HEAD COMPARISON: LIVE REAL S3 vs HYPERCACHE {}       ",
+            tier_label
+        );
     } else {
-        println!("       SIDE-BY-SIDE COMPARISON: IN-DATACENTER S3 vs HYPERCACHE {}    ", tier_label);
+        println!(
+            "       SIDE-BY-SIDE COMPARISON: IN-DATACENTER S3 vs HYPERCACHE {}    ",
+            tier_label
+        );
     }
     println!("===========================================================================");
     println!("  Metric                | Real S3 Remote Network | {}", tier_col);
     println!("  -------------------------------------------------------------------------");
-    println!("  Metadata Latency      | {:>7.2} ms             | {:.3} ms ({:.1}x FASTER)", s3_meta_val_ms, meta_duration.as_secs_f64() * 1000.0, s3_meta_val_ms / (meta_duration.as_secs_f64() * 1000.0).max(0.001));
-    println!("  Transfer Time ({:>4}MB) | {:>7.3} s             | {:>7.4} s ({:.2}x FASTER)", size_mb, s3_total_time_s, fastest_read_s, speedup);
-    println!("  Peak Throughput       | {:>7.1} MB/s          | {:>7.1} MB/s ({:>5.2} GB/s)", s3_speed_mbps, best_tp_mbps, best_tp_mbps / 1024.0);
-    println!("  Average Throughput    | {:>7.1} MB/s          | {:>7.1} MB/s ({:>5.2} GB/s)", s3_speed_mbps, avg_tp_mbps, avg_tp_mbps / 1024.0);
-    println!("  GPU Idle Time Saved   | --                    | {:.3} s per checkpoint load", time_saved_s);
+    println!(
+        "  Metadata Latency      | {:>7.2} ms             | {:.3} ms ({:.1}x FASTER)",
+        s3_meta_val_ms,
+        meta_duration.as_secs_f64() * 1000.0,
+        s3_meta_val_ms / (meta_duration.as_secs_f64() * 1000.0).max(0.001)
+    );
+    println!(
+        "  Transfer Time ({:>4}MB) | {:>7.3} s             | {:>7.4} s ({:.2}x FASTER)",
+        size_mb, s3_total_time_s, fastest_read_s, speedup
+    );
+    println!(
+        "  Peak Throughput       | {:>7.1} MB/s          | {:>7.1} MB/s ({:>5.2} GB/s)",
+        s3_speed_mbps,
+        best_tp_mbps,
+        best_tp_mbps / 1024.0
+    );
+    println!(
+        "  Average Throughput    | {:>7.1} MB/s          | {:>7.1} MB/s ({:>5.2} GB/s)",
+        s3_speed_mbps,
+        avg_tp_mbps,
+        avg_tp_mbps / 1024.0
+    );
+    println!(
+        "  GPU Idle Time Saved   | --                    | {:.3} s per checkpoint load",
+        time_saved_s
+    );
     println!("===========================================================================\n");
 
     // SHA-256 Bit-Level Integrity Parity Verification
@@ -372,9 +478,9 @@ pub async fn run_benchmark(
         let mut fd_cache = std::collections::HashMap::new();
 
         for chunk in layout_for_sha.iter() {
-            let file = fd_cache.entry(chunk.device.clone()).or_insert_with(|| {
-                File::open(Path::new(&chunk.device))
-            });
+            let file = fd_cache
+                .entry(chunk.device.clone())
+                .or_insert_with(|| File::open(Path::new(&chunk.device)));
 
             if let Ok(f) = file {
                 let mut buf = vec![0u8; chunk.length as usize];
@@ -383,7 +489,8 @@ pub async fn run_benchmark(
             }
         }
         Ok(format!("{:x}", hasher.finalize()))
-    }).await??;
+    })
+    .await??;
 
     println!("  -> Checkpoint SHA-256: {}", sha_hex);
     println!("  -> Data Integrity:    100% BIT-LEVEL PARITY VERIFIED (Zero Corruption across boundaries)\n");

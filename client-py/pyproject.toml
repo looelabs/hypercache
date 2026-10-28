@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hypercache-io"
-version = "0.9.0"
+version = "0.9.1"
 description = "HyperCache: Host-Local NVMe Caching and Zero-Copy Direct Block DMA / GPUDirect Storage Acceleration for AI Workloads"
 readme = "README.md"
 license = { text = "Apache-2.0" }
