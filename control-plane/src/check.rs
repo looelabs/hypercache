@@ -584,7 +584,23 @@ mod tests {
 
     #[test]
     fn test_evaluate_host_with_ram_enabled_succeeds() {
-        let report = evaluate_host(None, None, true).expect("evaluate_host should succeed");
+        // An empty prefix list keeps discovery off the host's raw disks: a CI runner may expose an
+        // unmounted disk the test user cannot open, which `check` correctly reports as FAIL.
+        let temp_dir = std::env::temp_dir().join(format!("hc_check_ram_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_path = temp_dir.join("ram_only.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "device_prefixes = []\nmetadata_persistence_path = \"{}/metadata.json\"\n",
+                temp_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let report = evaluate_host(Some(cfg_path), None, true).expect("evaluate_host should succeed");
+        let _ = std::fs::remove_dir_all(&temp_dir);
         assert!(
             report.ready,
             "Host check with RAM enabled should be ready even without raw block devices: {:?}",

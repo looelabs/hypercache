@@ -248,6 +248,8 @@ kill $DAEMON_PID
 - **macOS hosts do not compile the Linux-only code** (`#[cfg(target_os = "linux")]`: sysfs discovery, O_DIRECT, `fdatasync` paths). Clippy and test failures there show up only on Linux. Run `scripts/verify_release.sh --stages linux` (Docker) before calling a change done.
 - **Clippy depends on the toolchain.** CI uses current stable. A local toolchain that is a few releases behind may miss new lints, so run `rustup update` if CI clippy fails but local clippy passes.
 - **Containers expose host disks in sysfs without `/dev` nodes.** Discovery must skip them (it logs at debug). Do not turn that case into an error.
+- **Tests must not depend on the host's disks.** GitHub runner hardware varies: some VMs expose an unmounted disk the non-root runner user cannot open, which `check` correctly reports as FAIL. Tests that call discovery or `evaluate_host` must pin `device_prefixes = []`, mock devices or filesystem arenas.
+- **`release.yml` runs the test suites without the harness.** Any environment the harness sets up (for example `PYTHONPATH=client-py` for pytest) must also be set in the workflow step.
 - **Agents bound to loopback or `0.0.0.0` advertise an unusable address.** The controller dials them through `resolve_agent_address` (falls back to the registration source IP, IPv6 bracketed). Use it for every new dispatch path.
 - **Use `HYPERCACHE_SOCKET_PATH` to isolate test daemons.** It moves the socket and lock file for the daemon, the CLI and the Python client, so tests never touch `/run/hypercache` or another running daemon.
 - **MinIO images are no longer pullable.** The live S3 tests use `versity/versitygw:v1.10.0`. `server_enforces_signatures` proves the server really checks SigV4. Keep it, or signing bugs pass silently.

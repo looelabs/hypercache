@@ -35,6 +35,8 @@ jobs:
         run: cargo test --locked --manifest-path control-plane/Cargo.toml
 
       - name: Run Python client test suite
+        env:
+          PYTHONPATH: client-py
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install "numpy>=1.22" "fsspec>=2023.1.0" pytest
