@@ -925,7 +925,9 @@ pub async fn run_controller_server_with_config(
         }
     };
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(crate::server::shutdown_signal())
+        .await?;
     Ok(())
 }
 

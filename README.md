@@ -246,6 +246,39 @@ pip install hypercache-io
 kubectl apply -f deploy/kubernetes/hypercache.yaml
 ```
 
+#### Running the daemon in Docker and using it from the host
+
+Clients do not stream data through the daemon. They get a chunk layout over the socket, then read
+and write the cache files directly at the paths the daemon reports. A containerized daemon is
+therefore usable from the host (or from other containers) only when:
+
+1. **Every cache path is bind-mounted at the same path** on both sides: the socket directory, the
+   arena directory and, with the RAM tier, the shared-memory directory. A container's own `/dev/shm`
+   is private, so mount a host directory there.
+2. **Non-root clients are in `client_gid`.** The daemon runs as root and gives this numeric group
+   read/write access to the socket, arenas and RAM-tier files. Without it, only root can connect.
+
+```bash
+# configs/my-agent.toml: storage_backing_mode = "filesystem",
+#   filesystem_cache_paths = ["/var/cache/hypercache"], client_gid = 2000
+#   (optional RAM tier: ram_cache_enabled = true, ram_cache_shm_path = "/dev/shm/hypercache")
+sudo mkdir -p /run/hypercache /var/cache/hypercache /var/lib/hypercache /dev/shm/hypercache
+docker run -d --name hypercache \
+  -v /run/hypercache:/run/hypercache \
+  -v /var/cache/hypercache:/var/cache/hypercache \
+  -v /var/lib/hypercache:/var/lib/hypercache \
+  -v /dev/shm/hypercache:/dev/shm/hypercache \
+  -v /mnt/nfs:/mnt/nfs:ro \
+  -v "$PWD/configs/my-agent.toml:/etc/hypercache/agent.toml:ro" \
+  ghcr.io/looelabs/hypercache:latest -c /etc/hypercache/agent.toml start
+
+# On the host, as a user in group 2000:
+python -c "from hypercache.client import HyperCacheClient; print(HyperCacheClient().ping())"
+```
+
+`docker stop` shuts the daemon down cleanly (SIGTERM flushes the manifest and removes the socket).
+`scripts/e2e/container_host_access.sh` tests exactly this layout.
+
 ---
 
 ## Configuration Guide (`hypercache-agent.toml` & `hypercache-controller.toml`)
@@ -832,14 +865,15 @@ Runs on the Controller host (zero configuration required on `127.0.0.1` loopback
 ```bash
 # Full release verification harness: static checks (fmt, clippy, versions, zero-emoji),
 # Rust + Python suites, end-to-end daemon / fleet scenarios on real binaries, live S3
-# (throwaway versitygw container), a clean Linux container run, and the Docker image.
-scripts/verify_release.sh            # everything (Docker stages skipped if unavailable)
+# (throwaway versitygw container), a clean Linux container run, the Docker image with
+# host access to the containerized daemon, and the Kubernetes manifest on minikube.
+scripts/verify_release.sh            # everything (Docker / minikube stages skipped if unavailable)
 scripts/verify_release.sh --quick    # static, rust, python only
 
-# 1. Run the Rust Control Plane unit & integration test suite (73 tests + 6 live S3 tests)
+# 1. Run the Rust Control Plane unit & integration test suite (76 tests + 6 live S3 tests)
 cargo test --manifest-path control-plane/Cargo.toml
 
-# 2. Run the Python Data Plane & framework integration test suite (32 tests)
+# 2. Run the Python Data Plane & framework integration test suite (34 tests)
 .venv/bin/pytest client-py/tests
 
 # 2b. End-to-end scenarios against the release binaries (no daemon needed beforehand)

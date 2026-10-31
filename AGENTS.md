@@ -66,6 +66,7 @@ hypercache-poc/
 │   ├── rustfmt.toml            # max_width = 120; CI enforces cargo fmt --check
 │   ├── src/
 │   │   ├── lib.rs              # Library crate root; both binaries build on it
+│   │   ├── access.rs           # client_gid sharing of the socket, arenas and RAM-tier files
 │   │   ├── main.rs             # Binary: ./hypercache (Worker Node Daemon & Local CLI)
 │   │   ├── bin/
 │   │   │   └── admin.rs        # Binary: ./hypercache-admin (Cluster Administration Suite)
@@ -95,6 +96,9 @@ hypercache-poc/
 ├── scripts/
 │   ├── verify_release.sh       # Release verification harness (static, rust, python, e2e, s3, linux, image)
 │   ├── e2e/hypercache_e2e.py   # End-to-end daemon / fleet / S3 scenarios against the real binaries
+│   ├── e2e/container_host_access.sh # Containerized daemon used by a non-root "host" client
+│   ├── e2e/host_probe.py       # Client probe run by the container and Kubernetes scenarios
+│   ├── e2e/k8s_smoke.sh        # Bundled K8s manifest on a throwaway minikube cluster
 │   └── setup_mock_devices.sh   # Creates sparse mock block device files in /tmp
 │
 └── client-py/                  # Zero-copy Python AI client & framework integration
@@ -203,14 +207,14 @@ cargo test --manifest-path control-plane/Cargo.toml
 ```bash
 .venv/bin/pytest client-py/tests
 ```
-*Expected: All 32 client, datapath, fsspec and integration tests pass.*
+*Expected: All 34 client, datapath, fsspec and integration tests pass.*
 
 ### Running the Release Verification Harness
 ```bash
-scripts/verify_release.sh            # static, rust, python, e2e, s3, linux, image
+scripts/verify_release.sh            # static, rust, python, e2e, s3, linux, image, k8s
 scripts/verify_release.sh --quick    # static, rust, python
 ```
-*Expected: `RESULT: PASSED`. Docker-based stages (s3, linux, image) are skipped with a notice when Docker is unavailable. Run the full harness before tagging a release.*
+*Expected: `RESULT: PASSED`. Docker-based stages (s3, linux, image, k8s) are skipped with a notice when Docker (or, for k8s, minikube and kubectl) is unavailable. Run the full harness before tagging a release.*
 
 ### Running Local Benchmark Verification
 ```bash
@@ -251,6 +255,9 @@ kill $DAEMON_PID
 - **Tests must not depend on the host's disks.** GitHub runner hardware varies: some VMs expose an unmounted disk the non-root runner user cannot open, which `check` correctly reports as FAIL. Tests that call discovery or `evaluate_host` must pin `device_prefixes = []`, mock devices or filesystem arenas.
 - **`release.yml` runs the test suites without the harness.** Any environment the harness sets up (for example `PYTHONPATH=client-py` for pytest) must also be set in the workflow step.
 - **Agents bound to loopback or `0.0.0.0` advertise an unusable address.** The controller dials them through `resolve_agent_address` (falls back to the registration source IP, IPv6 bracketed). Use it for every new dispatch path.
+- **Clients open cache files directly, outside the daemon's mount namespace.** A layout carries the daemon's own paths, so a containerized daemon must share the socket directory, arena directories and (RAM tier) the shared-memory directory at identical paths with its clients. A container's `/dev/shm` is private. Non-root clients need `client_gid`. Never let the client create RAM chunk files or directories: the daemon pre-creates staged files and `commit_write` rejects RAM chunks that were never written, which is how a client with a private `/dev/shm` is caught instead of silently losing a checkpoint. `scripts/e2e/container_host_access.sh` and `k8s_smoke.sh` cover this.
+- **The daemon is PID 1 in containers.** PID 1 ignores signals it has no handler for, so every long-running entry point must stop on `server::shutdown_signal()` (SIGINT and SIGTERM), or `docker stop` and pod deletion wait out the grace period and SIGKILL it.
+- **`storage_backing_mode = "filesystem"` must never touch raw disks.** If no arena can be provisioned the daemon runs without Tier 2 storage. A privileged pod sees the host's unmounted disks, so a fallback scan would overwrite them.
 - **Use `HYPERCACHE_SOCKET_PATH` to isolate test daemons.** It moves the socket and lock file for the daemon, the CLI and the Python client, so tests never touch `/run/hypercache` or another running daemon.
 - **MinIO images are no longer pullable.** The live S3 tests use `versity/versitygw:v1.10.0`. `server_enforces_signatures` proves the server really checks SigV4. Keep it, or signing bugs pass silently.
 - **Do not edit `scripts/verify_release.sh` while it is running.** Bash reads the script incrementally, and an edit mid-run causes bogus syntax errors.
@@ -330,3 +337,4 @@ cargo build --release --manifest-path control-plane/Cargo.toml
 | `s3_multipart_threshold_bytes` | integer | `67108864` | Uploads above this size use S3 multipart upload |
 | `allow_local_admin_bypass` | bool | `true` | Controller: loopback callers skip auth (set `false` behind proxies / in K8s) |
 | `node_gc_secs` | integer | `600` | Controller: forget nodes silent for this long |
+| `client_gid` | integer | `None` | Numeric group given read/write on the socket, arenas and RAM-tier files (non-root host / pod clients) |

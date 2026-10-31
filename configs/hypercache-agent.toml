@@ -97,6 +97,12 @@ nfs_read_buffer_bytes = 4194304 # 4 MiB
 # or write arbitrary host files such as /etc/shadow.
 # nfs_allowed_paths = ["/mnt/datasets", "/scratch/checkpoints"]
 
+# Local client access. Clients read and write cache files directly, so when the daemon runs as
+# root (raw devices, containers) and clients run as another user, set the numeric group id the
+# clients run with: the socket, arenas and RAM-tier files become group read/write (0660).
+# Numeric because group names differ between a container and its host. Unset = daemon user only.
+# client_gid = 2000
+
 # Freed blocks are held for this many seconds before reuse, so a reader that resolved a layout
 # just before an eviction or re-ingest never reads another object's bytes.
 reclaim_grace_secs = 30

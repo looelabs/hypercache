@@ -13,6 +13,7 @@ pub struct RamMemoryPool {
     shm_path: PathBuf,
     max_capacity_bytes: u64,
     used_bytes: Arc<AtomicU64>,
+    client_gid: Option<u32>,
 }
 
 impl RamMemoryPool {
@@ -27,10 +28,37 @@ impl RamMemoryPool {
             shm_path,
             max_capacity_bytes,
             used_bytes: Arc::new(AtomicU64::new(0)),
+            client_gid: None,
         };
 
         pool.recompute_used_bytes();
         pool
+    }
+
+    /// Shares the pool directory and every chunk file with `client_gid` (see `access`).
+    pub fn with_client_gid(mut self, client_gid: Option<u32>) -> Self {
+        self.client_gid = client_gid;
+        if let Err(e) = crate::access::grant_dir(&self.shm_path, client_gid) {
+            warn!(
+                "Could not give group {:?} access to shared memory directory {:?}: {}",
+                client_gid, self.shm_path, e
+            );
+        }
+        self
+    }
+
+    /// Creates the empty file for a chunk a client is about to write (staged writes).
+    /// Creating it here, rather than in the client, means a client that does not share this
+    /// `/dev/shm` with the daemon fails loudly instead of writing into a private copy.
+    pub fn create_staged_chunk(&self, path: &Path) -> Result<()> {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("Failed to create staged shared memory file at {:?}", path))?;
+        crate::access::grant_file_or_warn(path, self.client_gid);
+        Ok(())
     }
 
     /// Recomputes used bytes by scanning existing .shm files in the shared memory directory.
@@ -88,6 +116,8 @@ impl RamMemoryPool {
                 .with_context(|| format!("Failed to create shared memory file at {:?}", target_path))?;
             file.write_all(data)
                 .with_context(|| format!("Failed to write data to shared memory file at {:?}", target_path))?;
+            crate::access::grant_file(&target_path, self.client_gid)
+                .with_context(|| format!("Failed to share {:?} with client group", target_path))?;
             Ok(())
         })();
 

@@ -5,6 +5,7 @@ bounce buffers, tier-based SHM detection, and opt-in CRC32 verification.
 
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from hypercache.datapath import (
     ChecksumMismatchError,
     ChunkLocation,
     DirectBlockReader,
+    DirectBlockWriter,
     get_data_reader,
 )
 
@@ -187,6 +189,20 @@ class TestClientConcurrencyAndFraming(unittest.TestCase):
             client.locate("hypercache://x/1", auto_ingest=False)
         self.assertFalse(client.ping())
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses socket permissions")
+    def test_socket_permission_error_names_client_gid(self):
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.path)
+        server.listen(1)
+        try:
+            os.chmod(self.path, 0o000)
+            client = HyperCacheClient(socket_path=self.path)
+            with self.assertRaises(ConnectionError) as ctx:
+                client.locate("hypercache://x/1", auto_ingest=False)
+            self.assertIn("client_gid", str(ctx.exception))
+        finally:
+            server.close()
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires fork()")
     def test_client_reconnects_after_fork(self):
         daemon = _EchoDaemon(self.path)
@@ -230,9 +246,7 @@ class TestDatapathReads(unittest.TestCase):
             f.write(b"\0" * 8192)
 
     def tearDown(self):
-        for name in os.listdir(self.dir):
-            os.remove(os.path.join(self.dir, name))
-        os.rmdir(self.dir)
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def _layout(self, chunk=65536, crc=True):
         out = []
@@ -314,6 +328,30 @@ class TestDatapathReads(unittest.TestCase):
             self.assertEqual(reader.get_stats()["shm_reads"], 1)
         finally:
             reader.close()
+
+    def test_ram_chunk_write_never_creates_a_private_shm_directory(self):
+        writer = DirectBlockWriter()
+        try:
+            # Directory missing: this process does not share /dev/shm with the daemon
+            missing_dir = os.path.join(self.dir, "unshared_shm")
+            loc = ChunkLocation(device=os.path.join(missing_dir, "c0.shm"), offset=0, length=100, tier="ram")
+            with self.assertRaises(FileNotFoundError) as ctx:
+                writer.write_chunks([loc], self.payload[:100])
+            self.assertIn("/dev/shm", str(ctx.exception))
+            self.assertFalse(os.path.exists(missing_dir))
+
+            # Shared directory with the daemon's pre-created file: written in place
+            shared_dir = os.path.join(self.dir, "shared_shm")
+            os.makedirs(shared_dir)
+            target = os.path.join(shared_dir, "c0.shm")
+            open(target, "wb").close()
+            loc = ChunkLocation(device=target, offset=0, length=100, tier="ram")
+            self.assertEqual(writer.write_chunks([loc], self.payload[:100]), 100)
+            with open(target, "rb") as f:
+                self.assertEqual(f.read(), self.payload[:100])
+        finally:
+            if hasattr(writer, "close"):
+                writer.close()
 
     def test_chunk_location_round_trip_and_legacy(self):
         legacy = ChunkLocation.from_dict({"device": "/dev/x", "offset": 4096, "length": 10})

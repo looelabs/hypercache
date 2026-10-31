@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.9.2
+
+Containers and Kubernetes: a daemon running in a container (as root) is now usable from the host
+and from other pods by unprivileged users, and stops cleanly when the runtime asks it to.
+
+### Fixes
+- The daemon and the controller now shut down cleanly on SIGTERM. As a container's PID 1 they ignored
+  it, so `docker stop` and pod deletion waited out the grace period (10 s / 30 s), SIGKILLed the
+  daemon and left a stale socket behind.
+- RAM-tier checkpoints written by a client with its own `/dev/shm` (any client outside the daemon's
+  container) were silently lost: the client created a private copy and the commit still succeeded.
+  The daemon now pre-creates staged RAM chunk files, the client never creates them, and
+  `commit_write` rejects RAM chunks that were never written.
+- `storage_backing_mode = "filesystem"` no longer falls back to scanning raw block devices when no
+  arena can be provisioned. In a privileged pod, that scan could select the host's unmounted disks.
+- A non-root client that cannot open the socket now gets an error naming `client_gid` instead of
+  "Is the daemon running?". NFS confinement errors say when `nfs_mount_path` does not exist inside
+  the daemon's filesystem (share not mounted into the container).
+
+### New
+- `client_gid` (agent): the numeric group that local clients run with. The socket, filesystem
+  arenas and RAM-tier files (and the RAM directory, setgid) are shared with it read/write.
+  Unset keeps the previous behavior (daemon user only).
+- Kubernetes manifest: `client_gid = 2000`, readiness/liveness probes for the agent
+  (`hypercache status`) and the controller (TCP), RAM-tier hostPath instructions, and an example
+  training pod with the required mounts and `supplementalGroups`.
+- README: running the daemon in Docker with host access.
+- `scripts/e2e/container_host_access.sh` (in the `image` stage, now also run by CI) and
+  `scripts/e2e/k8s_smoke.sh` (new `k8s` stage, minikube).
+
 ## 0.9.1
 
 Hardening release: data integrity under concurrency and crashes, network and filesystem security,

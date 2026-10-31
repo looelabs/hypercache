@@ -15,7 +15,12 @@
 #   linux   re-runs static,rust,python,e2e,s3 inside a clean rust:1-bookworm container,
 #           so Linux-only paths (O_DIRECT, sysfs, fdatasync) are exercised. Needs Docker.
 #   image   builds the release Dockerfile and smoke-tests the image (binaries, configs,
-#           Python client import, daemon start on a mock device). Needs Docker.
+#           Python client import, daemon start on a mock device), then uses the containerized
+#           daemon from a second container as an unprivileged host client
+#           (scripts/e2e/container_host_access.sh). Needs Docker.
+#   k8s     deploys deploy/kubernetes/hypercache.yaml on a throwaway minikube cluster and runs a
+#           non-root training pod against the node cache (scripts/e2e/k8s_smoke.sh). Needs
+#           Docker, minikube and kubectl; skipped when they are missing.
 #
 # Usage:
 #   scripts/verify_release.sh                 # all stages (Docker stages skipped if unavailable)
@@ -37,7 +42,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-ALL_STAGES="static,rust,python,e2e,s3,linux,image"
+ALL_STAGES="static,rust,python,e2e,s3,linux,image,k8s"
 STAGES="$ALL_STAGES"
 NO_DOCKER=0
 IN_CONTAINER=0
@@ -474,10 +479,28 @@ stage_image() {
     step "docker build (release Dockerfile, --locked)" build_image
     if [ "$FAILED" -eq 0 ]; then
         step "image smoke: versions, configs, python client, daemon start" smoke_image
+        step "container <-> host access: client_gid, O_DIRECT, RAM tier, SIGTERM, warm boot" \
+            "$REPO_ROOT/scripts/e2e/container_host_access.sh" "$IMAGE_TAG"
     else
         skip "image smoke" "image build failed"
     fi
     [ "$before" -ne 0 ] && FAILED=1
+}
+
+stage_k8s() {
+    section "k8s (minikube)"
+    if [ "$IN_CONTAINER" -eq 1 ]; then
+        return
+    fi
+    if ! docker_ok || ! command -v minikube >/dev/null 2>&1 || ! command -v kubectl >/dev/null 2>&1; then
+        skip "kubernetes smoke test" "needs Docker, minikube and kubectl"
+        return
+    fi
+    if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+        step "docker build (release Dockerfile, --locked)" build_image || return
+    fi
+    step "kubernetes manifest on minikube: probes, registration, non-root pod, SIGTERM, warm boot" \
+        "$REPO_ROOT/scripts/e2e/k8s_smoke.sh" "$IMAGE_TAG"
 }
 
 # ------------------------------------------------------------------------------
@@ -496,6 +519,7 @@ has_stage e2e && stage_e2e
 has_stage s3 && stage_s3
 has_stage linux && stage_linux
 has_stage image && stage_image
+has_stage k8s && stage_k8s
 
 echo
 echo "=============================================================================="

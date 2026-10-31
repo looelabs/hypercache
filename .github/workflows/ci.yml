@@ -43,9 +43,10 @@ jobs:
           python -m pip install "numpy>=1.22" "fsspec>=2023.1.0" pytest boto3 safetensors pyyaml build
           sudo apt-get install -y -qq lsof
 
-      # Runs every stage except `linux` (the runner already is a clean Linux host).
-      # The s3 stage starts a throwaway versitygw container via the runner's Docker.
+      # Runs every stage except `linux` (the runner already is a clean Linux host) and `k8s`
+      # (needs minikube). The s3 stage starts a throwaway versitygw container, and the image
+      # stage builds the release image and tests host access to the containerized daemon.
       - name: Verification harness
         env:
           PYTHON: python
-        run: scripts/verify_release.sh --stages static,rust,python,e2e,s3
+        run: scripts/verify_release.sh --stages static,rust,python,e2e,s3,image

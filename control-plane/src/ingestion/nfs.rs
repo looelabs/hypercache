@@ -84,13 +84,26 @@ impl NfsPosixFetcher {
         if roots.iter().any(|root| resolved.starts_with(root)) {
             Ok(resolved)
         } else {
+            let missing: Vec<&str> = std::iter::once(self.config.nfs_mount_path.as_str())
+                .chain(self.config.nfs_allowed_paths.iter().map(|s| s.as_str()))
+                .filter(|s| !s.trim().is_empty() && !Path::new(s).exists())
+                .collect();
+            let hint = if missing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Note: {:?} does not exist on the daemon's filesystem (in a container, mount the share at that path).",
+                    missing
+                )
+            };
             anyhow::bail!(
                 "NFS/POSIX path {:?} for '{}' is outside the allowed roots (nfs_mount_path = {:?}, nfs_allowed_paths = {:?}). \
-                 Add its directory to nfs_allowed_paths in the agent configuration to allow it.",
+                 Add its directory to nfs_allowed_paths in the agent configuration to allow it.{}",
                 path,
                 uri,
                 self.config.nfs_mount_path,
-                self.config.nfs_allowed_paths
+                self.config.nfs_allowed_paths,
+                hint
             )
         }
     }

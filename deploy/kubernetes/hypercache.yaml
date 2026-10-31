@@ -13,6 +13,13 @@
 #      O_DIRECT filesystem arenas or raw /dev block devices) and exposing the
 #      Unix Domain Socket (/run/hypercache/hypercache.sock) to training/inference
 #      pods on the same node via a shared hostPath volume.
+#
+# Using the cache from a training / inference pod (see the example at the end of this file):
+#   - Clients read and write cache files directly at the paths the agent reports, so a client pod
+#     must mount the same hostPaths at the SAME mountPaths as the agent (/run/hypercache,
+#     /var/cache/hypercache, and /dev/shm/hypercache when the RAM tier is enabled).
+#   - The agent runs as root and shares the socket and cache files with client_gid (2000 below).
+#     Client pods that run as non-root add that group via securityContext.supplementalGroups.
 # ==============================================================================
 
 apiVersion: v1
@@ -54,6 +61,12 @@ data:
     # and uncomment the privileged /dev volumeMount in the DaemonSet below.)
     storage_backing_mode = "filesystem"
     filesystem_cache_paths = ["/var/cache/hypercache"]
+    # Client pods running as non-root need this group (supplementalGroups: [2000]).
+    client_gid = 2000
+    # Tier 1 RAM: a pod's /dev/shm is private, so RAM-tier files must live on a hostPath that
+    # client pods mount at the same path. Enable together with the host-shm volume below.
+    # ram_cache_enabled = true
+    # ram_cache_shm_path = "/dev/shm/hypercache"
     filesystem_arena_size_bytes = 107374182400 # 100 GiB per node NVMe directory
 
     chunk_size_bytes = 4194304
@@ -120,6 +133,15 @@ spec:
             - name: controller-http
               containerPort: 9120
               protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 9120
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9120
+            initialDelaySeconds: 10
+            periodSeconds: 20
           volumeMounts:
             - name: config
               mountPath: /etc/hypercache
@@ -210,6 +232,17 @@ spec:
             - name: metrics
               containerPort: 9110
               protocol: TCP
+          # `hypercache status` exits non-zero when the daemon does not answer on its socket
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/hypercache", "status"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/hypercache", "status"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
           volumeMounts:
             - name: config
               mountPath: /etc/hypercache
@@ -220,6 +253,9 @@ spec:
               mountPath: /var/cache/hypercache
             - name: metadata-dir
               mountPath: /var/lib/hypercache
+            # Uncomment together with ram_cache_enabled in the ConfigMap:
+            # - name: host-shm
+            #   mountPath: /dev/shm/hypercache
             # Uncomment /dev mount below ONLY if using storage_backing_mode = "raw_block":
             # - name: host-dev
             #   mountPath: /dev
@@ -247,6 +283,10 @@ spec:
           hostPath:
             path: /var/lib/hypercache
             type: DirectoryOrCreate
+        # - name: host-shm
+        #   hostPath:
+        #     path: /dev/shm/hypercache
+        #     type: DirectoryOrCreate
         # Uncomment host-dev volume ONLY if using storage_backing_mode = "raw_block":
         # - name: host-dev
         #   hostPath:
@@ -285,3 +325,33 @@ spec:
     - ports:
         - protocol: TCP
           port: 9110
+---
+# ==============================================================================
+# 4. Example: a training / inference pod using the node's cache (not applied as-is)
+# ==============================================================================
+# apiVersion: v1
+# kind: Pod
+# metadata:
+#   name: trainer
+# spec:
+#   securityContext:
+#     runAsUser: 1000
+#     runAsGroup: 1000
+#     supplementalGroups: [2000]        # = client_gid in the agent ConfigMap
+#   containers:
+#     - name: trainer
+#       image: your-training-image      # with `pip install hypercache-io`
+#       volumeMounts:                   # same mountPaths as the agent
+#         - name: hypercache-socket
+#           mountPath: /run/hypercache
+#         - name: hypercache-cache
+#           mountPath: /var/cache/hypercache
+#         # - name: hypercache-shm        # when the RAM tier is enabled
+#         #   mountPath: /dev/shm/hypercache
+#   volumes:
+#     - name: hypercache-socket
+#       hostPath: {path: /run/hypercache, type: Directory}
+#     - name: hypercache-cache
+#       hostPath: {path: /var/cache/hypercache, type: Directory}
+#     # - name: hypercache-shm
+#     #   hostPath: {path: /dev/shm/hypercache, type: Directory}

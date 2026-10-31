@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::discovery::DiscoveredDevice;
 use crate::ingestion::IngestionEngine;
 use crate::metadata::MetadataStore;
-use crate::protocol::{ChunkDescriptor, Request, Response, SyncStatus};
+use crate::protocol::{ChunkDescriptor, Request, Response, StorageTier, SyncStatus};
 use crate::telemetry::{TelemetryCollector, TelemetryEvent};
 
 /// Maximum size of one newline-delimited IPC request (protects the daemon from unbounded reads)
@@ -64,6 +64,45 @@ fn secure_socket_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolves on SIGINT (Ctrl+C) or SIGTERM (`docker stop`, Kubernetes pod termination).
+/// A container's PID 1 ignores SIGTERM unless it installs a handler, so without this the
+/// runtime waits out its grace period, SIGKILLs the daemon and leaves a stale socket behind.
+pub async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Cannot install SIGTERM handler ({}); only Ctrl+C triggers a clean shutdown",
+                e
+            );
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Checks that every RAM-tier chunk file holds at least the bytes its descriptor claims.
+fn verify_ram_chunks_written(layout: &[ChunkDescriptor]) -> Result<()> {
+    for chunk in layout.iter().filter(|c| c.tier == StorageTier::Ram) {
+        let have = fs::metadata(&chunk.device).map(|m| m.len()).unwrap_or(0);
+        if have < chunk.offset + chunk.length {
+            anyhow::bail!(
+                "RAM chunk {} holds {} of {} bytes. The client most likely does not share /dev/shm with the \
+                 daemon (run the daemon container with --ipc=host or mount the host's /dev/shm into both)",
+                chunk.device,
+                have,
+                chunk.offset + chunk.length
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Server {
     pub fn new(
         config: Config,
@@ -106,6 +145,7 @@ impl Server {
         let listener =
             UnixListener::bind(sock_path).with_context(|| format!("Failed to bind UDS listener at {:?}", sock_path))?;
 
+        crate::access::grant_file_or_warn(sock_path, self.config.client_gid);
         info!("HyperCache Control Plane listening on UDS: {:?}", sock_path);
 
         loop {
@@ -487,6 +527,13 @@ impl Server {
         let size = meta.object_size;
         let generation = meta.generation;
         let layout = meta.chunk_layout.clone();
+
+        // A client that does not share /dev/shm with the daemon writes into its own private copy
+        // and leaves the daemon's pre-created chunk files empty: refuse to commit that.
+        if let Err(e) = verify_ram_chunks_written(&layout) {
+            error!("Commit of '{}' rejected: {:#}", uri, e);
+            return Response::error(format!("{:#}", e));
+        }
 
         // The client wrote the chunks directly; flush them before declaring the write committed
         if let Err(e) = self.ingestion.striper().sync_chunks(&layout).await {
@@ -894,7 +941,22 @@ mod tests {
         assert_eq!(layout[0].tier, StorageTier::Ram);
         assert_eq!(layout[1].tier, StorageTier::Ram);
 
-        // 2. Commit write (write-back)
+        // The daemon pre-creates the chunk files; a client that never writes them (e.g. one with
+        // a private /dev/shm) must not get a successful commit
+        for chunk in &layout {
+            assert_eq!(std::fs::metadata(&chunk.device).unwrap().len(), 0);
+        }
+        let resp_unwritten = server.handle_commit_write(uri, None, false, t_start).await;
+        assert_eq!(resp_unwritten.status, crate::protocol::ResponseStatus::Error);
+        assert!(resp_unwritten
+            .error_message
+            .unwrap_or_default()
+            .contains("does not share /dev/shm"));
+
+        // 2. Client writes the chunks, then commits (write-back)
+        for chunk in &layout {
+            std::fs::write(&chunk.device, vec![7u8; chunk.length as usize]).unwrap();
+        }
         let resp_commit = server.handle_commit_write(uri, None, false, t_start).await;
         assert_eq!(resp_commit.status, crate::protocol::ResponseStatus::WriteCommitted);
 
@@ -1124,12 +1186,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_uds_round_trip_and_oversized_request() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let (server, dir) = nvme_server("uds", 16, |_| {});
         let sock = dir.join("s").join("hc.sock");
+        // Any group the test user belongs to works as client_gid; the dir's own gid is one
+        let my_gid = std::fs::metadata(&dir).unwrap().gid();
         let server = Arc::new(Server {
             config: Config {
                 socket_path: sock.to_string_lossy().to_string(),
+                client_gid: Some(my_gid),
                 ..server.config.clone()
             },
             ..Arc::try_unwrap(Arc::new(server)).ok().unwrap()
@@ -1153,6 +1219,11 @@ mod tests {
         assert_eq!(first.status, crate::protocol::ResponseStatus::Pong);
         let second: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(second.status, crate::protocol::ResponseStatus::List);
+
+        // client_gid opens the socket to the clients' group (connect needs write permission)
+        let sock_meta = std::fs::metadata(&sock).unwrap();
+        assert_eq!(sock_meta.gid(), my_gid);
+        assert_eq!(sock_meta.permissions().mode() & 0o777, 0o660);
 
         w.write_all(b"not json\n").await.unwrap();
         let err: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();

@@ -171,14 +171,16 @@ impl Striper {
                     let start = local_idx as u64 * chunk_size;
                     let chunk_len = (start + chunk_size).min(size_bytes) - start;
                     let chunk_id = format!("{}_chunk_{}", uri, start_chunk_idx + local_idx);
-                    ChunkDescriptor::new(
+                    let path = pool.get_chunk_path(&chunk_id);
+                    pool.create_staged_chunk(&path)?;
+                    Ok(ChunkDescriptor::new(
                         StorageTier::Ram,
-                        pool.get_chunk_path(&chunk_id).to_string_lossy().to_string(),
+                        path.to_string_lossy().to_string(),
                         0,
                         chunk_len,
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             return Ok(layout);
         }
 

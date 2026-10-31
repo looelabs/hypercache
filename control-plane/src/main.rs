@@ -521,7 +521,7 @@ async fn run_daemon(
 
     let ram_pool = if config.ram_cache_enabled {
         let shm_path = config::get_ram_pool_path(&config);
-        let pool = Arc::new(ram::RamMemoryPool::new(shm_path, ram_cap));
+        let pool = Arc::new(ram::RamMemoryPool::new(shm_path, ram_cap).with_client_gid(config.client_gid));
         metadata.set_ram_pool(pool.clone()).await;
         Some(pool)
     } else {
@@ -609,7 +609,7 @@ async fn run_daemon(
                 tracing::error!("Server terminated with error: {}", e);
             }
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = server::shutdown_signal() => {
             println!("\nReceived shutdown signal. Flushing metadata manifest and stopping cleanly...");
             let _ = server.metadata().flush_to_disk().await;
         }

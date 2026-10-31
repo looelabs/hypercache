@@ -535,7 +535,16 @@ class DirectBlockWriter:
         return self._fd_cache[device_path]
 
     def _write_ram_chunk(self, target_path: str, chunk_data: bytes) -> None:
-        os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+        # The daemon creates staged RAM chunk files. Never create the directory here: if it is
+        # missing, this process does not share /dev/shm with the daemon, and writing a private
+        # copy would make the checkpoint silently disappear.
+        if not os.path.isdir(os.path.dirname(os.path.abspath(target_path))):
+            raise FileNotFoundError(
+                f"RAM chunk directory for {target_path} does not exist in this process. It does not "
+                "share /dev/shm with the HyperCache daemon (run the daemon container with --ipc=host "
+                "or mount the host's /dev/shm into both)."
+            )
+        # "wb" still creates the file for daemons older than 0.9.2, which did not pre-create it
         with open(target_path, "wb") as f:
             f.write(chunk_data)
 

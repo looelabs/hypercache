@@ -200,6 +200,13 @@ pub struct Config {
     /// Controller only: seconds without heartbeat after which an OFFLINE node is forgotten
     #[serde(default = "default_node_gc_secs")]
     pub node_gc_secs: u64,
+
+    /// Numeric group id that local clients (training jobs on the host or in other containers)
+    /// run with. When set, the daemon gives this group read/write access to the socket,
+    /// filesystem arenas and RAM-tier files. Numeric because group names differ between a
+    /// container and its host. When unset, only the daemon's own user can use the cache.
+    #[serde(default)]
+    pub client_gid: Option<u32>,
 }
 
 pub const PRIMARY_METADATA_PATH: &str = "/var/lib/hypercache/metadata.json";
@@ -601,6 +608,7 @@ impl Default for Config {
             reclaim_grace_secs: default_reclaim_grace_secs(),
             allow_local_admin_bypass: true,
             node_gc_secs: default_node_gc_secs(),
+            client_gid: None,
         }
     }
 }

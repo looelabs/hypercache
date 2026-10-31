@@ -154,6 +154,11 @@ class HyperCacheClient:
             self._sock = sock
             self._rbuf = bytearray()
             return sock
+        except PermissionError as e:
+            raise ConnectionError(
+                f"Permission denied on HyperCache socket {self.socket_path} (uid {os.getuid()}). "
+                "Set client_gid in the daemon configuration and run this process with that group."
+            ) from e
         except Exception as e:
             logger.debug(f"Failed to connect to HyperCache daemon at {self.socket_path}: {e}")
             raise ConnectionError(

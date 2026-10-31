@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -37,11 +37,18 @@ impl DeviceDetector {
         info!("Running block device discovery (mode: '{}')...", mode);
 
         let backing_mode = config.storage_backing_mode.to_lowercase();
-        if backing_mode == "filesystem" && !config.filesystem_cache_paths.is_empty() {
+        if backing_mode == "filesystem" {
+            // Never fall back to raw disks here: a privileged pod sees the host's unmounted disks,
+            // and striping onto them would overwrite whatever they hold.
             let arenas = Self::provision_filesystem_arenas(config);
-            if !arenas.is_empty() {
-                return arenas;
+            if arenas.is_empty() {
+                error!(
+                    "storage_backing_mode = \"filesystem\" but no arena could be provisioned from \
+                     filesystem_cache_paths = {:?}; raw block devices are not used in this mode",
+                    config.filesystem_cache_paths
+                );
             }
+            return arenas;
         }
 
         if mode == "manual" && !config.block_devices.is_empty() {
@@ -615,6 +622,7 @@ impl DeviceDetector {
                 continue;
             }
 
+            crate::access::grant_file_or_warn(&arena_file, config.client_gid);
             let actual_size = fs::metadata(&arena_file).map(|m| m.len()).unwrap_or(arena_size);
 
             info!(
@@ -705,6 +713,47 @@ mod tests {
         assert!(devices[1].path.ends_with("hypercache_arena.dat"));
         assert_eq!(devices[0].size_bytes, 64 * 1024 * 1024);
         assert_eq!(devices[0].model.as_deref(), Some("Filesystem-DirectIO-Arena"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_filesystem_mode_never_falls_back_to_raw_disks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp_dir = std::env::temp_dir().join(format!("hypercache_fs_nofallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        // A regular file where the arena directory should be: provisioning fails
+        let blocker = temp_dir.join("not_a_dir");
+        fs::write(&blocker, b"x").unwrap();
+
+        // Prefixes that match every disk name: a raw-scan fallback would pick them up
+        let failing = Config {
+            storage_backing_mode: "filesystem".to_string(),
+            filesystem_cache_paths: vec![blocker.join("cache").to_string_lossy().to_string()],
+            device_prefixes: vec!["nvme".into(), "vd".into(), "xvd".into(), "sd".into()],
+            ..Config::default()
+        };
+        assert!(DeviceDetector::detect_devices(&failing).is_empty());
+        let empty = Config {
+            filesystem_cache_paths: vec![],
+            ..failing.clone()
+        };
+        assert!(DeviceDetector::detect_devices(&empty).is_empty());
+
+        // A provisioned arena is shared with client_gid
+        let my_gid = fs::metadata(&blocker).unwrap().gid();
+        let ok = Config {
+            filesystem_cache_paths: vec![temp_dir.join("arena").to_string_lossy().to_string()],
+            filesystem_arena_size_bytes: 64 * 1024 * 1024,
+            client_gid: Some(my_gid),
+            ..failing
+        };
+        let devices = DeviceDetector::detect_devices(&ok);
+        assert_eq!(devices.len(), 1);
+        let meta = fs::metadata(&devices[0].path).unwrap();
+        assert_eq!(meta.gid(), my_gid);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o660);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
