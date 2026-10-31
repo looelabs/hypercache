@@ -49,12 +49,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Clients traverse the work dir to reach the socket and the model
+# Clients traverse the work dir to reach the socket and the model. The probe and the client
+# package are copied there too: the checkout may sit in a home directory other users cannot
+# enter (GitHub runners: /home/runner is 0750).
 chmod 755 "$WORK"
-mkdir -p "$WORK/nfs" "$WORK/run"
+mkdir -p "$WORK/nfs" "$WORK/run" "$WORK/client"
+cp -r "$REPO/client-py/hypercache" "$WORK/client/"
+cp "$REPO/scripts/e2e/host_probe.py" "$WORK/client/"
+chmod -R a+rX "$WORK/client"
 head -c 20971527 /dev/urandom > "$WORK/nfs/model.bin"
 chmod 644 "$WORK/nfs/model.bin"
 export HYPERCACHE_SOCKET_PATH="$WORK/run/hypercache.sock"
+
+# Clients run as uid 1000 / 1001: the interpreter and its packages must be usable by them
+if ! setpriv --reuid 1000 --regid 1000 --clear-groups env HOME=/tmp PYTHONPATH="$WORK/client" \
+    "$PY" -c "import fsspec, numpy, hypercache" 2>"$WORK/py.err"; then
+    echo "  FAIL  $PY with fsspec/numpy is not usable by uid 1000:"
+    sed 's/^/        /' "$WORK/py.err"
+    exit 1
+fi
 
 start_daemon() { # config log
     "$HC" -c "$1" start >"$2" 2>&1 &
@@ -85,9 +98,9 @@ probe() { # name uid groups expect
     local grp_args=(--clear-groups)
     [ -n "$groups" ] && grp_args=(--groups "$groups")
     if setpriv --reuid "$uid" --regid "$uid" "${grp_args[@]}" env HOME=/tmp \
-        PYTHONPATH="$REPO/client-py" HYPERCACHE_SOCKET_PATH="$HYPERCACHE_SOCKET_PATH" \
+        PYTHONPATH="$WORK/client" HYPERCACHE_SOCKET_PATH="$HYPERCACHE_SOCKET_PATH" \
         PROBE_EXPECT="$expect" PROBE_SOURCE="$WORK/nfs/model.bin" \
-        "$PY" "$REPO/scripts/e2e/host_probe.py"; then
+        "$PY" "$WORK/client/host_probe.py"; then
         pass "$name"
     else
         fail "$name"
