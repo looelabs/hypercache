@@ -58,9 +58,13 @@ data:
 
     # Standard Kubernetes Mode: Direct I/O (O_DIRECT) Arena on Node-Local NVMe Mount
     # (To use raw unmounted /dev/nvme* block devices instead, set storage_backing_mode = "raw_block"
-    # and uncomment the privileged /dev volumeMount in the DaemonSet below.)
+    # and uncomment the privileged /dev volumeMount in the DaemonSet below. The agent then shares
+    # the claimed devices with client_gid, but client pods must also be privileged (or get the
+    # device from a device plugin): the runtime blocks block devices in unprivileged pods.)
     storage_backing_mode = "filesystem"
     filesystem_cache_paths = ["/var/cache/hypercache"]
+    # The arena's space is reserved when the agent starts: if the node's disk cannot hold it, the
+    # agent refuses to start and logs the required and free bytes. Size it to the node's NVMe.
     # Client pods running as non-root need this group (supplementalGroups: [2000]).
     client_gid = 2000
     # Tier 1 RAM: a pod's /dev/shm is private, so RAM-tier files must live on a hostPath that

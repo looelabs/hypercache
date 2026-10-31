@@ -279,6 +279,43 @@ python -c "from hypercache.client import HyperCacheClient; print(HyperCacheClien
 `docker stop` shuts the daemon down cleanly (SIGTERM flushes the manifest and removes the socket).
 `scripts/e2e/container_host_access.sh` tests exactly this layout.
 
+#### Arena sizing: space is reserved at startup
+
+Filesystem arenas are preallocated (`fallocate`) when the daemon starts, so an arena that does not
+fit fails immediately with the numbers, for example
+`arena "/var/cache/hypercache/hypercache_arena.dat" needs 107374182400 more bytes (100.00 GiB) but only 39728455680 (37.00 GiB) are free`,
+and the daemon (or the pod) refuses to start. Before, arenas were sparse and a full disk only showed
+up later as failed ingests. `hypercache check` reports the same condition without creating anything.
+Set `filesystem_arena_preallocate = false` to keep sparse (thin-provisioned) arenas on purpose.
+Existing sparse arenas are filled in place on the next start; their data is untouched.
+
+#### Raw-block mode with non-root clients
+
+In `raw_block` mode clients open the NVMe device nodes directly, so they need read/write access to
+them, not just to the socket:
+
+1. **Set `client_gid`.** At every start the daemon gives that group read/write (`0660`) on the
+   devices it claims (only those: the OS disk and mounted disks are never touched). In a privileged
+   container with the host's `/dev` mounted, this changes the host's device node.
+2. **Make it survive reboots and device rescans** (udev resets device permissions) with a udev rule
+   on the host, e.g. `/etc/udev/rules.d/99-hypercache.rules`:
+   ```
+   KERNEL=="nvme1n1", GROUP="2000", MODE="0660"
+   KERNEL=="nvme2n1", GROUP="2000", MODE="0660"
+   ```
+   then `sudo udevadm control --reload && sudo udevadm trigger`.
+3. **Containers / Kubernetes:** the daemon container must be privileged with the host's `/dev` (see
+   the DaemonSet comments). Client containers need the device itself: `--device /dev/nvme1n1` in
+   Docker; in Kubernetes the runtime's device policy blocks block devices for unprivileged pods even
+   when the file mode allows them, so client pods must be privileged or get the device through a
+   device plugin. For unprivileged training pods, use `storage_backing_mode = "filesystem"`.
+
+**Security note:** members of `client_gid` can read and write the whole raw devices, including
+every cached object, which the zero-copy read path requires. Only add trusted training users.
+
+`scripts/e2e/bare_metal_access.sh` (bare-metal Linux), `container_host_access.sh` (Docker) and
+`k8s_smoke.sh` (minikube) test these setups on loop devices.
+
 ---
 
 ## Configuration Guide (`hypercache-agent.toml` & `hypercache-controller.toml`)
@@ -432,6 +469,7 @@ Every critical setting in `hypercache-agent.toml` and `hypercache-controller.tom
 | `storage_backing_mode` | -- | `"auto"` | `"auto"`, `"raw_block"`, or `"filesystem"` (`O_DIRECT` arena files). |
 | `filesystem_cache_paths` | -- | `[]` | List of mounted ext4/XFS directories for `O_DIRECT` arena files. |
 | `filesystem_arena_size_bytes`| -- | `10737418240` (10 GiB) | Pre-allocated size per filesystem arena file in bytes. |
+| `filesystem_arena_preallocate`| -- | `true` | Reserve the arena's space at startup (refuse to start if it does not fit); `false` keeps sparse arenas. |
 | `device_discovery_mode` | -- | `"auto"` | `"auto"` (scan `/sys/class/block`) or `"manual"` (use `block_devices` list). |
 | `block_devices` | -- | `[]` | Explicit list of block devices when `device_discovery_mode = "manual"`. |
 | `exclude_root_device` | -- | `true` | Unconditionally exclude OS root drive (`/`) from the storage pool. |
@@ -870,7 +908,7 @@ Runs on the Controller host (zero configuration required on `127.0.0.1` loopback
 scripts/verify_release.sh            # everything (Docker / minikube stages skipped if unavailable)
 scripts/verify_release.sh --quick    # static, rust, python only
 
-# 1. Run the Rust Control Plane unit & integration test suite (76 tests + 6 live S3 tests)
+# 1. Run the Rust Control Plane unit & integration test suite (77 tests + 6 live S3 tests)
 cargo test --manifest-path control-plane/Cargo.toml
 
 # 2. Run the Python Data Plane & framework integration test suite (34 tests)

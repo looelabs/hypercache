@@ -34,6 +34,9 @@ device_start_offset_bytes = 4096
 storage_backing_mode = "auto"
 # filesystem_cache_paths = ["/mnt/nvme0/hypercache", "/mnt/nvme1/hypercache"]
 filesystem_arena_size_bytes = 10737418240  # 10 GiB per arena file
+# Arena space is reserved on disk at startup, so an arena that does not fit stops the daemon right
+# away instead of failing ingests once the disk fills. false = sparse (thin-provisioned) arenas.
+filesystem_arena_preallocate = true
 
 # Developer / CI Mock Device Settings (Disabled by default)
 dev_mock_device_pattern = "/tmp/hypercache_nvme*.raw"
@@ -99,7 +102,8 @@ nfs_read_buffer_bytes = 4194304 # 4 MiB
 
 # Local client access. Clients read and write cache files directly, so when the daemon runs as
 # root (raw devices, containers) and clients run as another user, set the numeric group id the
-# clients run with: the socket, arenas and RAM-tier files become group read/write (0660).
+# clients run with: the socket, arenas, RAM-tier files and the claimed raw devices become group
+# read/write (0660). For raw devices, also add a udev rule so the mode survives reboots (README).
 # Numeric because group names differ between a container and its host. Unset = daemon user only.
 # client_gid = 2000
 

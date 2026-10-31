@@ -40,15 +40,17 @@ impl DeviceDetector {
         if backing_mode == "filesystem" {
             // Never fall back to raw disks here: a privileged pod sees the host's unmounted disks,
             // and striping onto them would overwrite whatever they hold.
-            let arenas = Self::provision_filesystem_arenas(config);
-            if arenas.is_empty() {
-                error!(
-                    "storage_backing_mode = \"filesystem\" but no arena could be provisioned from \
-                     filesystem_cache_paths = {:?}; raw block devices are not used in this mode",
-                    config.filesystem_cache_paths
-                );
-            }
-            return arenas;
+            return match Self::try_provision_filesystem_arenas(config) {
+                Ok(arenas) => arenas,
+                Err(_) => {
+                    error!(
+                        "storage_backing_mode = \"filesystem\": arenas from filesystem_cache_paths = {:?} could \
+                         not all be provisioned; raw block devices are not used in this mode",
+                        config.filesystem_cache_paths
+                    );
+                    Vec::new()
+                }
+            };
         }
 
         if mode == "manual" && !config.block_devices.is_empty() {
@@ -147,9 +149,10 @@ impl DeviceDetector {
 
         // 2. Check for filesystem-backed Direct I/O cache paths if configured (Kubernetes PVC / hostPath / XFS / ext4 GDS)
         if !config.filesystem_cache_paths.is_empty() && backing_mode != "raw_block" {
-            let arenas = Self::provision_filesystem_arenas(config);
-            if !arenas.is_empty() {
-                return arenas;
+            if let Ok(arenas) = Self::try_provision_filesystem_arenas(config) {
+                if !arenas.is_empty() {
+                    return arenas;
+                }
             }
         }
 
@@ -598,37 +601,120 @@ impl DeviceDetector {
         Ok(())
     }
 
-    /// Provisions pre-allocated Direct I/O arena files inside mounted XFS/ext4 directories
-    /// for unprivileged Kubernetes pods and native GPUDirect Storage (cuFile) compatibility.
-    pub fn provision_filesystem_arenas(config: &Config) -> Vec<DiscoveredDevice> {
+    /// Minimum arena size; smaller configured sizes are rounded up.
+    pub const MIN_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The arena file a `filesystem_cache_paths` entry resolves to: the path itself when it
+    /// names a `.dat` / `.raw` file, otherwise `hypercache_arena.dat` inside that directory.
+    pub fn arena_file_for(raw_path: &str) -> std::path::PathBuf {
+        let p = Path::new(raw_path);
+        if raw_path.ends_with(".dat") || raw_path.ends_with(".raw") {
+            p.to_path_buf()
+        } else {
+            p.join("hypercache_arena.dat")
+        }
+    }
+
+    /// Bytes on disk actually backing a file (sparse files report less than their length).
+    pub fn allocated_bytes(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).map(|m| m.blocks() * 512).unwrap_or(0)
+    }
+
+    /// Creates (or completes) an arena file of `size_bytes`. With `preallocate`, the space is
+    /// reserved on disk now, so a filesystem that is too small fails here, at startup, instead
+    /// of with write errors once ingests fill it. Existing arenas keep their length; only their
+    /// holes are filled. Filesystems without fallocate support fall back to a sparse file.
+    fn ensure_arena_file(path: &Path, size_bytes: u64, preallocate: bool) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("Cannot create arena directory {:?}", parent))?;
+        }
+        let is_new = !path.exists();
+        let target_len = if is_new { size_bytes } else { fs::metadata(path)?.len() };
+
+        if preallocate {
+            let missing = target_len.saturating_sub(Self::allocated_bytes(path));
+            let dir = path.parent().unwrap_or_else(|| Path::new("."));
+            let free = fs2::available_space(dir).unwrap_or(u64::MAX);
+            if missing > free {
+                anyhow::bail!(
+                    "arena {:?} needs {} more bytes ({:.2} GiB) but only {} ({:.2} GiB) are free on that filesystem. \
+                     Lower filesystem_arena_size_bytes, free space, or set filesystem_arena_preallocate = false \
+                     to accept a sparse arena that can run out of space later",
+                    path,
+                    missing,
+                    missing as f64 / GIB,
+                    free,
+                    free as f64 / GIB
+                );
+            }
+        }
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("Failed to open arena file {:?}", path))?;
+
+        let reserved = if preallocate {
+            match reserve_space(&file, target_len) {
+                Ok(()) => true,
+                Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                    warn!(
+                        "Filesystem holding {:?} cannot preallocate (fallocate unsupported); using a sparse arena",
+                        path
+                    );
+                    false
+                }
+                Err(e) => {
+                    if is_new {
+                        let _ = fs::remove_file(path);
+                    }
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to reserve {} bytes for arena {:?}", target_len, path)));
+                }
+            }
+        } else {
+            false
+        };
+        if !reserved && file.metadata()?.len() < target_len {
+            file.set_len(target_len)
+                .with_context(|| format!("Failed to set length for {:?}", path))?;
+        }
+        Ok(())
+    }
+
+    /// Provisions Direct I/O arena files inside mounted XFS/ext4 directories for unprivileged
+    /// Kubernetes pods and native GPUDirect Storage (cuFile). Every configured path must
+    /// succeed; the error names each one that failed.
+    pub fn try_provision_filesystem_arenas(config: &Config) -> Result<Vec<DiscoveredDevice>> {
         let mut arenas = Vec::new();
-        let arena_size = config.filesystem_arena_size_bytes.max(64 * 1024 * 1024);
+        let mut failures = Vec::new();
+        let arena_size = config.filesystem_arena_size_bytes.max(Self::MIN_ARENA_BYTES);
 
         for raw_path in &config.filesystem_cache_paths {
-            let p = Path::new(raw_path);
-            let arena_file = if raw_path.ends_with(".dat") || raw_path.ends_with(".raw") {
-                p.to_path_buf()
-            } else {
-                let _ = fs::create_dir_all(p);
-                p.join("hypercache_arena.dat")
-            };
-
+            let arena_file = Self::arena_file_for(raw_path);
             let arena_str = arena_file.to_string_lossy().to_string();
-            if let Err(e) = Self::ensure_file_size(&arena_str, arena_size) {
-                warn!(
-                    "Failed to provision filesystem Direct I/O arena at {}: {}",
+            if let Err(e) = Self::ensure_arena_file(&arena_file, arena_size, config.filesystem_arena_preallocate) {
+                error!(
+                    "Failed to provision filesystem Direct I/O arena at {}: {:#}",
                     arena_str, e
                 );
+                failures.push(format!("{}: {:#}", arena_str, e));
                 continue;
             }
 
             crate::access::grant_file_or_warn(&arena_file, config.client_gid);
             let actual_size = fs::metadata(&arena_file).map(|m| m.len()).unwrap_or(arena_size);
+            let reserved = Self::allocated_bytes(&arena_file);
 
             info!(
-                "Provisioned Filesystem Direct I/O Arena: {} ({:.2} GiB)",
+                "Provisioned Filesystem Direct I/O Arena: {} ({:.2} GiB, {:.2} GiB reserved on disk)",
                 arena_str,
-                actual_size as f64 / (1024.0 * 1024.0 * 1024.0)
+                actual_size as f64 / GIB,
+                reserved as f64 / GIB
             );
 
             arenas.push(DiscoveredDevice {
@@ -644,8 +730,46 @@ impl DeviceDetector {
             });
         }
 
-        arenas
+        if failures.is_empty() {
+            Ok(arenas)
+        } else {
+            anyhow::bail!("{}", failures.join("; "))
+        }
     }
+
+    /// Like `detect_devices`, but a misconfigured storage pool is an error instead of an empty
+    /// pool. The daemon uses this so it refuses to start rather than run without its storage.
+    pub fn detect_devices_checked(config: &Config) -> Result<Vec<DiscoveredDevice>> {
+        if config.storage_backing_mode.eq_ignore_ascii_case("filesystem") {
+            if config.filesystem_cache_paths.is_empty() {
+                warn!("storage_backing_mode = \"filesystem\" with no filesystem_cache_paths: no Tier 2 storage");
+                return Ok(Vec::new());
+            }
+            return Self::try_provision_filesystem_arenas(config);
+        }
+        Ok(Self::detect_devices(config))
+    }
+}
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Reserves disk blocks for the first `len` bytes of `file` and extends it to `len`.
+#[cfg(target_os = "linux")]
+fn reserve_space(file: &fs::File, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // fallocate(2), not posix_fallocate(3): glibc emulates the latter by writing zeros on
+    // filesystems without support, which takes minutes for a 100 GiB arena.
+    let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_space(file: &fs::File, len: u64) -> std::io::Result<()> {
+    fs2::FileExt::allocate(file, len)
 }
 
 #[cfg(test)]
@@ -713,6 +837,75 @@ mod tests {
         assert!(devices[1].path.ends_with("hypercache_arena.dat"));
         assert_eq!(devices[0].size_bytes, 64 * 1024 * 1024);
         assert_eq!(devices[0].model.as_deref(), Some("Filesystem-DirectIO-Arena"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_arena_preallocation_and_capacity_errors() {
+        let temp_dir = std::env::temp_dir().join(format!("hypercache_fs_prealloc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let size = 64 * 1024 * 1024;
+        let config = |dir: &str, size: u64, preallocate: bool| Config {
+            storage_backing_mode: "filesystem".to_string(),
+            filesystem_cache_paths: vec![temp_dir.join(dir).to_string_lossy().to_string()],
+            filesystem_arena_size_bytes: size,
+            filesystem_arena_preallocate: preallocate,
+            ..Config::default()
+        };
+
+        // Block counts are only asserted on Linux: APFS reserves preallocated space without
+        // reporting it in st_blocks
+        let blocks_reported = cfg!(target_os = "linux");
+
+        // Default: the space is reserved on disk at provisioning time
+        let reserved = DeviceDetector::detect_devices_checked(&config("reserved", size, true)).unwrap();
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].size_bytes, size);
+        if blocks_reported {
+            assert!(DeviceDetector::allocated_bytes(Path::new(&reserved[0].path)) >= size);
+        }
+
+        // Opt-out keeps a sparse arena
+        let sparse = DeviceDetector::detect_devices_checked(&config("sparse", size, false)).unwrap();
+        assert!(DeviceDetector::allocated_bytes(Path::new(&sparse[0].path)) < size);
+        // Re-provisioning with preallocation fills the existing arena's holes
+        let filled = DeviceDetector::detect_devices_checked(&config("sparse", size, true)).unwrap();
+        assert_eq!(filled[0].size_bytes, size);
+        if blocks_reported {
+            assert!(DeviceDetector::allocated_bytes(Path::new(&filled[0].path)) >= size);
+        }
+
+        // An arena larger than the filesystem's free space fails up front, names the numbers,
+        // and leaves no partial file behind
+        let free = fs2::available_space(&temp_dir).unwrap();
+        let too_big = config("too_big", free.saturating_mul(2), true);
+        let err = DeviceDetector::detect_devices_checked(&too_big)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("are free"), "{}", err);
+        assert!(!temp_dir.join("too_big").join("hypercache_arena.dat").exists());
+        assert!(DeviceDetector::detect_devices(&too_big).is_empty());
+        // ... and `check` reports it as a failure without creating anything
+        let report_cfg = temp_dir.join("too_big.toml");
+        fs::write(
+            &report_cfg,
+            format!(
+                "storage_backing_mode = \"filesystem\"\nfilesystem_cache_paths = [\"{}\"]\nfilesystem_arena_size_bytes = {}\nmetadata_persistence_path = \"{}/m.json\"\n",
+                temp_dir.join("check_big").display(),
+                free.saturating_mul(2),
+                temp_dir.display()
+            ),
+        )
+        .unwrap();
+        let report = crate::check::evaluate_host(Some(report_cfg), None, false).unwrap();
+        assert!(!report.ready);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name.starts_with("Arena") && c.status == crate::check::CheckStatus::Fail));
+        assert!(!temp_dir.join("check_big").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -404,8 +404,15 @@ async fn run_daemon(
     let agent_port = custom_agent_port.unwrap_or(config.agent_http_port);
     let agent_bind = config.agent_bind_address.clone();
 
-    // Dynamic SSD / NVMe Device Auto-Discovery
-    let detected_devices = DeviceDetector::detect_devices(&config);
+    // Dynamic SSD / NVMe Device Auto-Discovery. A configured pool that cannot be provisioned
+    // (e.g. an arena larger than its filesystem) stops startup instead of running without storage.
+    let detected_devices = DeviceDetector::detect_devices_checked(&config)
+        .context("Storage pool could not be provisioned; refusing to start")?;
+    // Clients open claimed devices directly, so share them with client_gid like arenas and the
+    // socket. On a container with the host's /dev mounted, this changes the host's device node.
+    for dev in &detected_devices {
+        hypercache_control_plane::access::grant_file_or_warn(Path::new(&dev.path), config.client_gid);
+    }
     println!("------------------------------------------------------------");
     if detected_devices.is_empty() {
         println!("No secondary raw NVMe block devices detected (OS root drive protected).");

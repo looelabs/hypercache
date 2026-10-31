@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.9.3
+
+Raw-block access for non-root clients and up-front arena sizing, tested on bare-metal Linux,
+Docker and Kubernetes.
+
+### Fixes
+- Filesystem arenas are reserved on disk at startup (`fallocate`) instead of created sparse. An arena
+  that does not fit its filesystem stops the daemon immediately with the required and free bytes,
+  instead of surfacing later as failed ingests once the disk fills. Existing sparse arenas are filled
+  in place. New key `filesystem_arena_preallocate` (default `true`; `false` keeps sparse arenas).
+- `hypercache check` inspects filesystem arenas without creating or reserving them, and reports an
+  arena that will not fit as FAIL.
+- In raw-block mode, non-root clients could not open the NVMe devices. With `client_gid` set, the
+  daemon now shares the devices it claims (`0660`, client group) at every start.
+- CI: the e2e script hardcoded the version (`0.9.1`) and failed on the 0.9.2 bump. It now reads
+  `Cargo.toml`, and the static stage rejects literal versions in scripts and tests. The YAML check
+  reports SKIP instead of PASS when PyYAML is missing.
+
+### Docs
+- README: raw-block mode with non-root clients (udev rule, Docker `--device`, Kubernetes device
+  policy, security note) and arena sizing. Manifest and config template comments updated.
+
+### Tests
+- `scripts/e2e/bare_metal_access.sh` (new, `e2e` stage on Linux as root / passwordless sudo, and in
+  the privileged `linux` stage): raw loop device shared with `client_gid`, non-root O_DIRECT reads
+  and raw-device checkpoints, refusal outside the group, `check` and startup refusal for an oversized
+  arena on a 128 MiB ext4 filesystem, full reservation, sparse opt-out, SIGTERM.
+- `container_host_access.sh`: raw-block mode with a privileged daemon and a `--device` client
+  container; container exits when the arena does not fit a tmpfs.
+- `k8s_smoke.sh`: raw-block mode as documented (privileged agent, host `/dev`) with a privileged
+  non-root training pod, the unprivileged-pod limitation, and an oversized arena keeping the agent
+  from starting.
+- Rust: arena preallocation, capacity errors, sparse opt-out, `check` without side effects.
+
 ## 0.9.2
 
 Containers and Kubernetes: a daemon running in a container (as root) is now usable from the host

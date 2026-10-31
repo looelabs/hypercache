@@ -9,7 +9,9 @@
 #   rust    cargo test (unit + integration), release build, binary smoke (--version/--help)
 #   python  pytest suite, wheel build (when `build` is installed)
 #   e2e     real daemon + controller + agents on file-backed devices
-#           (scripts/e2e/hypercache_e2e.py daemon fleet)
+#           (scripts/e2e/hypercache_e2e.py daemon fleet); on Linux as root (or with passwordless
+#           sudo) also raw block devices and arena capacity on loop devices
+#           (scripts/e2e/bare_metal_access.sh)
 #   s3      live S3 against a throwaway versitygw container: SigV4, pagination,
 #           multipart, parallel ranged GET, write-back (Rust + E2E). Needs Docker.
 #   linux   re-runs static,rust,python,e2e,s3 inside a clean rust:1-bookworm container,
@@ -132,8 +134,12 @@ check_versions() {
 }
 
 check_no_hardcoded_versions() {
-    # Binaries must take their version from Cargo.toml
-    ! grep -rn 'version = "[0-9]' control-plane/src --include='*.rs' | grep -v CARGO_PKG_VERSION
+    # Binaries must take their version from Cargo.toml, and tests must read it from there too
+    # (a literal version in a test breaks on the next bump)
+    local want
+    want=$(grep -m1 '^version' control-plane/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+    ! grep -rn 'version = "[0-9]' control-plane/src --include='*.rs' | grep -v CARGO_PKG_VERSION || return 1
+    ! grep -rnF "$want" scripts control-plane/tests client-py/tests
 }
 
 check_emoji_policy() {
@@ -224,14 +230,18 @@ check_config_keys_load() {
 stage_static() {
     section "static"
     step "version numbers agree (Cargo, pyproject, __init__, release.yml)" check_versions
-    step "no hardcoded version strings in Rust sources" check_no_hardcoded_versions
+    step "no hardcoded version strings in Rust sources and tests" check_no_hardcoded_versions
     step "zero-emoji policy (AGENTS.md rule 1)" check_emoji_policy
     step "cargo fmt --check" cargo fmt --manifest-path "$CARGO_MANIFEST" -- --check
     step "cargo clippy --all-targets -D warnings (Cargo.lock locked)" \
         cargo clippy --locked --manifest-path "$CARGO_MANIFEST" --all-targets -- -D warnings
     step "python byte-compile (client + scripts)" check_python_compile
     step "shell script syntax (bash -n)" check_shell_syntax
-    step "YAML syntax (workflows, K8s manifests, compose)" check_yaml
+    if "$PY" -c "import yaml" 2>/dev/null; then
+        step "YAML syntax (workflows, K8s manifests, compose)" check_yaml
+    else
+        skip "YAML syntax (workflows, K8s manifests, compose)" "PyYAML not installed in $PY"
+    fi
     step "TOML syntax (configs, Cargo, pyproject)" check_toml
 }
 
@@ -305,6 +315,27 @@ stage_e2e() {
         "$PY" scripts/e2e/hypercache_e2e.py --bin-dir "$RELEASE_DIR" "${keep[@]+"${keep[@]}"}" daemon
     step "e2e: controller + agents fleet scenario" \
         "$PY" scripts/e2e/hypercache_e2e.py --bin-dir "$RELEASE_DIR" "${keep[@]+"${keep[@]}"}" fleet
+
+    # Bare metal: raw block devices and real filesystems need root and loop devices
+    local bare="e2e: bare metal (raw block device, arena capacity, non-root clients)"
+    if [ "$(uname -s)" != "Linux" ] || ! command -v losetup >/dev/null || ! command -v mkfs.ext4 >/dev/null ||
+        ! command -v setpriv >/dev/null; then
+        skip "$bare" "needs Linux with losetup, mkfs.ext4 and setpriv"
+        return
+    fi
+    local sudo=()
+    if [ "$(id -u)" -ne 0 ]; then
+        if ! sudo -n true 2>/dev/null; then
+            skip "$bare" "needs root or passwordless sudo"
+            return
+        fi
+        sudo=(sudo -n)
+    fi
+    if ! "${sudo[@]+"${sudo[@]}"}" losetup -f >/dev/null 2>&1; then
+        skip "$bare" "no loop devices available (unprivileged container?)"
+        return
+    fi
+    step "$bare" "${sudo[@]+"${sudo[@]}"}" scripts/e2e/bare_metal_access.sh "$RELEASE_DIR" "$(command -v "$PY")"
 }
 
 # ------------------------------------------------------------------------------
@@ -387,7 +418,8 @@ run_linux_container() {
 
     # Copy the working tree (without build outputs) so the container never writes to the host repo.
     # Named volumes cache the cargo registry and target dir between runs.
-    docker run --rm --network "$net" \
+    # Privileged so the e2e stage can attach loop devices for the bare-metal scenario
+    docker run --rm --privileged --network "$net" \
         -v "$REPO_ROOT:/src:ro" \
         -v hc-verify-cargo-registry:/usr/local/cargo/registry \
         -v hc-verify-target:/work/control-plane/target \

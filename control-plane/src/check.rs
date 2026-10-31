@@ -47,6 +47,90 @@ pub struct CheckReport {
 }
 
 /// Executes the comprehensive pre-flight host and configuration verification suite.
+/// Reports whether a filesystem arena exists or can be provisioned with its configured size.
+/// Returns the check item and, when the arena is usable, its size.
+fn check_arena(config: &Config, raw_path: &str) -> (CheckItem, Option<u64>) {
+    let arena = DeviceDetector::arena_file_for(raw_path);
+    let size = config.filesystem_arena_size_bytes.max(DeviceDetector::MIN_ARENA_BYTES);
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let item = |status, detail: String, remediation: Option<&str>| CheckItem {
+        category: "Storage".to_string(),
+        name: format!("Arena {}", arena.display()),
+        status,
+        detail,
+        remediation: remediation.map(str::to_string),
+    };
+
+    let existing = fs::metadata(&arena).ok();
+    let length = existing.as_ref().map(|m| m.len()).unwrap_or(size);
+    let missing = length.saturating_sub(DeviceDetector::allocated_bytes(&arena));
+    // Free space on the filesystem that holds (or will hold) the arena
+    let mut probe_dir = arena.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+    while !probe_dir.exists() {
+        match probe_dir.parent() {
+            Some(p) => probe_dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    let free = fs2::available_space(&probe_dir).unwrap_or(0);
+
+    if let Some(meta) = &existing {
+        if meta.permissions().readonly() || OpenOptions::new().read(true).write(true).open(&arena).is_err() {
+            return (
+                item(
+                    CheckStatus::Fail,
+                    "Arena file exists but is not readable/writable by this user".to_string(),
+                    Some("Run as the daemon user (root) or fix the file's ownership"),
+                ),
+                None,
+            );
+        }
+    }
+
+    if config.filesystem_arena_preallocate && missing > free {
+        return (
+            item(
+                CheckStatus::Fail,
+                format!(
+                    "Arena needs {:.2} GiB more on disk but only {:.2} GiB are free on {}; the daemon will refuse to start",
+                    gib(missing),
+                    gib(free),
+                    probe_dir.display()
+                ),
+                Some("Lower filesystem_arena_size_bytes, free space, or set filesystem_arena_preallocate = false"),
+            ),
+            None,
+        );
+    }
+    if !config.filesystem_arena_preallocate && missing > free {
+        return (
+            item(
+                CheckStatus::Warn,
+                format!(
+                    "Sparse arena of {:.2} GiB, but only {:.2} GiB are free: ingests fail with ENOSPC once the disk fills",
+                    gib(length),
+                    gib(free)
+                ),
+                Some("Set filesystem_arena_preallocate = true to reserve the space at startup"),
+            ),
+            Some(length),
+        );
+    }
+    let state = match (&existing, missing) {
+        (Some(_), 0) => "exists, fully reserved".to_string(),
+        (Some(_), m) => format!("exists, {:.2} GiB still sparse", gib(m)),
+        (None, _) => "will be created at daemon start".to_string(),
+    };
+    (
+        item(
+            CheckStatus::Pass,
+            format!("{:.2} GiB arena {} ({:.2} GiB free)", gib(length), state, gib(free)),
+            None,
+        ),
+        Some(length),
+    )
+}
+
 pub fn evaluate_host(
     config_path: Option<PathBuf>,
     explicit_devices: Option<Vec<String>>,
@@ -313,9 +397,23 @@ pub fn evaluate_host(
     }
 
     // 4. Storage Pool Verification (Tier 2 Block Devices / Filesystem Arenas & Tier 1 RAM)
-    let devices = DeviceDetector::detect_devices(&config);
     let mut readable_writable_devs = 0usize;
     let mut total_pool_bytes = 0u64;
+    // Filesystem arenas are inspected, not provisioned: `check` must not create or reserve
+    // a 100 GiB arena as a side effect
+    let devices = if config.storage_backing_mode.eq_ignore_ascii_case("filesystem") {
+        for raw_path in &config.filesystem_cache_paths {
+            let (item, usable_bytes) = check_arena(&config, raw_path);
+            if let Some(bytes) = usable_bytes {
+                readable_writable_devs += 1;
+                total_pool_bytes += bytes;
+            }
+            checks.push(item);
+        }
+        Vec::new()
+    } else {
+        DeviceDetector::detect_devices(&config)
+    };
     let min_required_per_dev = config.device_start_offset_bytes + (config.chunk_size_bytes as u64);
 
     for dev in &devices {

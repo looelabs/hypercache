@@ -207,6 +207,12 @@ pub struct Config {
     /// container and its host. When unset, only the daemon's own user can use the cache.
     #[serde(default)]
     pub client_gid: Option<u32>,
+
+    /// Reserve each filesystem arena's full size on disk when it is provisioned (fallocate), so a
+    /// disk that is too small fails at startup instead of with write errors once it fills up.
+    /// `false` keeps sparse (thin-provisioned) arenas.
+    #[serde(default = "default_true")]
+    pub filesystem_arena_preallocate: bool,
 }
 
 pub const PRIMARY_METADATA_PATH: &str = "/var/lib/hypercache/metadata.json";
@@ -609,6 +615,7 @@ impl Default for Config {
             allow_local_admin_bypass: true,
             node_gc_secs: default_node_gc_secs(),
             client_gid: None,
+            filesystem_arena_preallocate: true,
         }
     }
 }

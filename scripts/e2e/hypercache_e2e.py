@@ -331,6 +331,15 @@ def write_object(client: HyperCacheClient, uri: str, data: bytes, write_through:
 # ----------------------------------------------------------------------------------------------
 
 
+def cargo_version() -> str:
+    """The package version from control-plane/Cargo.toml (single source of truth)."""
+    with open(os.path.join(REPO_ROOT, "control-plane", "Cargo.toml")) as f:
+        for line in f:
+            if line.startswith("version"):
+                return line.split('"')[1]
+    raise RuntimeError("no version in control-plane/Cargo.toml")
+
+
 def scenario_daemon(ctx: Ctx, rep: Report) -> None:
     print("== Scenario: single-node daemon")
     node = Node(ctx, "solo", device_mb=64, devices=4, overrides={"reclaim_grace_secs": 30})
@@ -339,9 +348,10 @@ def scenario_daemon(ctx: Ctx, rep: Report) -> None:
         print(node.log_tail())
         return
 
+    want = cargo_version()
     rep.check("version flag reports the package version", lambda: expect(
-        "0.9.1" in subprocess.run([ctx.bin("hypercache"), "--version"], capture_output=True, text=True).stdout,
-        "hypercache --version does not report 0.9.1"))
+        want in subprocess.run([ctx.bin("hypercache"), "--version"], capture_output=True, text=True).stdout,
+        f"hypercache --version does not report {want}"))
     rep.check("status command talks to the daemon", lambda: node.cli("status"))
 
     def zero_exposure():
