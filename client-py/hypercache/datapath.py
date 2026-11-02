@@ -7,9 +7,12 @@ Responsible for executing direct hardware DMA reads from raw NVMe block devices
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import logging
 import mmap
 import os
+import stat
 import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -515,26 +518,109 @@ class DirectBlockWriter:
     """
     Direct Block Writer for write-back and write-through caching.
     Writes byte slices to striped physical NVMe block devices or POSIX shared memory chunks.
+
+    With direct_on_block_devices=True, writes to raw block devices use O_DIRECT. In testing on one
+    drive this raised both store speed and later read speed (benchmarks/results/lmcache_and_ttft.md).
+    Whatever O_DIRECT can't take goes through the page cache, so a write never fails because of it.
+    Callers must still commit, because the daemon's sync is what makes the data durable.
     """
 
-    def __init__(self, max_workers: Optional[int] = None):
+    def __init__(self, max_workers: Optional[int] = None, direct_on_block_devices: bool = False):
         self._fd_cache: Dict[str, int] = {}
+        self._direct_fds: Dict[str, Optional[int]] = {}
+        self._direct_on_block_devices = direct_on_block_devices
+        self._fd_lock = threading.Lock()
         if max_workers is None:
             max_workers = min(64, max(16, (os.cpu_count() or 4) * 4))
         self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def _get_write_fd(self, device_path: str) -> int:
-        if device_path not in self._fd_cache:
-            try:
-                fd = os.open(device_path, os.O_RDWR)
-                self._fd_cache[device_path] = fd
-            except OSError as e:
-                logger.error(f"Failed to open device {device_path} for write: {e}")
-                raise
-        return self._fd_cache[device_path]
+        with self._fd_lock:
+            if device_path not in self._fd_cache:
+                try:
+                    fd = os.open(device_path, os.O_RDWR)
+                    self._fd_cache[device_path] = fd
+                except OSError as e:
+                    logger.error(f"Failed to open device {device_path} for write: {e}")
+                    raise
+            return self._fd_cache[device_path]
 
-    def _write_ram_chunk(self, target_path: str, chunk_data: bytes) -> None:
+    @staticmethod
+    def _pwrite_all(fd: int, data: memoryview, offset: int) -> None:
+        # pwrite may write fewer bytes than asked, for example when the disk is nearly full
+        while len(data) > 0:
+            written = os.pwrite(fd, data, offset)
+            if written == 0:
+                raise IOError(f"Wrote 0 bytes at offset {offset}")
+            data = data[written:]
+            offset += written
+
+    @staticmethod
+    def _is_block_device(device_path: str) -> bool:
+        try:
+            return stat.S_ISBLK(os.stat(device_path).st_mode)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _open_direct(device_path: str) -> int:
+        return os.open(device_path, os.O_RDWR | os.O_DIRECT)
+
+    @staticmethod
+    def _is_aligned(data: memoryview, block_size: int) -> bool:
+        # The address of a read-only buffer isn't available here, so treat it as unaligned
+        if data.readonly:
+            return False
+        return ctypes.addressof(ctypes.c_char.from_buffer(data)) % block_size == 0
+
+    def _get_direct_fd(self, device_path: str) -> Optional[int]:
+        if not self._direct_on_block_devices:
+            return None
+        with self._fd_lock:
+            if device_path not in self._direct_fds:
+                fd = None
+                if hasattr(os, "O_DIRECT") and self._is_block_device(device_path):
+                    try:
+                        fd = self._open_direct(device_path)
+                    except OSError as e:
+                        logger.debug(f"O_DIRECT is unavailable on {device_path}: {e}")
+                self._direct_fds[device_path] = fd
+            return self._direct_fds[device_path]
+
+    def _write_device_chunk(self, device_path: str, data: memoryview, offset: int) -> None:
+        direct_fd = self._get_direct_fd(device_path)
+        written = 0
+        if direct_fd is not None:
+            written = self._write_whole_blocks_direct(direct_fd, device_path, data, offset)
+        if written < len(data):
+            self._pwrite_all(self._get_write_fd(device_path), data[written:], offset + written)
+
+    def _write_whole_blocks_direct(self, fd: int, device_path: str, data: memoryview, offset: int) -> int:
+        """Writes as many whole blocks as O_DIRECT accepts. Returns the bytes written."""
+        block_size = logical_block_size(device_path)
+        whole = len(data) - len(data) % block_size
+        if whole == 0 or offset % block_size != 0:
+            return 0
+        source = data[:whole]
+        if not self._is_aligned(source, block_size):
+            # An mmap is page-aligned, and is freed along with the views of it
+            source = memoryview(mmap.mmap(-1, whole))
+            source[:] = data[:whole]
+        written = 0
+        try:
+            while written < whole:
+                count = os.pwrite(fd, source[written:], offset + written)
+                written += count
+                if count == 0 or count % block_size != 0:
+                    break
+        except OSError as e:
+            if e.errno != errno.EINVAL:
+                raise
+            logger.debug(f"O_DIRECT write refused on {device_path}: {e}")
+        return written
+
+    def _write_ram_chunk(self, target_path: str, chunk_data: Union[bytes, memoryview]) -> None:
         # The daemon creates staged RAM chunk files. Never create the directory here: if it is
         # missing, this process does not share /dev/shm with the daemon, and writing a private
         # copy would make the checkpoint silently disappear.
@@ -557,7 +643,7 @@ class DirectBlockWriter:
         if not chunk_layout or not data:
             return 0
 
-        view = memoryview(data)
+        view = memoryview(data).cast("B")
         total_len = len(view)
         current_virtual_offset = 0
         tasks = []
@@ -571,14 +657,14 @@ class DirectBlockWriter:
                 break
 
             slice_end = min(chunk_end, total_len)
-            slice_bytes = bytes(view[chunk_start:slice_end])
+            # A view, not a copy: this method waits for every write before returning
+            slice_bytes = view[chunk_start:slice_end]
 
             if chunk.tier == "ram":
                 tasks.append(self._executor.submit(self._write_ram_chunk, chunk.device, slice_bytes))
             else:
-                fd = self._get_write_fd(chunk.device)
                 tasks.append(
-                    self._executor.submit(os.pwrite, fd, slice_bytes, chunk.offset)
+                    self._executor.submit(self._write_device_chunk, chunk.device, slice_bytes, chunk.offset)
                 )
 
         # Wait for all chunks to write
@@ -595,5 +681,12 @@ class DirectBlockWriter:
             except Exception:
                 pass
         self._fd_cache.clear()
+        for fd in self._direct_fds.values():
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+        self._direct_fds.clear()
         self._executor.shutdown(wait=False)
 
