@@ -2,9 +2,13 @@
 HyperCache KV-Cache Prefix Block Store (`HyperCacheKVStore`).
 
 Provides a content-addressed key-value block interface over HyperCache's Tier-1
-Host RAM (`/dev/shm` / HugePages) and Tier-2 Striped NVMe engine, enabling
-plug-and-play KV-cache offloading for LMCache, vLLM prefix caching, and
-NVIDIA Dynamo KVBM.
+Host RAM (`/dev/shm` / HugePages) and Tier-2 Striped NVMe engine.
+
+This is a building block for code that manages its own KV-cache blocks. For LMCache,
+use `hypercache.integrations.lmcache_l2`. There is no NVIDIA Dynamo KVBM integration.
+
+Blocks stay on this host and remain evictable, unless write_through=True asks for a
+synchronous backend flush.
 """
 
 from __future__ import annotations
@@ -103,7 +107,11 @@ class HyperCacheKVStore:
             return False
 
         self._writer.write_chunks(stage_res.chunk_layout, raw_bytes)
-        return self._client.commit_write(uri, write_through=self.write_through)
+        return self._client.commit_write(
+            uri,
+            write_through=self.write_through,
+            local_only=not self.write_through,
+        )
 
     def get_kv_block(
         self,
@@ -117,7 +125,7 @@ class HyperCacheKVStore:
         """
         uri = self._make_uri(block_key)
         loc = self._client.locate(uri, auto_ingest=False)
-        if not loc.is_hit:
+        if not self._is_readable(loc):
             return None
 
         if out_tensor is not None:
@@ -143,7 +151,12 @@ class HyperCacheKVStore:
 
     def exists_kv_block(self, block_key: str) -> bool:
         uri = self._make_uri(block_key)
-        return self._client.locate(uri, auto_ingest=False).is_hit
+        return self._is_readable(self._client.locate(uri, auto_ingest=False))
+
+    @staticmethod
+    def _is_readable(loc: Any) -> bool:
+        # A staged layout is published before its data is written, so it isn't readable yet
+        return loc.is_hit and loc.sync_status != "STAGED"
 
     def close(self) -> None:
         self._reader.close()

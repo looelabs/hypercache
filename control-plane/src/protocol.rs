@@ -91,6 +91,12 @@ pub enum Request {
         sha256: Option<String>,
         #[serde(default)]
         write_through: bool,
+        /// Keep the object on this host only: no backend flush, and evictable once committed.
+        #[serde(default)]
+        local_only: bool,
+        /// Per-chunk CRC32 values computed by the client, in layout order.
+        #[serde(default)]
+        chunk_checksums: Option<Vec<u32>>,
     },
     Pin {
         uri: String,
@@ -156,6 +162,9 @@ pub enum SyncStatus {
     SyncFailed,
     #[serde(rename = "REPLICA_COMMITTED")]
     ReplicaCommitted,
+    /// Regenerable data with no authoritative copy, such as a KV cache block. Never flushed.
+    #[serde(rename = "LOCAL_ONLY")]
+    LocalOnly,
 }
 
 impl SyncStatus {
@@ -176,6 +185,7 @@ impl SyncStatus {
             SyncStatus::SyncedBackend => "SYNCED_BACKEND",
             SyncStatus::SyncFailed => "SYNC_FAILED",
             SyncStatus::ReplicaCommitted => "REPLICA_COMMITTED",
+            SyncStatus::LocalOnly => "LOCAL_ONLY",
         }
     }
 
@@ -185,7 +195,7 @@ impl SyncStatus {
             SyncStatus::Committed => 50.0,
             SyncStatus::SyncingBackend => 75.0,
             SyncStatus::SyncFailed => 0.0,
-            SyncStatus::SyncedBackend | SyncStatus::ReplicaCommitted => 100.0,
+            SyncStatus::SyncedBackend | SyncStatus::ReplicaCommitted | SyncStatus::LocalOnly => 100.0,
         }
     }
 }
@@ -277,6 +287,11 @@ impl Response {
 
     pub fn with_generation(mut self, generation: u64) -> Self {
         self.generation = Some(generation);
+        self
+    }
+
+    pub fn with_sync_status(mut self, sync_status: Option<SyncStatus>) -> Self {
+        self.sync_status = sync_status;
         self
     }
 

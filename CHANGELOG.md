@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `hypercache.integrations.lmcache_l2`: an L2 adapter for LMCache multiprocess mode, tested on
+  LMCache 0.5.5 and 0.5.6 and vLLM 0.31.0. Optional extra: `hypercache[lmcache]`.
+- `commit_write` accepts `local_only` and `chunk_checksums`. A `LOCAL_ONLY` object is never flushed
+  to a backend and stays evictable. Both fields are optional on the wire; older clients are unaffected.
+- `locate` reports `sync_status` for HITs, so a reader can refuse an object that is still staged.
+- `DirectBlockWriter(direct_on_block_devices=True)` writes to raw block devices with O_DIRECT, falling
+  back to the page cache for anything it can't take. Off by default; the LMCache adapter turns it on.
+- `benchmarks/pipelined_ttft.py`, `benchmarks/write_concurrency_probe.py`, `benchmarks/raw_write_probe.py` and
+  `benchmarks/results/lmcache_and_ttft.md`.
+
+### Fixes
+- `HyperCacheKVStore` commits are now `LOCAL_ONLY` unless `write_through` is set. Previously every
+  commit started a backend upload of prompt-derived data, ignoring `auto_flush_s3=False`, and a failed
+  upload left the block dirty and impossible to evict. Reads now treat staged blocks as misses.
+- `DirectBlockWriter` retries short writes instead of ignoring them, no longer copies each chunk, and
+  no longer leaks a file descriptor when two threads open the same device.
+
+### Docs
+- Corrected the pipelined loader claims. It does not shorten time to first token by itself: on a
+  15 GB model the change was between -3.4% and +1.1%, and the first layer took 880 ms, not milliseconds.
+- Fixed the pipelined loader README example, which did not match the API.
+- Removed the claims of LMCache and Dynamo KVBM readiness. LMCache now has a real adapter; Dynamo
+  KVBM has no integration.
+
 ## 0.9.3
 
 Raw-block access for non-root clients and up-front arena sizing, tested on bare-metal Linux,

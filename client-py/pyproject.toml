@@ -40,6 +40,9 @@ Repository = "https://github.com/looelabs/hypercache"
 Issues = "https://github.com/looelabs/hypercache/issues"
 
 [project.optional-dependencies]
+lmcache = [
+    "lmcache>=0.5.5,<0.6; python_version >= '3.10'",
+]
 gpu = [
     "kvikio-cu12>=24.0.0",
     "cupy-cuda12x>=12.0.0",

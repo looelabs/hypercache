@@ -110,14 +110,17 @@ hypercache-poc/
     │   ├── datapath.py         # Direct Block DMA / GDS direct I/O reader
     │   ├── fsspec_fs.py        # AbstractFileSystem implementation for torch.load/save
     │   ├── kv_store.py         # Content-addressed KV-Cache Prefix Block Store
-    │   ├── pipeline.py         # Double-buffered pipelined GPU tensor loader
+    │   ├── pipeline.py         # In-order byte-range reader with background prefetch; returns bytes, runs no model
     │   └── integrations/
+    │       ├── lmcache_l2.py   # LMCache L2 plugin adapter; the only module importing lmcache, never imported by integrations/__init__.py
     │       ├── safetensors_loader.py # Zero-copy Safetensors & vLLM weight loader
     │       └── dcp.py          # PyTorch Distributed Checkpoint (DCP) StorageReader/Writer
     └── tests/
         ├── test_client.py      # Unit tests for UDS protocol and client metadata parsing
         ├── test_fsspec.py      # Unit tests for fsspec file operations and streaming writes
         ├── test_integrations_and_kv.py # Unit tests for Safetensors/vLLM, DCP, and KV-Cache store
+        ├── test_direct_writer.py       # DirectBlockWriter O_DIRECT mode: alignment, partial blocks, fallbacks
+        ├── test_lmcache_adapter.py     # LMCache L2 adapter against a fake daemon; stubs LMCache where absent
         ├── test_pipelined_and_numa.py  # Unit tests for pipelined DMA and NUMA affinity
         └── test_robustness.py  # Thread/fork safety, framing, O_DIRECT bounce buffers, CRC verification
 ```
