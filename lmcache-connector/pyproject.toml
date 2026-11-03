@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hypercache-lmcache-native"
+description = "LMCache native L2 connector backed by the HyperCache daemon"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dynamic = ["version"]
+dependencies = []
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "hypercache_lmcache_native"
+features = ["extension-module"]

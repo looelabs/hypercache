@@ -3,15 +3,18 @@
 ## Unreleased
 
 ### Added
-- `hypercache.integrations.lmcache_l2`: an L2 adapter for LMCache multiprocess mode, tested on
-  LMCache 0.5.5 and 0.5.6 and vLLM 0.31.0. Optional extra: `hypercache[lmcache]`.
+- `lmcache-connector/`: an L2 connector for LMCache multiprocess mode, written in Rust and loaded
+  through LMCache's `native_plugin` type. Built separately with maturin. Tested on LMCache 0.5.5 and
+  0.5.6 and vLLM 0.31.0 and 0.33.0.
 - `commit_write` accepts `local_only` and `chunk_checksums`. A `LOCAL_ONLY` object is never flushed
   to a backend and stays evictable. Both fields are optional on the wire; older clients are unaffected.
 - `locate` reports `sync_status` for HITs, so a reader can refuse an object that is still staged.
 - `DirectBlockWriter(direct_on_block_devices=True)` writes to raw block devices with O_DIRECT, falling
-  back to the page cache for anything it can't take. Off by default; the LMCache adapter turns it on.
+  back to the page cache for anything it can't take. Off by default.
 - `benchmarks/pipelined_ttft.py`, `benchmarks/write_concurrency_probe.py`, `benchmarks/raw_write_probe.py` and
   `benchmarks/results/lmcache_and_ttft.md`.
+- `benchmarks/lmcache_connector_direct.py`, `benchmarks/results/lmcache_rust_connector.md` and
+  `benchmarks/results/lmcache_rust_connector_xeon.md`.
 
 ### Fixes
 - `HyperCacheKVStore` commits are now `LOCAL_ONLY` unless `write_through` is set. Previously every

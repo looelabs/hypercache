@@ -124,7 +124,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 * Each node caches only its assigned $1/N$ slice of the dataset and streams batches into local PyTorch `DataLoader` workers at local NVMe line rate with zero network traffic. Because it uses consistent hashing, adding or removing a node only remaps $1/N$ of the shards instead of invalidating the entire cluster cache.
 
 ### 5. LLM KV-Cache Prefix Block Offloading (`HyperCacheKVStore`)
-* Long-context LLM serving generates massive KV-cache tensors. Rather than recomputing shared prompt prefixes when GPU VRAM fills up, LMCache can keep them on HyperCache through `hypercache.integrations.lmcache_l2`, and other code can use `HyperCacheKVStore` directly. Blocks stay on the local host and remain evictable. There is no NVIDIA Dynamo KVBM integration.
+* Long-context LLM serving generates massive KV-cache tensors. Rather than recomputing shared prompt prefixes when GPU VRAM fills up, LMCache can keep them on HyperCache through [`lmcache-connector/`](lmcache-connector/README.md), and other code can use `HyperCacheKVStore` directly. Blocks stay on the local host and remain evictable. There is no NVIDIA Dynamo KVBM integration.
 
 ### 6. Peer-to-Peer (P2P) Fleet Distribution
 * When preloading a large model across a multi-node cluster, you do not want every node pulling the full file from S3 simultaneously.
@@ -694,14 +694,15 @@ The loader splits the object by bytes and returns bytes. Your code has to supply
 
 ### 6. KV-Cache Storage for LMCache
 
-`hypercache.integrations.lmcache_l2` is an L2 adapter for LMCache's multiprocess mode, tested with LMCache 0.5.5 and 0.5.6 and vLLM 0.31.0. It needs a daemon built from this version or later. Install `hypercache[lmcache]` where the LMCache server runs, and pass:
+[`lmcache-connector/`](lmcache-connector/README.md) is an L2 connector for LMCache's multiprocess mode, written in Rust. It's tested with LMCache 0.5.5 and 0.5.6 and vLLM 0.31.0 and 0.33.0, and needs a daemon built from this version or later. Build it with maturin, install the wheel where the LMCache server runs, and pass:
 
 ```bash
 lmcache server --l1-size-gb 60 --eviction-policy LRU --l2-adapter '{
-  "type": "plugin",
-  "module_path": "hypercache.integrations.lmcache_l2",
-  "class_name": "HyperCacheL2Adapter",
-  "adapter_params": {"namespace": "my-model-rev-abc123", "tier": "nvme"}
+  "type": "native_plugin",
+  "module_path": "hypercache_lmcache_native",
+  "class_name": "HyperCacheNativeConnector",
+  "adapter_params": {"namespace": "my-model-rev-abc123", "tier": "nvme"},
+  "max_capacity_gb": 0
 }'
 ```
 
@@ -711,7 +712,7 @@ lmcache server --l1-size-gb 60 --eviction-policy LRU --l2-adapter '{
 - **Not supported:** `list_l2_keys` and LMCache's IsolatedLRU quotas.
 - **Size L1 for loads.** Loads go through L1, and LMCache only evicts it down to 80%. If the load doesn't fit, vLLM recomputes.
 
-See the [results](benchmarks/results/lmcache_and_ttft.md). On our test drive in raw mode, the adapter's loads were within 0.4% of LMCache's `raw_block` adapter and its stores about 4% slower, while also verifying a CRC32 on every chunk. In filesystem arena mode, its loads were within 1% of `fs_native` with O_DIRECT and its stores about 20% slower.
+On a single drive, it ties LMCache's `raw_block` adapter on throughput while verifying a CRC32 on every chunk, though `raw_block` lookups are 5 to 10 times as fast. It can also stripe across drives, which `raw_block` can't: on a VM with 4 network disks it loaded at 6.4 GB/s, the VM's read limit, and at 39.8 GB/s from the RAM tier. See the [results](benchmarks/results/lmcache_rust_connector_xeon.md).
 
 For code that manages its own KV blocks, use `HyperCacheKVStore`:
 

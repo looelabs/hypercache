@@ -5,7 +5,7 @@ Provides a content-addressed key-value block interface over HyperCache's Tier-1
 Host RAM (`/dev/shm` / HugePages) and Tier-2 Striped NVMe engine.
 
 This is a building block for code that manages its own KV-cache blocks. For LMCache,
-use `hypercache.integrations.lmcache_l2`. There is no NVIDIA Dynamo KVBM integration.
+use the connector in `lmcache-connector/`. There is no NVIDIA Dynamo KVBM integration.
 
 Blocks stay on this host and remain evictable, unless write_through=True asks for a
 synchronous backend flush.

@@ -74,6 +74,7 @@ else
 fi
 
 CARGO_MANIFEST="control-plane/Cargo.toml"
+CONNECTOR_MANIFEST="lmcache-connector/Cargo.toml"
 RELEASE_DIR="$REPO_ROOT/control-plane/target/release"
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hc-verify-logs.XXXXXX")"
 
@@ -208,7 +209,8 @@ except ImportError:
     except ImportError:
         print("tomllib unavailable (Python < 3.11); skipping")
         sys.exit(0)
-for f in glob.glob("configs/*.toml") + ["control-plane/Cargo.toml", "client-py/pyproject.toml", "control-plane/rustfmt.toml"]:
+for f in glob.glob("configs/*.toml") + ["control-plane/Cargo.toml", "client-py/pyproject.toml", "control-plane/rustfmt.toml",
+                                         "lmcache-connector/Cargo.toml", "lmcache-connector/pyproject.toml"]:
     with open(f, "rb") as fh:
         tomllib.load(fh)
     print(f"{f}: ok")
@@ -233,6 +235,9 @@ stage_static() {
     step "no hardcoded version strings in Rust sources and tests" check_no_hardcoded_versions
     step "zero-emoji policy (AGENTS.md rule 1)" check_emoji_policy
     step "cargo fmt --check" cargo fmt --manifest-path "$CARGO_MANIFEST" -- --check
+    step "lmcache-connector: cargo fmt --check" cargo fmt --manifest-path "$CONNECTOR_MANIFEST" -- --check
+    step "lmcache-connector: cargo clippy -D warnings" \
+        cargo clippy --locked --manifest-path "$CONNECTOR_MANIFEST" --all-targets -- -D warnings
     step "cargo clippy --all-targets -D warnings (Cargo.lock locked)" \
         cargo clippy --locked --manifest-path "$CARGO_MANIFEST" --all-targets -- -D warnings
     step "python byte-compile (client + scripts)" check_python_compile
@@ -271,6 +276,7 @@ check_missing_config_is_error() {
 stage_rust() {
     section "rust"
     step "cargo test (unit + integration, locked)" cargo test --locked --manifest-path "$CARGO_MANIFEST"
+    step "lmcache-connector: cargo test" cargo test --locked --manifest-path "$CONNECTOR_MANIFEST"
     step "cargo build --release" cargo build --locked --release --manifest-path "$CARGO_MANIFEST"
     step "release binaries: --version and every subcommand --help" check_binaries
     step "daemon refuses to start without a config file" check_missing_config_is_error

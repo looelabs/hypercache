@@ -1,0 +1,23 @@
+[package]
+name = "hypercache-lmcache-connector"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "LMCache native L2 connector backed by the HyperCache daemon"
+publish = false
+
+[lib]
+name = "hypercache_lmcache_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Plain `cargo test` builds without Python, so the tests need no interpreter or LMCache.
+python = ["dep:pyo3"]
+extension-module = ["python", "pyo3/extension-module"]
+
+[dependencies]
+crc32fast = "1"
+libc = "0.2"
+pyo3 = { version = "0.24", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

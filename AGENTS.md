@@ -93,6 +93,7 @@ hypercache-poc/
 │   └── tests/
 │       └── s3_live.rs          # #[ignore]d live S3 tests (run by scripts/verify_release.sh)
 │
+├── lmcache-connector/          # LMCache native L2 connector in Rust (PyO3, built with maturin); separate from the daemon
 ├── scripts/
 │   ├── verify_release.sh       # Release verification harness (static, rust, python, e2e, s3, linux, image)
 │   ├── e2e/hypercache_e2e.py   # End-to-end daemon / fleet / S3 scenarios against the real binaries
@@ -112,7 +113,6 @@ hypercache-poc/
     │   ├── kv_store.py         # Content-addressed KV-Cache Prefix Block Store
     │   ├── pipeline.py         # In-order byte-range reader with background prefetch; returns bytes, runs no model
     │   └── integrations/
-    │       ├── lmcache_l2.py   # LMCache L2 plugin adapter; the only module importing lmcache, never imported by integrations/__init__.py
     │       ├── safetensors_loader.py # Zero-copy Safetensors & vLLM weight loader
     │       └── dcp.py          # PyTorch Distributed Checkpoint (DCP) StorageReader/Writer
     └── tests/
@@ -120,7 +120,6 @@ hypercache-poc/
         ├── test_fsspec.py      # Unit tests for fsspec file operations and streaming writes
         ├── test_integrations_and_kv.py # Unit tests for Safetensors/vLLM, DCP, and KV-Cache store
         ├── test_direct_writer.py       # DirectBlockWriter O_DIRECT mode: alignment, partial blocks, fallbacks
-        ├── test_lmcache_adapter.py     # LMCache L2 adapter against a fake daemon; stubs LMCache where absent
         ├── test_pipelined_and_numa.py  # Unit tests for pipelined DMA and NUMA affinity
         └── test_robustness.py  # Thread/fork safety, framing, O_DIRECT bounce buffers, CRC verification
 ```

@@ -1,5 +1,7 @@
 # LMCache adapter and pipelined loader results
 
+Note: the Python adapter measured here was later replaced by the Rust connector in `lmcache-connector/`. It remains in git history at commit 5108dcc.
+
 Measured 2026-11-02 on one small server. These results show behaviour and relative cost on this machine. They are not throughput claims for production hardware.
 
 **Hardware:** Ryzen 5 5600GT, 31 GB RAM, RTX 4060 Ti 16 GB (PCIe Gen3 x8), Crucial P3 Gen3 x4 (ext4 on LVM), Intel SSDPEKNU512GZ Gen3 x2 (raw, about 1.4 GB/s direct read measured with dd).
