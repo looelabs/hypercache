@@ -68,6 +68,10 @@ impl Response {
     }
 }
 
+fn connection_is_dead(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)
+}
+
 pub struct DaemonClient {
     socket_path: PathBuf,
     timeout: Duration,
@@ -99,17 +103,22 @@ impl DaemonClient {
     }
 
     fn exchange(&mut self, body: &Value, timeout: Duration) -> io::Result<Response> {
-        if self.stream.is_none() {
-            self.stream = Some(BufReader::new(UnixStream::connect(&self.socket_path)?));
-        }
-        let reader = self.stream.as_mut().expect("connected above");
-        reader.get_ref().set_read_timeout(Some(timeout))?;
-        reader.get_ref().set_write_timeout(Some(timeout))?;
-
         let mut message = serde_json::to_vec(body)?;
         message.push(b'\n');
-        reader.get_mut().write_all(&message)?;
 
+        // A kept connection dies when the daemon restarts, and the next write is what finds out.
+        // The daemon can't have received that request, so resending it is safe. A failure after
+        // this point is never resent, because the daemon may already have acted on the request.
+        let reused = self.stream.is_some();
+        match self.send(&message, timeout) {
+            Err(error) if reused && connection_is_dead(&error) => {
+                self.stream = None;
+                self.send(&message, timeout)?;
+            }
+            other => other?,
+        }
+
+        let reader = self.stream.as_mut().expect("connected by send");
         loop {
             self.line.clear();
             if reader.read_line(&mut self.line)? == 0 {
@@ -122,6 +131,18 @@ impl DaemonClient {
                 return Ok(serde_json::from_str(&self.line)?);
             }
         }
+    }
+
+    fn send(&mut self, message: &[u8], timeout: Duration) -> io::Result<()> {
+        if self.stream.is_none() {
+            self.stream = Some(BufReader::new(UnixStream::connect(&self.socket_path)?));
+        }
+        let reader = self.stream.as_mut().expect("connected above");
+        // macOS refuses these on a socket whose peer has gone, before anything is written
+        let dead = |error| io::Error::new(io::ErrorKind::BrokenPipe, error);
+        reader.get_ref().set_read_timeout(Some(timeout)).map_err(dead)?;
+        reader.get_ref().set_write_timeout(Some(timeout)).map_err(dead)?;
+        reader.get_mut().write_all(message)
     }
 
     pub fn locate(&mut self, uri: &str) -> io::Result<Response> {
@@ -165,5 +186,99 @@ impl DaemonClient {
     pub fn evict(&mut self, uri: &str) -> io::Result<bool> {
         let response = self.request(&json!({"action": "evict", "uri": uri}), self.timeout)?;
         Ok(matches!(response.status.as_str(), "EVICTED" | "PONG" | "OK"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn socket_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hc-client-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("d.sock")
+    }
+
+    /// Answers one request on one connection, then closes it.
+    fn answer_one(listener: &UnixListener, requests: &AtomicUsize) {
+        // Gives up rather than blocking, so a failed assertion can't hang the test run
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => panic!("no connection: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        requests.fetch_add(1, Ordering::SeqCst);
+        reader.get_mut().write_all(b"{\"status\":\"MISS\"}\n").unwrap();
+    }
+
+    #[test]
+    fn request_survives_a_daemon_restart_on_a_kept_connection() {
+        let socket = socket_path("restart");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = AtomicUsize::new(0);
+        let mut client = DaemonClient::new(socket.clone(), TIMEOUT);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| answer_one(&listener, &requests));
+            assert_eq!(client.locate("hypercache://a").unwrap().status, "MISS");
+        });
+        // The old connection is closed now. The next request should reconnect and go through once.
+        std::thread::scope(|scope| {
+            scope.spawn(|| answer_one(&listener, &requests));
+            assert_eq!(client.locate("hypercache://a").unwrap().status, "MISS");
+        });
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn request_the_daemon_received_is_never_resent() {
+        let socket = socket_path("received");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = DaemonClient::new(socket.clone(), TIMEOUT);
+
+        // A kept connection whose daemon reads the request, then dies before it replies
+        let (near, far) = UnixStream::pair().unwrap();
+        client.stream = Some(BufReader::new(near));
+        let daemon = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(far).read_line(&mut line).unwrap();
+        });
+
+        assert!(client.request(&json!({"action": "commit"}), TIMEOUT).is_err());
+        daemon.join().unwrap();
+        // A resend would have had to reconnect through this listener
+        assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn a_daemon_that_is_really_down_is_still_an_error() {
+        let socket = socket_path("down");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = AtomicUsize::new(0);
+        let mut client = DaemonClient::new(socket.clone(), TIMEOUT);
+        std::thread::scope(|scope| {
+            scope.spawn(|| answer_one(&listener, &requests));
+            client.locate("hypercache://a").unwrap();
+        });
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        assert!(client.locate("hypercache://a").is_err());
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 }
