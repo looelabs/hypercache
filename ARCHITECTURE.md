@@ -390,6 +390,17 @@ dataset = ShardedTokenDataset(["hypercache://datasets/tokens/shard_000.bin", ...
 loader = DataLoader(dataset, batch_size=16, num_workers=4)
 ```
 
+### 7.5. LMCache KV-Cache Connector
+
+`lmcache-connector/` is an L2 connector for LMCache's multiprocess mode, written in Rust and loaded through LMCache's `native_plugin` type. It's a separate package from the Python client.
+
+- **Control path:** each worker thread keeps a connection to the daemon's socket for `locate`, `stage_write` and `commit_write`. Commits are `LOCAL_ONLY`, so KV data is never flushed to a backend and stays evictable.
+- **Data path:** workers read and write chunks directly on the devices the layout names, with `O_DIRECT` into LMCache's page-aligned L1 buffers, and verify a CRC32 per chunk on load.
+- **Failure rule:** any doubt is a miss. A block that fails its checksum is evicted. If the daemon restarts, workers reconnect, and a request the daemon may have received is never resent.
+- **Concurrency:** a worker handles one object at a time and reads its chunks in order, so `num_workers` sets the queue depth.
+
+See [`lmcache-connector/README.md`](lmcache-connector/README.md).
+
 ---
 
 ## 8. CLI Command Reference & Operator Guide

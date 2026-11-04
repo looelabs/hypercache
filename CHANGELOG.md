@@ -13,8 +13,9 @@
   back to the page cache for anything it can't take. Off by default.
 - `benchmarks/pipelined_ttft.py`, `benchmarks/write_concurrency_probe.py`, `benchmarks/raw_write_probe.py` and
   `benchmarks/results/lmcache_and_ttft.md`.
-- `benchmarks/lmcache_connector_direct.py`, `benchmarks/results/lmcache_rust_connector.md` and
-  `benchmarks/results/lmcache_rust_connector_xeon.md`.
+- `benchmarks/lmcache_connector_direct.py`, `benchmarks/results/lmcache_rust_connector.md`,
+  `benchmarks/results/lmcache_rust_connector_xeon.md` and
+  `benchmarks/results/lmcache_rust_connector_nvme.md`.
 
 ### Fixes
 - `HyperCacheKVStore` commits are now `LOCAL_ONLY` unless `write_through` is set. Previously every

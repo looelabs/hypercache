@@ -712,7 +712,7 @@ lmcache server --l1-size-gb 60 --eviction-policy LRU --l2-adapter '{
 - **Not supported:** `list_l2_keys` and LMCache's IsolatedLRU quotas.
 - **Size L1 for loads.** Loads go through L1, and LMCache only evicts it down to 80%. If the load doesn't fit, vLLM recomputes.
 
-On a single drive, it ties LMCache's `raw_block` adapter on throughput while verifying a CRC32 on every chunk, though `raw_block` lookups are 5 to 10 times as fast. It can also stripe across drives, which `raw_block` can't: on a VM with 4 network disks it loaded at 6.4 GB/s, the VM's read limit, and at 39.8 GB/s from the RAM tier. See the [results](benchmarks/results/lmcache_rust_connector_xeon.md).
+On 4 Gen4 NVMe drives it loads 14 MiB objects at 24.9 GB/s and stores them at 18.5 GB/s, while verifying a CRC32 on every chunk. That's 90% of the drives' raw read speed. LMCache's `raw_block` adapter uses one drive, where the two are about even on throughput, and its lookups are about 3 times as fast. See the [NVMe results](benchmarks/results/lmcache_rust_connector_nvme.md).
 
 For code that manages its own KV blocks, use `HyperCacheKVStore`:
 
