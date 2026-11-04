@@ -4,7 +4,7 @@ Measured 2026-11-04 on a rented bare-metal node with no GPU. Raw data is in `lmc
 
 **Hardware:** AMD EPYC 9474F (48 cores, 1 socket, 1 NUMA node), 755 GB DDR5-4800 on 8 channels, 4 Micron 7450 3.84 TB drives (firmware E2MU300, Gen4 x4, 4 KiB blocks), each discarded before a run.
 
-**Software:** Linux 6.8.0, LMCache 0.5.6, Python 3.12, rustc 1.99.1, HyperCache 0.9.3 plus this branch. The safety script passed 30 of 30 on LMCache 0.5.5 and 0.5.6 on these drives.
+**Software:** Linux 6.8.0, LMCache 0.5.6, Python 3.12, rustc 1.99.1, HyperCache 0.9.3 plus this branch. The safety script (`scripts/e2e/lmcache_l2_e2e.py`) passed 30 of 30 on the final code, on LMCache 0.5.5 and 0.5.6, on 1 and 4 drives (`safety_final/`).
 
 **Method:** `lmcache bench l2`, 8 keys per task, L1 aligned to 4 KiB, 2 warmup rounds, order shuffled, median of 3 runs with the range in brackets. Every run checks that all keys were stored and loaded. 14 MiB is one 256-token Qwen2.5-7B chunk. "Old" is the daemon before the stripe fix (each object starts on the first drive), and "fixed" is after it.
 

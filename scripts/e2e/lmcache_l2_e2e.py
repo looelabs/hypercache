@@ -136,7 +136,7 @@ def mixed_writes_are_coherent(client):
     buffered = DirectBlockWriter(max_workers=4)
     direct = DirectBlockWriter(max_workers=4, direct_on_block_devices=True)
     direct_reader = DirectBlockReader(max_workers=4, verify_checksums=False)
-    plain = os.open(layout[0].device, os.O_RDONLY)
+    plain = {device: os.open(device, os.O_RDONLY) for device in {chunk.device for chunk in layout}}
     aligned = mmap.mmap(-1, size)
     view = memoryview(aligned)
 
@@ -145,7 +145,7 @@ def mixed_writes_are_coherent(client):
         direct_reader.read_range_into(layout, 0, size, through_direct)
         through_cache, position = bytearray(size), 0
         for chunk in layout:
-            through_cache[position : position + chunk.length] = os.pread(plain, chunk.length, chunk.offset)
+            through_cache[position : position + chunk.length] = os.pread(plain[chunk.device], chunk.length, chunk.offset)
             position += chunk.length
         return bytes(through_direct), bytes(through_cache)
 
@@ -159,7 +159,8 @@ def mixed_writes_are_coherent(client):
         return True
     finally:
         view.release()
-        os.close(plain)
+        for fd in plain.values():
+            os.close(fd)
         direct_reader.close()
         direct.close()
         buffered.close()
@@ -308,7 +309,7 @@ def main():
     wrong = load(adapter, keys[1:2], [Obj(bytes(size - 4096))])
     results.append(check("wrong buffer size is a miss", wrong == [False]))
 
-    results.append(check("page cache and O_DIRECT stay coherent on one device", mixed_writes_are_coherent(client)))
+    results.append(check("page cache and O_DIRECT stay coherent", mixed_writes_are_coherent(client)))
 
     adapter.delete(keys)
     adapter.submit_unlock(keys)
