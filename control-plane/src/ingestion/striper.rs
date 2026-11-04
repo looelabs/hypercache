@@ -9,6 +9,14 @@ use crate::metadata::MetadataStore;
 use crate::protocol::{ChunkDescriptor, StorageTier};
 use crate::ram::RamMemoryPool;
 
+/// The drive an object's first chunk goes on. Each object starts on its own drive, so objects that
+/// don't fill a whole stripe still spread evenly, and readers don't all start on the same drive.
+/// Stable across restarts, so an append after a restart continues the object's pattern.
+fn start_device(uri: &str, num_devices: usize) -> usize {
+    // Multiply and shift so the choice comes from the hash's high bits
+    ((crc32fast::hash(uri.as_bytes()) as u64 * num_devices as u64) >> 32) as usize
+}
+
 #[derive(Clone)]
 pub struct Striper {
     config: Config,
@@ -49,12 +57,13 @@ impl Striper {
         }
     }
 
-    fn device_for_chunk(&self, chunk_idx: usize) -> Result<String> {
+    fn device_for_chunk(&self, uri: &str, chunk_idx: usize) -> Result<String> {
         let num_devices = self.config.block_devices.len();
         if num_devices == 0 {
             anyhow::bail!("No secondary raw NVMe block devices configured or discovered (OS root disk protected). Pass --tier ram to cache directly in Tier 1 Host RAM (/dev/shm) or configure secondary block devices in configs/hypercache-agent.toml.");
         }
-        Ok(self.config.block_devices[chunk_idx % num_devices].clone())
+        let start = start_device(uri, num_devices);
+        Ok(self.config.block_devices[(start + chunk_idx) % num_devices].clone())
     }
 
     fn open_device(&self, device: &str) -> Result<Arc<File>> {
@@ -189,7 +198,7 @@ impl Striper {
             let start = local_idx as u64 * chunk_size;
             let chunk_len = (start + chunk_size).min(size_bytes) - start;
             let allocated = async {
-                let device_path = self.device_for_chunk(start_chunk_idx + local_idx)?;
+                let device_path = self.device_for_chunk(uri, start_chunk_idx + local_idx)?;
                 let offset = self
                     .metadata
                     .allocate_chunk_offset_for(
@@ -245,7 +254,7 @@ impl Striper {
             }
         }
 
-        let device_path = self.device_for_chunk(chunk_idx)?;
+        let device_path = self.device_for_chunk(uri, chunk_idx)?;
         let offset = self
             .metadata
             .allocate_chunk_offset_for(
@@ -284,6 +293,83 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Bytes per drive for many objects of one size, as a fraction of an even share.
+    fn spread(num_devices: usize, object_chunks: usize, last_chunk_fraction: f64) -> Vec<f64> {
+        let objects = 8192;
+        let mut bytes = vec![0.0; num_devices];
+        for i in 0..objects {
+            let uri = format!("hypercache://bench/m@00000000@0@{:08x}", i);
+            let start = start_device(&uri, num_devices);
+            for chunk in 0..object_chunks {
+                let size = if chunk + 1 == object_chunks {
+                    last_chunk_fraction
+                } else {
+                    1.0
+                };
+                bytes[(start + chunk) % num_devices] += size;
+            }
+        }
+        let even = bytes.iter().sum::<f64>() / num_devices as f64;
+        bytes.iter().map(|b| b / even).collect()
+    }
+
+    #[test]
+    fn test_objects_spread_evenly_across_drives() {
+        for num_devices in [2, 3, 4, 8] {
+            // Under one chunk, 14 MiB in 4 MiB chunks, and exactly one stripe's worth
+            for (chunks, last) in [(1, 0.5), (4, 0.5), (num_devices, 1.0)] {
+                for share in spread(num_devices, chunks, last) {
+                    assert!(
+                        (0.9..=1.1).contains(&share),
+                        "{} drives, {} chunks: share {}",
+                        num_devices,
+                        chunks,
+                        share
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_start_device_is_stable_and_in_range() {
+        assert_eq!(start_device("hypercache://a", 1), 0);
+        for num_devices in 1..=16 {
+            for i in 0..1000 {
+                let uri = format!("hypercache://{}", i);
+                assert!(start_device(&uri, num_devices) < num_devices);
+                assert_eq!(start_device(&uri, num_devices), start_device(&uri, num_devices));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_layout_keeps_stripe_order_from_the_objects_start_drive() {
+        let config = Config {
+            block_devices: (0..4).map(|i| format!("/tmp/hc-layout-{}.raw", i)).collect(),
+            chunk_size_bytes: 1024 * 1024,
+            ..Config::default()
+        };
+        let devices = config.block_devices.clone();
+        let striper = Striper::new(config, MetadataStore::new(1 << 30, None, None), None);
+        for uri in ["hypercache://a", "hypercache://b", "hypercache://c", "hypercache://d"] {
+            let layout = striper
+                .allocate_layout(uri, 6 * 1024 * 1024, Some(StorageTier::Nvme))
+                .await
+                .unwrap();
+            let start = start_device(uri, 4);
+            for (i, chunk) in layout.iter().enumerate() {
+                assert_eq!(chunk.device, devices[(start + i) % 4]);
+            }
+            // Appending continues the same pattern
+            let more = striper
+                .allocate_layout_from_index(uri, 6, 1024 * 1024, Some(StorageTier::Nvme))
+                .await
+                .unwrap();
+            assert_eq!(more[0].device, devices[(start + 6) % 4]);
+        }
     }
 
     #[tokio::test]

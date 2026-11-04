@@ -879,8 +879,10 @@ mod tests {
         assert_eq!(resp_stage.object_size, Some(8388608));
         let layout = resp_stage.chunk_layout.unwrap();
         assert_eq!(layout.len(), 2);
-        assert_eq!(layout[0].device, raw_dev0.to_str().unwrap());
-        assert_eq!(layout[1].device, raw_dev1.to_str().unwrap());
+        // The object's start drive depends on its URI, but its two chunks use both drives
+        let mut used = [layout[0].device.as_str(), layout[1].device.as_str()];
+        used.sort();
+        assert_eq!(used, [raw_dev0.to_str().unwrap(), raw_dev1.to_str().unwrap()]);
 
         // 2. Commit write (write-back by default)
         let resp_commit = server.handle_commit_write(uri, None, false, t_start).await;
