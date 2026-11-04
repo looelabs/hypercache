@@ -127,16 +127,17 @@ When an object is requested for the first time (`Cache MISS`), the Ingestion Eng
 ```
 Authoritative S3 Object (5.00 GB Payload)
   │
-  ├── Chunk 0 (4 MiB) ──► Target: /dev/nvme1n1 @ Offset 4096
+  ├── Chunk 0 (4 MiB) ──► Target: /dev/nvme1n1 @ Offset 4096       (this object's start drive)
   ├── Chunk 1 (4 MiB) ──► Target: /dev/nvme2n1 @ Offset 4096
   ├── Chunk 2 (4 MiB) ──► Target: /dev/nvme1n1 @ Offset 4198400
   ├── Chunk 3 (4 MiB) ──► Target: /dev/nvme2n1 @ Offset 4198400
-  └── Chunk N (4 MiB) ──► Target: /dev/nvme(N % Count) @ Offset ...
+  └── Chunk N (4 MiB) ──► Target: /dev/nvme((Start + N) % Count) @ Offset ...
 ```
 
 #### Striping Strategy (`striper.rs`):
 - **Fixed 4 MiB Chunk Sizing**: Aligns with NVMe internal erase block boundaries and flash page allocation units, minimizing write amplification.
-- **Round-Robin Multi-Drive Striping**: Distributes sequential chunks evenly across all discovered block devices ($D_0, D_1, \dots, D_{N-1}$).
+- **Round-Robin Multi-Drive Striping**: Distributes sequential chunks across all discovered block devices ($D_0, D_1, \dots, D_{N-1}$).
+- **Per-Object Start Drive**: Each object starts on a drive chosen from a CRC32 of its URI, so objects that don't fill a whole stripe still spread evenly, and objects smaller than one chunk use every drive across the pool. The choice is stable across restarts. Each chunk records its own drive in the layout, so objects stored before this rule stay readable and keep their placement.
 - **Positional Direct Writes**: Writes blocks directly using `preadv`/`pwritev` or positional file handles with a 4096-byte hardware offset safety margin (`device_start_offset_bytes`).
 
 ---
