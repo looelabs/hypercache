@@ -30,7 +30,9 @@ jobs:
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "control-plane -> target"
+          workspaces: |
+            control-plane -> target
+            lmcache-connector -> target
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,6 +44,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "numpy>=1.22" "fsspec>=2023.1.0" pytest boto3 safetensors pyyaml build
           sudo apt-get install -y -qq lsof
+
+      # In this job, not its own, so the check that main requires covers the connector too.
+      # The tests need no Python or LMCache. The Python bindings are only linted here.
+      - name: LMCache connector
+        working-directory: lmcache-connector
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --features extension-module -- -D warnings
+          cargo test --locked
 
       # Runs every stage except `linux` (the runner already is a clean Linux host) and `k8s`
       # (needs minikube). The s3 stage starts a throwaway versitygw container, and the image
