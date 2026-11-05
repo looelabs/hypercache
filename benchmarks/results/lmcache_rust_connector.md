@@ -1,6 +1,6 @@
 # Rust LMCache connector results
 
-Note: the Python adapter compared here was later replaced by this connector. It remains in git history at commit 5108dcc.
+Note: the Python adapter compared here was later replaced by this connector. It remains in git history at commit 5be16e3.
 
 Measured 2026-11-02 on one small server. These results show behaviour and relative cost on this machine. They are not throughput claims for production hardware.
 

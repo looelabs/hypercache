@@ -1,6 +1,6 @@
 # LMCache adapter and pipelined loader results
 
-Note: the Python adapter measured here was later replaced by the Rust connector in `lmcache-connector/`. It remains in git history at commit 5108dcc.
+Note: the Python adapter measured here was later replaced by the Rust connector in `lmcache-connector/`. It remains in git history at commit 5be16e3.
 
 Measured 2026-11-02 on one small server. These results show behaviour and relative cost on this machine. They are not throughput claims for production hardware.
 

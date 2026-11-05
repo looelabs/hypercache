@@ -1,6 +1,6 @@
 # Rust LMCache connector results: Xeon VM, 4 network disks
 
-Note: the Python adapter compared here was later replaced by this connector. It remains in git history at commit 5108dcc.
+Note: the Python adapter compared here was later replaced by this connector. It remains in git history at commit 5be16e3.
 
 Measured 2026-11-03 on a rented cloud VM. Raw data is in `lmcache_l2_raw/rust-connector-xeon/`. Earlier results from a small server are in `lmcache_rust_connector.md`.
 
