@@ -285,12 +285,36 @@ cargo build --release --manifest-path control-plane/Cargo.toml
 .venv/bin/python scripts/e2e/hypercache_e2e.py daemon fleet --keep   # add s3 with --s3-endpoint ...
 ```
 
-### E. Release Checklist
-1. Bump the version in `control-plane/Cargo.toml`, `client-py/pyproject.toml`, `client-py/hypercache/__init__.py` and the default tag in `.github/workflows/release.yml`. The static stage fails if they disagree. The binaries read their version from Cargo (`env!("CARGO_PKG_VERSION")`), so never hardcode version strings in Rust.
+### E. Versions and Releases
+
+**Merging to `main` releases nothing.** `ci.yml` only tests. Binaries, the container image and the PyPI package are built and published by `release.yml`, which runs when a `v*` tag is pushed. A fix on `main` without a tag has not reached users.
+
+**Versions are `vMAJOR.MINOR.PATCH`:**
+
+| Part | Bump it for | Example |
+| :--- | :--- | :--- |
+| MAJOR | The first stable release, and later breaking changes. Only the maintainer decides this. It stays 0 until then. | `v0.9.4` to `v1.0.0` |
+| MINOR | A new user-facing feature, or a change that breaks the rules in section 7.B. Resets PATCH to 0. Describe any break and its upgrade steps in `CHANGELOG.md`. | `v0.9.4` to `v0.10.0` |
+| PATCH | Bug fixes, speed and hardening work that stay backward compatible, including a new optional config key that a fix needs. | `v0.9.3` to `v0.9.4` |
+
+**Rules:**
+- **Every `v*` tag publishes.** That includes names like `v0.9.4-rc1`, so never push a tag to test something.
+- **Tags are permanent.** A ruleset blocks moving or deleting `v*` tags, and PyPI never accepts a version number twice. If a release is bad, fix it in the next PATCH and never reuse the number.
+- **Tag a commit on `main`, after CI has passed on that commit.** The tag must equal the version in the files listed below. `release.yml` stops before publishing if it doesn't, but the tag and its number are still used up, so check first.
+- **Release user-facing fixes soon.** Wait only if another fix is about to land. Changes to docs, CI or tests alone don't need a release.
+- **Agents don't decide to release.** When a user-facing change merges, tell the maintainer it is unreleased and ask whether to cut a release.
+- **Record changes as you make them.** Add them under `## Unreleased` in `CHANGELOG.md`. The release renames that heading to the new version.
+
+**Release checklist:**
+1. On a branch, bump the version in `control-plane/Cargo.toml`, `client-py/pyproject.toml`, `client-py/hypercache/__init__.py` and the default tag in `.github/workflows/release.yml`. The static stage fails if they disagree. The binaries read their version from Cargo (`env!("CARGO_PKG_VERSION")`), so never hardcode version strings in Rust.
 2. Run `cargo update` only on purpose. `Cargo.lock` is committed and every build uses `--locked`.
-3. Add a section to `CHANGELOG.md`.
+3. In `CHANGELOG.md`, rename `## Unreleased` to the new version and add a line saying what the release is for.
 4. Run the full `scripts/verify_release.sh` until it prints `RESULT: PASSED`.
-5. Leave committing, tagging and pushing to the maintainer unless they explicitly ask you to do it.
+5. Open a PR. The maintainer reviews and merges it, because `main` only accepts changes through a PR.
+6. Once CI passes on that commit in `main`, the maintainer tags it: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`.
+7. Check that the `Release Binaries & Container Image` run passed, then check the GitHub release, the container image and the PyPI package.
+
+Leave committing, merging, tagging and pushing to the maintainer unless they explicitly ask you to do it.
 
 ---
 
