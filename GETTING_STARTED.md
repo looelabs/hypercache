@@ -309,3 +309,35 @@ scrape_configs:
 4. **Proxies and Sidecars**: If the controller sits behind a local proxy (Istio/Envoy sidecar, nginx, `kubectl port-forward`), set `allow_local_admin_bypass = false` in `hypercache-controller.toml`. Otherwise forwarded remote calls arrive from `127.0.0.1` and skip the token check.
 5. **Restrict Filesystem Access**: `file://` and `nfs://` URIs may only reach `nfs_mount_path` and the directories listed in `nfs_allowed_paths`. Add dataset or checkpoint directories there explicitly instead of widening `nfs_mount_path` to `/`.
 6. **Verify Before Rollout**: Run `scripts/verify_release.sh` on the build you deploy. It exercises the daemon, the fleet controller and a live S3 endpoint end to end.
+
+---
+
+## 9. KV-Cache Storage for LMCache
+
+The connector in `lmcache-connector/` lets an LMCache server in multiprocess mode keep KV-cache chunks on HyperCache's NVMe tier. It's tested with LMCache 0.5.5 and 0.5.6.
+
+**1. Build and install it.** It isn't published as a package yet, so this needs a Rust toolchain and maturin. Use the same Python that runs LMCache:
+
+```bash
+cd lmcache-connector
+maturin build --release -i python3.12
+pip install target/wheels/hypercache_lmcache_native-*.whl
+```
+
+**2. Start the daemon** on the node, as in section 3.
+
+**3. Start LMCache with the connector:**
+
+```bash
+lmcache server --l1-size-gb 60 --eviction-policy LRU --l1-align-bytes 4096 --l2-adapter '{
+  "type": "native_plugin",
+  "module_path": "hypercache_lmcache_native",
+  "class_name": "HyperCacheNativeConnector",
+  "adapter_params": {"namespace": "my-model-rev-abc123", "tier": "nvme", "num_workers": 32},
+  "max_capacity_gb": 0
+}'
+```
+
+Change `namespace` whenever the model weights, dtype or engine settings change, because LMCache's key has no model revision. Keep `max_capacity_gb` at 0, since the daemon owns capacity. Use `num_workers` 8 on one drive and 32 on four.
+
+The settings, behaviour and limits are in [`lmcache-connector/README.md`](lmcache-connector/README.md), and measurements are in [`benchmarks/results/lmcache_rust_connector_nvme.md`](benchmarks/results/lmcache_rust_connector_nvme.md).

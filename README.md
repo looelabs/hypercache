@@ -107,7 +107,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 
 ### 1. Fast LLM Inference Cold Starts & Serverless GPU Scaling
 * **Pre-Warm Models Fleet-Wide**: Use `./hypercache-admin preload` to stage base models onto local NVMe or RAM across your cluster ahead of traffic spikes.
-* **Layer-by-Layer Pipelined Loading (`HyperCachePipelinedLoader`)**: Instead of waiting for 100% of a model to load before starting inference, HyperCache loads Layer 0 in milliseconds so GPU forward-pass compute starts immediately while background DMA threads prefetch Layers $1, 2, \dots, N$ ahead of execution.
+* **Layer-by-Layer Pipelined Loading (`HyperCachePipelinedLoader`)**: Reads a model's byte ranges in order and prefetches the next ones in the background, so an engine that can run layers as their weights arrive can overlap compute with I/O. It does not shorten time to first token by itself: the first token needs every layer, so the saving is at most `min(T_io, T_compute)`. In [our test](benchmarks/results/lmcache_and_ttft.md) on a 15 GB model, time to first token moved between -3.4% and +1.1%.
 * **Zero-Copy Multi-Tenant Model Sharing (`MAP_SHARED`)**: If you run multiple inference worker processes or containers on the same machine, they map the exact same physical RAM pages in Tier 1 shared memory with **0 bytes of memory duplication**.
 
 ### 2. Sub-Millisecond Multi-LoRA Adapter Hot-Swapping
@@ -124,7 +124,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 * Each node caches only its assigned $1/N$ slice of the dataset and streams batches into local PyTorch `DataLoader` workers at local NVMe line rate with zero network traffic. Because it uses consistent hashing, adding or removing a node only remaps $1/N$ of the shards instead of invalidating the entire cluster cache.
 
 ### 5. LLM KV-Cache Prefix Block Offloading (`HyperCacheKVStore`)
-* Long-context LLM serving generates massive KV-cache tensors. Rather than recomputing shared prompt prefixes when GPU VRAM fills up, inference engines (and frameworks like LMCache or Dynamo KVBM) can use `HyperCacheKVStore` to offload content-addressed KV-cache blocks into Tier 1 Host RAM with automatic spillover to Tier 2 NVMe.
+* Long-context LLM serving generates massive KV-cache tensors. Rather than recomputing shared prompt prefixes when GPU VRAM fills up, LMCache can keep them on HyperCache through [`lmcache-connector/`](lmcache-connector/README.md), and other code can use `HyperCacheKVStore` directly. Blocks stay on the local host and remain evictable. There is no NVIDIA Dynamo KVBM integration.
 
 ### 6. Peer-to-Peer (P2P) Fleet Distribution
 * When preloading a large model across a multi-node cluster, you do not want every node pulling the full file from S3 simultaneously.
@@ -679,21 +679,42 @@ state_dict = reader.load_rank_shard()
 
 ### 5. Layer-by-Layer Pipelined Model Loader (Compute / I/O Overlap)
 
-Start forward-pass compute on Layer 0 immediately while subsequent layers prefetch in the background:
+Read a model in order while the next byte ranges prefetch in the background:
 
 ```python
 from hypercache.pipeline import HyperCachePipelinedLoader
 
-loader = HyperCachePipelinedLoader(prefetch_depth=2)
+loader = HyperCachePipelinedLoader("hypercache://models/model.bin", num_layers=30, prefetch_ahead=2)
 
-# Layer 0 arrives immediately; Layers 1..N prefetch in background threads during GPU compute
-for layer_idx, layer_bytes in loader.stream_layers(layer_uris):
-    run_layer_forward_pass(layer_idx, layer_bytes)
+for layer, layer_bytes in loader.stream_layers():
+    run_layer_forward_pass(layer.layer_idx, layer_bytes)
 ```
 
-### 6. KV-Cache Prefix Block Store (LMCache / Dynamo KVBM Ready)
+The loader splits the object by bytes and returns bytes. Your code has to supply true layer boundaries (`loader.layers`), turn bytes into tensors and run the model. The first token still needs every layer, so the saving is at most `min(T_io, T_compute)`. See the [measurements](benchmarks/results/lmcache_and_ttft.md).
 
-Offload and retrieve prompt prefix KV-cache blocks on striped local NVMe (or optional Host RAM):
+### 6. KV-Cache Storage for LMCache
+
+[`lmcache-connector/`](lmcache-connector/README.md) is an L2 connector for LMCache's multiprocess mode, written in Rust. It's tested with LMCache 0.5.5 and 0.5.6 and vLLM 0.31.0 and 0.33.0, and needs a daemon built from this version or later. Build it with maturin, install the wheel where the LMCache server runs, and pass:
+
+```bash
+lmcache server --l1-size-gb 60 --eviction-policy LRU --l2-adapter '{
+  "type": "native_plugin",
+  "module_path": "hypercache_lmcache_native",
+  "class_name": "HyperCacheNativeConnector",
+  "adapter_params": {"namespace": "my-model-rev-abc123", "tier": "nvme"},
+  "max_capacity_gb": 0
+}'
+```
+
+- **`namespace` is required.** LMCache's key has no model revision or dtype, so change this value whenever the weights or dtype change. Otherwise a new model could read the old model's KV data.
+- **Blocks stay local.** They are never flushed to a backend, because they derive from user prompts and can be recomputed. They stay evictable, and the daemon manages capacity.
+- **Doubt means a miss.** Every load verifies a CRC32 per chunk. A failed check reports a miss and removes the block.
+- **Not supported:** `list_l2_keys` and LMCache's IsolatedLRU quotas.
+- **Size L1 for loads.** Loads go through L1, and LMCache only evicts it down to 80%. If the load doesn't fit, vLLM recomputes.
+
+On 4 Gen4 NVMe drives it loads 14 MiB objects at 24.9 GB/s and stores them at 18.5 GB/s, while verifying a CRC32 on every chunk. That's 90% of the drives' raw read speed. LMCache's `raw_block` adapter uses one drive, where the two are about even on throughput, and its lookups are about 3 times as fast. See the [NVMe results](benchmarks/results/lmcache_rust_connector_nvme.md).
+
+For code that manages its own KV blocks, use `HyperCacheKVStore`:
 
 ```python
 from hypercache import HyperCacheKVStore
@@ -706,7 +727,7 @@ block_key = kv_store.compute_prefix_hash(
 )
 
 # Store KV-cache block into local striped NVMe
-kv_store.put_kv_block(block_key, kv_tensor, tier="nvme", pinned=True)
+kv_store.put_kv_block(block_key, kv_tensor, tier="nvme")
 
 # Retrieve KV-cache block directly into pre-allocated GPU tensor
 kv_store.get_kv_block(block_key, out_tensor=gpu_kv_buffer)

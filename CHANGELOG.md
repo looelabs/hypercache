@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+- `lmcache-connector/`: an L2 connector for LMCache multiprocess mode, written in Rust and loaded
+  through LMCache's `native_plugin` type. Built separately with maturin. Tested on LMCache 0.5.5 and
+  0.5.6 and vLLM 0.31.0 and 0.33.0.
+- `commit_write` accepts `local_only` and `chunk_checksums`. A `LOCAL_ONLY` object is never flushed
+  to a backend and stays evictable. Both fields are optional on the wire; older clients are unaffected.
+- `locate` reports `sync_status` for HITs, so a reader can refuse an object that is still staged.
+- `DirectBlockWriter(direct_on_block_devices=True)` writes to raw block devices with O_DIRECT, falling
+  back to the page cache for anything it can't take. Off by default.
+- `benchmarks/pipelined_ttft.py`, `benchmarks/write_concurrency_probe.py`, `benchmarks/raw_write_probe.py` and
+  `benchmarks/results/lmcache_and_ttft.md`.
+- `benchmarks/lmcache_connector_direct.py`, `benchmarks/results/lmcache_rust_connector.md`,
+  `benchmarks/results/lmcache_rust_connector_xeon.md` and
+  `benchmarks/results/lmcache_rust_connector_nvme.md`.
+
 ### Fixes
 - Each object now starts on its own drive, chosen from a hash of its URI. Previously every object
   started on the first drive. Objects that don't fill a whole stripe left the last drives underused,
@@ -11,6 +26,18 @@
   objects load at 24884 MB/s (was 20740) and store at 18549 MB/s (was 16129).
 - Upgrading needs no migration. Objects already stored keep their placement and stay readable, and
   objects stored after the upgrade stay readable if you roll back. Existing objects aren't rebalanced.
+- `HyperCacheKVStore` commits are now `LOCAL_ONLY` unless `write_through` is set. Previously every
+  commit started a backend upload of prompt-derived data, ignoring `auto_flush_s3=False`, and a failed
+  upload left the block dirty and impossible to evict. Reads now treat staged blocks as misses.
+- `DirectBlockWriter` retries short writes instead of ignoring them, no longer copies each chunk, and
+  no longer leaks a file descriptor when two threads open the same device.
+
+### Docs
+- Corrected the pipelined loader claims. It does not shorten time to first token by itself: on a
+  15 GB model the change was between -3.4% and +1.1%, and the first layer took 880 ms, not milliseconds.
+- Fixed the pipelined loader README example, which did not match the API.
+- Removed the claims of LMCache and Dynamo KVBM readiness. LMCache now has a real adapter; Dynamo
+  KVBM has no integration.
 
 ## 0.9.3
 

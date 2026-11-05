@@ -1,0 +1,14 @@
+== w2_single
+rate 5000 rep0: alone 17741 MB/s, with lookups 17217 MB/s (-3.0% change), achieved 4999 keys/s
+rate 5000 rep1: alone 17769 MB/s, with lookups 17218 MB/s (-3.1% change), achieved 5001 keys/s
+rate 5000 rep2: alone 17779 MB/s, with lookups 17218 MB/s (-3.2% change), achieved 5000 keys/s
+rate 20000 rep0: alone 17764 MB/s, with lookups 16636 MB/s (-6.4% change), achieved 19229 keys/s
+rate 20000 rep1: alone 17800 MB/s, with lookups 16657 MB/s (-6.4% change), achieved 19281 keys/s
+rate 20000 rep2: alone 17763 MB/s, with lookups 16485 MB/s (-7.2% change), achieved 19133 keys/s
+== w4_batch
+rate 5000 rep0: alone 18121 MB/s, with lookups 17649 MB/s (-2.6% change), achieved 5000 keys/s
+rate 5000 rep1: alone 18191 MB/s, with lookups 17659 MB/s (-2.9% change), achieved 5000 keys/s
+rate 5000 rep2: alone 18121 MB/s, with lookups 17637 MB/s (-2.7% change), achieved 5000 keys/s
+rate 20000 rep0: alone 18150 MB/s, with lookups 16580 MB/s (-8.7% change), achieved 19998 keys/s
+rate 20000 rep1: alone 18279 MB/s, with lookups 16571 MB/s (-9.3% change), achieved 19999 keys/s
+rate 20000 rep2: alone 18222 MB/s, with lookups 16725 MB/s (-8.2% change), achieved 19999 keys/s

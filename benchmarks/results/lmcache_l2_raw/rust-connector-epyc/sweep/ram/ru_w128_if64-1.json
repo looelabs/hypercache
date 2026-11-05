@@ -1,0 +1,73 @@
+{
+  "title": "L2 Adapter Benchmark Result",
+  "metrics": {
+    "config": {
+      "l2_adapter_json": "{\"type\":\"native_plugin\",\"module_path\":\"hypercache_lmcache_native\",\"class_name\":\"HyperCacheNativeConnector\",\"adapter_params\":{\"namespace\":\"bench\",\"socket_path\":\"/run/hc/hc.sock\",\"tier\":\"ram\",\"num_workers\":128},\"max_capacity_gb\":0}",
+      "num_keys": 8,
+      "in_flight": 64,
+      "keys_per_round": 512,
+      "data_size_kb": 14336,
+      "data_per_round_mb": 7168.0,
+      "measurement_rounds": 16,
+      "warmup_rounds": 1,
+      "lookup_max_hit_rate": 0.0
+    },
+    "op_0": {
+      "operation": "Store",
+      "rounds": 16,
+      "rounds_timed_out": 0,
+      "keys_per_round": 512,
+      "total_keys": 8192,
+      "total_success": 8192,
+      "duration_avg_ms": 252.76,
+      "duration_min_ms": 250.52,
+      "duration_max_ms": 254.45,
+      "duration_p50_ms": 252.84,
+      "duration_p99_ms": 254.45,
+      "duration_std_ms": 0.81,
+      "throughput_avg_mbps": 28358.84,
+      "throughput_min_mbps": 28170.79,
+      "throughput_max_mbps": 28612.1,
+      "ops_per_sec_avg": 2025.63,
+      "latency_per_key_ms": 0.494
+    },
+    "op_1": {
+      "operation": "Lookup",
+      "rounds": 16,
+      "rounds_timed_out": 0,
+      "keys_per_round": 512,
+      "total_keys": 8192,
+      "total_success": 0,
+      "duration_avg_ms": 4.71,
+      "duration_min_ms": 4.61,
+      "duration_max_ms": 4.76,
+      "duration_p50_ms": 4.71,
+      "duration_p99_ms": 4.76,
+      "duration_std_ms": 0.04,
+      "throughput_avg_mbps": 0.0,
+      "throughput_min_mbps": 0.0,
+      "throughput_max_mbps": 0.0,
+      "ops_per_sec_avg": 108605.14,
+      "latency_per_key_ms": 0.009
+    },
+    "op_2": {
+      "operation": "Load",
+      "rounds": 16,
+      "rounds_timed_out": 0,
+      "keys_per_round": 512,
+      "total_keys": 8192,
+      "total_success": 8192,
+      "duration_avg_ms": 130.27,
+      "duration_min_ms": 129.81,
+      "duration_max_ms": 130.66,
+      "duration_p50_ms": 130.33,
+      "duration_p99_ms": 130.66,
+      "duration_std_ms": 0.28,
+      "throughput_avg_mbps": 55022.4,
+      "throughput_min_mbps": 54860.47,
+      "throughput_max_mbps": 55218.11,
+      "ops_per_sec_avg": 3930.17,
+      "latency_per_key_ms": 0.254
+    }
+  }
+}

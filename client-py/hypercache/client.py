@@ -54,6 +54,8 @@ class LocateResult:
     error_message: Optional[str] = None
     # Layout generation reported by the daemon (changes whenever the URI is re-ingested or rewritten)
     generation: Optional[int] = None
+    # Write status reported by daemons that support it, such as "STAGED" or "LOCAL_ONLY"
+    sync_status: Optional[str] = None
 
     @property
     def is_hit(self) -> bool:
@@ -242,6 +244,7 @@ class HyperCacheClient:
                 chunk_size=resp.get("chunk_size", 4194304),
                 chunk_layout=chunk_layout,
                 generation=resp.get("generation"),
+                sync_status=resp.get("sync_status"),
             )
         elif status == "MISS":
             return LocateResult(
@@ -426,10 +429,17 @@ class HyperCacheClient:
         uri: str,
         sha256: Optional[str] = None,
         write_through: bool = False,
+        local_only: bool = False,
+        chunk_checksums: Optional[List[int]] = None,
     ) -> bool:
         """
         Commits a staged write in the control plane, triggering background sync to S3 (write-back)
         or synchronously waiting for authoritative backend flush (write-through).
+
+        With local_only=True the object stays on this host: it is never flushed to a backend
+        and remains evictable. chunk_checksums records per-chunk CRC32 values for it, in layout
+        order. A daemon without local-only support ignores both and flushes the object,
+        so check get_write_status() for "LOCAL_ONLY" when that matters.
         """
         req = {
             "action": "commit_write",
@@ -438,6 +448,10 @@ class HyperCacheClient:
         }
         if sha256 is not None:
             req["sha256"] = sha256
+        if local_only:
+            req["local_only"] = True
+        if chunk_checksums is not None:
+            req["chunk_checksums"] = chunk_checksums
 
         # Commit hashes the staged data (when sha256 is given) and, for write-through, uploads it
         resp = self._send_request(req, timeout=self.ingest_timeout)
