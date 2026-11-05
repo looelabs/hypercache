@@ -25,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-const LOOKUP_WORKERS: usize = 2;
+const LOOKUP_WORKERS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -665,19 +665,24 @@ impl Worker {
         }
     }
 
-    /// A daemon failure fails the whole batch, which LMCache treats as all misses.
+    /// A daemon failure fails the whole batch, which LMCache treats as all misses. A malformed key
+    /// is a miss for that key alone.
     fn exists(&mut self, batch: &Batch, keys: &[String]) {
         let shared = self.shared.clone();
-        for (index, key) in keys.iter().enumerate() {
-            let Ok(uri) = shared.uri_for(key) else { continue };
-            match self.client.locate(&uri) {
-                Ok(location) if location.is_valid_block() => batch.results[index].store(1, SeqCst),
-                Ok(_) => {}
-                Err(error) => {
-                    record_failure(batch, format!("lookup failed: {error}"));
-                    return;
+        let (indexes, uris): (Vec<usize>, Vec<String>) = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| Some((index, shared.uri_for(key).ok()?)))
+            .unzip();
+        match self.client.locate_many(&uris) {
+            Ok(locations) => {
+                for (index, location) in indexes.into_iter().zip(locations) {
+                    if location.is_valid_block() {
+                        batch.results[index].store(1, SeqCst);
+                    }
                 }
             }
+            Err(error) => record_failure(batch, format!("lookup failed: {error}")),
         }
     }
 
@@ -945,6 +950,28 @@ mod tests {
     }
 
     const SIZE: usize = 14 * 1024 * 1024 + 123;
+
+    /// More keys than one write of lookups holds, mixing hits, misses, staged blocks and a bad key.
+    #[test]
+    fn large_lookup_reports_each_key_correctly() {
+        let daemon = FakeDaemon::start("largelookup", false);
+        let connector = daemon.connector("ns");
+        let long_key = |n: usize| format!("Qwen/test@00000000@0@{n:04x}ab");
+        let stored: Vec<String> = (0..300).step_by(3).map(long_key).collect();
+        let mut sources: Vec<Aligned> = stored.iter().map(|_| Aligned::new(&[7u8; 4096])).collect();
+        assert!(store(&connector, &stored, &mut sources).ok);
+
+        let mut staged = DaemonClient::new(daemon.socket.clone(), Duration::from_secs(5));
+        staged
+            .stage_write(&connector.uri(&long_key(1)).unwrap(), 4096, "nvme")
+            .unwrap();
+
+        let mut query: Vec<String> = (0..300).map(long_key).collect();
+        query[4] = "not-a-key".into();
+        let results = exists(&connector, &query);
+        let wanted: Vec<bool> = (0..300).map(|n| n % 3 == 0).collect();
+        assert_eq!(results, wanted);
+    }
 
     #[test]
     fn round_trip_with_partial_last_block() {
