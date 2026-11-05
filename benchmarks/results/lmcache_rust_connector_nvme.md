@@ -14,7 +14,7 @@ Measured 2026-11-04 on a rented bare-metal node with no GPU. Raw data is in `lmc
 - **The stripe fix matters most for small objects.** 2 MiB objects load 3.9 times as fast, because they used to land on one drive.
 - **On 4 drives, the connector matches the best `raw_block` result on RAID 0, and holds it.** `raw_block` on RAID 0 reached the same speed in 2 of 6 runs and got stuck near 15.2 GB/s in the other 4. The cause isn't known, and could be our array setup.
 - **No load returned wrong bytes** across crashes, restarts, corruption, eviction and a 30-minute soak.
-- **Lookups are slower than `raw_block`'s**, at about 2.6 ms against 0.9-1.0 ms on one drive.
+- **Lookups were slower than `raw_block`'s on this node**, at about 2.6 ms against 0.9-1.0 ms per round on one drive. A later change made them faster than `raw_block`'s on a Ryzen 5 5600, which hasn't been repeated on this node. See [lookup speed](#lookup-speed).
 - **Full-speed writes cut reads hard.** Most of that comes from the drives themselves. See [mixed reads and writes](#mixed-reads-and-writes).
 
 ## What the drives can do without HyperCache
@@ -93,6 +93,38 @@ These one-drive runs used the old daemon. With one drive, every object starts on
 | `raw_block` RAID 0, 2 drives, 32 workers | 10727 [10677-10794] | 9669 [9649-9701] | 3.9 |
 
 Don't read the stuck 15.2 GB/s runs as a general fault of RAID 0 or `raw_block`. It could come from either of those or from our array settings, and we didn't look for the cause. The comparison shows what we measured, without tuning `raw_block`'s setup.
+
+## Lookup speed
+
+The "Lookup ms" columns above came before this change. They time a whole round (`in_flight * 8` keys), and every lookup in them was a miss, because `--lookup-max-hit-rate` defaults to 0. Per key, that's about 20 µs for Rust against 7.6 µs for `raw_block` on this node, at any queue depth, drive count or worker count.
+
+**Cause:** the connector made one socket round trip per key, on 2 lookup workers. On the 5600, that accounted for about 80% of its lookup time. The connector now sends each batch's lookups in one write and uses 4 lookup workers. The daemon and its protocol didn't change.
+
+**Measured 2026-11-05 on a different machine:** Ryzen 5 5600 (6 cores), 31 GB RAM, Linux 6.8.0, LMCache 0.5.6, no drive involved because a lookup does no drive I/O. Objects were 224 KiB at 64 KiB per chunk, so each still has 4 chunks and a normal-length reply. Raw data is in `lmcache_l2_raw/rust-connector-lookup/`.
+
+µs per key, 8 keys per batch, median of 3 with the range in brackets, 30 rounds plus 5 warm-up:
+
+| Setup | 16 in flight, hits | 16 in flight, misses | 64 in flight, hits | 64 in flight, misses |
+|---|---|---|---|---|
+| Rust, 2 workers, one round trip per key (before) | 11.56 [10.00-11.88] | 9.84 [7.97-10.55] | 11.95 [10.78-12.44] | 9.77 [9.22-9.79] |
+| Rust, 4 workers, one round trip per key | 7.73 [7.34-7.73] | 6.48 [6.41-6.48] | 8.83 [8.65-9.24] | 6.33 [6.07-6.58] |
+| Rust, 2 workers, batched | 6.64 [5.31-6.88] | 4.69 [3.91-4.84] | 6.09 [5.86-6.46] | 4.82 [4.22-5.35] |
+| **Rust, 4 workers, batched (now)** | **3.75 [3.52-3.91]** | **2.58 [2.58-2.66]** | **3.69 [3.63-3.77]** | **2.36 [2.34-2.44]** |
+| `raw_block`, posix | 4.38 [4.30-4.38] | 4.06 [4.06-4.06] | 4.34 [4.26-4.59] | 3.91 [3.89-3.91] |
+| `fs_native`, page cache on | 4.69 [4.61-4.84] | 3.83 [3.52-3.91] | 4.75 [4.43-5.00] | 3.85 [3.83-3.96] |
+
+**Effect on loads:** one lookup batch at a time at a fixed rate, with loads limited by CPU on tmpfs, which is a worst case. Bursts of lookups weren't tested.
+
+| Lookups | Loads before, MB/s (change from loads alone) | Loads now, MB/s (change from loads alone) |
+|---|---|---|
+| 5,000 keys/s | 17218 (-3.1%) | 17649 (-2.7%) |
+| 20,000 keys/s | 16636 (-6.4%), reached about 19,200 keys/s | 16580 (-8.7%) |
+
+The two versions are about the same. The speed of loads alone moved by about 2% between sessions, which is similar in size to the differences here.
+
+**Safety on the final code:** run on the 5600, on loop devices on a RAM disk rather than real drives, with lower volumes to fit in RAM (256 objects, 4 GiB limits). The safety script passed 30 of 30 on LMCache 0.5.5 and 0.5.6, on 1 and 2 devices. All 19 failure tests passed. The 5 new ones cover lookups: each of 2,000 mixed batches returned the right result for every key, `kill -9` with and without saved metadata, a frozen daemon whose late replies must not answer later lookups, and deletes during lookups. No key that was never stored was ever reported as found. The upgrade test wasn't repeated, because the daemon didn't change.
+
+**Not known yet:** the speed on this EPYC node, where times were about twice as long before the change.
 
 ## Mixed reads and writes
 

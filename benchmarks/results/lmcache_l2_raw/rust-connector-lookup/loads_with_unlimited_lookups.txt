@@ -1,0 +1,16 @@
+== w2_single
+load_vs_lookup rep0: alone 18078 MB/s, with lookups 15897 MB/s (-12.1% change), lookups 36235 keys/s
+load_vs_lookup rep1: alone 18128 MB/s, with lookups 15906 MB/s (-12.3% change), lookups 36073 keys/s
+load_vs_lookup rep2: alone 18136 MB/s, with lookups 15901 MB/s (-12.3% change), lookups 36045 keys/s
+== w4_single
+load_vs_lookup rep0: alone 17646 MB/s, with lookups 14908 MB/s (-15.5% change), lookups 57954 keys/s
+load_vs_lookup rep1: alone 17685 MB/s, with lookups 15059 MB/s (-14.9% change), lookups 58164 keys/s
+load_vs_lookup rep2: alone 18107 MB/s, with lookups 14960 MB/s (-17.4% change), lookups 58022 keys/s
+== w2_batch
+load_vs_lookup rep0: alone 18195 MB/s, with lookups 13847 MB/s (-23.9% change), lookups 113232 keys/s
+load_vs_lookup rep1: alone 18197 MB/s, with lookups 13683 MB/s (-24.8% change), lookups 111435 keys/s
+load_vs_lookup rep2: alone 18206 MB/s, with lookups 14112 MB/s (-22.5% change), lookups 115467 keys/s
+== w4_batch
+load_vs_lookup rep0: alone 18429 MB/s, with lookups 12326 MB/s (-33.1% change), lookups 176048 keys/s
+load_vs_lookup rep1: alone 18490 MB/s, with lookups 12209 MB/s (-34.0% change), lookups 174833 keys/s
+load_vs_lookup rep2: alone 18506 MB/s, with lookups 12123 MB/s (-34.5% change), lookups 174900 keys/s
