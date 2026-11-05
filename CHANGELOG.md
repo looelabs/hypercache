@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.9.4
+
+Faster loads and stores for objects that don't fill a whole stripe.
 
 ### Fixes
 - Each object now starts on its own drive, chosen from a hash of its URI. Previously every object
@@ -11,6 +13,10 @@
   objects load at 24884 MB/s (was 20740) and store at 18549 MB/s (was 16129).
 - Upgrading needs no migration. Objects already stored keep their placement and stay readable, and
   objects stored after the upgrade stay readable if you roll back. Existing objects aren't rebalanced.
+- CI: the bare-metal e2e script loaded its client from the checkout, which uid 1000 can't read on a
+  GitHub runner. It now runs the client from a world-readable work dir.
+- Release: `release.yml` now stops before building or publishing if the release tag doesn't match
+  the version files.
 
 ## 0.9.3
 
