@@ -7,18 +7,42 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to create/update on GitHub Releases (e.g. v0.9.3)"
+        description: "Release tag to create/update on GitHub Releases (e.g. v0.9.4)"
         required: false
-        default: "v0.9.3"
+        default: "v0.9.4"
 
 permissions:
   contents: write
   packages: write
 
 jobs:
+  check-release-tag:
+    name: Check tag matches version files
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Tags can't be moved or deleted, and every later job publishes, so stop here on a mismatch.
+      - name: Compare the release tag with the version files
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          cargo_v=$(grep -m1 '^version' control-plane/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          py_v=$(grep -m1 '^version' client-py/pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          init_v=$(grep -m1 '__version__' client-py/hypercache/__init__.py | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=$RELEASE_TAG Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v"
+          for version in "$cargo_v" "$py_v" "$init_v"; do
+            if [ "$RELEASE_TAG" != "v$version" ]; then
+              echo "::error::Release tag $RELEASE_TAG does not match version $version"
+              exit 1
+            fi
+          done
+
   build-linux-binaries:
     name: Build Linux x86_64 Binaries
     runs-on: ubuntu-22.04
+    needs: check-release-tag
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
