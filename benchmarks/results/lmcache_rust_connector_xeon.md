@@ -6,7 +6,7 @@ Measured 2026-11-03 on a rented cloud VM. Raw data is in `lmcache_l2_raw/rust-co
 
 **Hardware:** Xeon 6776P (KVM guest, 24 vCPUs), 214 GB RAM, RTX PRO 6000 Blackwell (97,887 MiB), 4 virtio network disks of 2.3-2.4 TiB, sold as capped at 2 GB/s each.
 
-**Software:** Linux 6.11.0, LMCache 0.5.6, vLLM 0.33.0, Python 3.12.3, rustc 1.99.1, HyperCache 0.9.3 plus this change.
+**Software:** Linux 6.11.0, LMCache 0.5.6, vLLM 0.33.0 (whose image can't load LMCache's GPU kernels; see the output section), Python 3.12.3, rustc 1.99.1, HyperCache 0.9.3 plus this change.
 
 **Method:** `lmcache bench l2`, 14 MiB objects (one 256-token Qwen2.5-7B chunk), 8 keys per task, L1 aligned to 4 KiB, order shuffled, median of 3 runs with the range in brackets. Every run was checked for the expected key count; all succeeded with no timeouts. CPU is user plus system time for the whole bench process, including the bench's own work, and excludes the daemon. The disks can't discard, so runs overwrite earlier data instead of starting wiped.
 
@@ -90,23 +90,36 @@ Qwen2.5-7B-Instruct-AWQ, revision b250375, 4 drives, a prompt that fills 37 chun
 
 Why the repeat in L1 differs by connector wasn't investigated. This GPU computes the prompt quickly, so the cache saves far less time than on the earlier server, where a cold run took 3.5 s.
 
-## Open issue: output sometimes differs after a cache hit
+## Output differs after a cache hit: cause found
 
-The same prompt at temperature 0 didn't always return the same text. Runs where any answer differed:
+On this VM, answers at temperature 0 often changed when LMCache served the prompt from its cache, with or without HyperCache. **The cause is in the `vllm/vllm-openai:v0.33.0` image, not in HyperCache.** The image ships LMCache 0.5.6 with a `cuda_ops` extension built for a different torch than the image's torch 2.14, so it fails to load (`undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb`). LMCache then logs one warning, "lmcache.cuda_ops compiled extension not found; CudaDeviceOps stays on the torch baseline for all ops", and copies KV data with plain torch ops instead. That fallback changes the answers. The warning is in this run's LMCache logs, which are kept outside git. LMCache [#6673](https://github.com/LMCache/LMCache/issues/6673) reports the same effect on another model and traces it to the fallback's copy not waiting for the kernel that fills it, so stores can save stale KV data. That root cause is theirs; it wasn't checked here.
 
-| Setup | Runs that differed |
-|---|---|
-| No cache, 6 requests | 0 of 2 |
-| vLLM's own prefix cache only, 6 requests | 0 of 2 |
-| LMCache L1 only, no HyperCache, 6 requests | 1 of 2 |
-| LMCache with Rust connector, first test | 2 of 3 |
-| LMCache with Python adapter, first test | 2 of 3 |
-| LMCache with Rust connector, second test, 5 requests | 1 of 3 |
-| LMCache with Python adapter, second test, 5 requests | 0 of 3 |
+**On this VM**, 25 different prompts of about 8,700 tokens, each sent cold, repeated straight away (served from LMCache L1), then sent again after the others (served from the drives on the Rust run). Answers that differed from the cold answer:
 
-- **It happens with no HyperCache in the path,** and it isn't specific to either connector. No checksum errors appeared in the second test's logs.
-- In the two runs of the second test and the L1-only test that differed, the first request gave the usual answer and every cached request gave the same other answer. Both answers read normally: "...and storage location on one of 3..." against "...and stored on one of 37...".
-- **Cause not found.** Rounding differences between a full computation and a cached one could explain it, but that isn't shown, and nor is a bug in LMCache or vLLM ruled out. The earlier server, on vLLM 0.31.0 and LMCache 0.5.5, gave identical output in the runs recorded, which were few.
+| Setup | Repeat, from L1 | Second pass | Repeat against second pass |
+|---|---|---|---|
+| No cache | 0 of 25 | 0 of 25 | 0 of 25 |
+| vLLM's prefix cache | 0 of 25 | 0 of 25 | 0 of 25 |
+| LMCache L1, no HyperCache | 25 of 25 | 0 of 25 (L1 had dropped it, so recomputed) | 25 of 25 |
+| LMCache and Rust connector | 25 of 25 | 25 of 25 (from the drives) | 0 of 25 |
+
+Answers loaded from the drives matched answers loaded from L1 exactly, so HyperCache returned the bytes LMCache stored. If those bytes were already wrong when stored, the drives keep them wrong, including after the fallback is fixed. Per-prompt tokens and log-probabilities are in `lmcache_l2_raw/rust-connector-xeon/det2/`.
+
+**Proof, on a second machine** (EPYC 7443 and RTX 4060 Ti 16 GB, one Samsung Gen4 drive, same model and prompts, 2026-11-22). Every run on vLLM 0.31.0, torch 2.13:
+
+| LMCache | `cuda_ops` | LMCache L1: repeats that differed | Rust connector with `VLLM_BATCH_INVARIANT=1` |
+|---|---|---|---|
+| 0.5.5, from the image | loads | 1 of 25, a near-tie | 0 of 25 |
+| 0.5.6, from PyPI | loads | 1 of 25, a near-tie | 0 of 25 |
+| 0.5.6 with `cuda_ops` deleted | missing | 24 of 25 | not run |
+
+- **LMCache 0.5.6's own code is fine.** With working kernels it matches 0.5.5. Removing the kernels from a working setup brings the difference back.
+- **Nothing points to vLLM 0.33.0 itself.** vLLM 0.31.0 with the fallback differs as much as vLLM 0.33.0 does. vLLM 0.33.0 with working kernels couldn't be tested, because neither LMCache wheel on PyPI loads its kernels under torch 2.14.
+- **A near-tie** is a token where the top two choices were 0.016 apart in log-probability: ordinary rounding. In the fallback runs, most changed answers differ from the first generated token, and in 1 or 2 of 25 the new token wasn't among the cold run's top 5.
+- **The drives on the second machine.** With a 1.5 GB L1, the second pass loaded every chunk from the drive, with no failed stores. In four sessions over both version sets, drive-loaded answers had the same tokens as L1-loaded answers on 99 of 100 prompts. The other was a near-tie on vLLM 0.33.0 with batch invariance. On vLLM 0.31.0 with batch invariance, the log-probabilities matched exactly too, on 25 of 25. Without it they drifted by up to 0.038, which batching alone can cause.
+- **Not checked here:** the root cause given in #6673, and how often the changed answers are wrong rather than reworded. #6673 saw clearly corrupt answers with a larger model.
+
+**What to do:** check the LMCache server log for that warning, or run `python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"` in the LMCache environment, which prints `None` when the kernels load. The connector also prints a warning at startup when they don't. Use a setup where they load: vLLM 0.31.0 with LMCache 0.5.5, or the vLLM 0.33.0 image with LMCache 0.5.7.post1 from PyPI. On the second machine, that 0.33.0 setup gave 1 of 25 near-ties with L1 only. With the Rust connector and loads from the drive, 3 of 25 answers differed: two near-ties and one with a gap of 1.6. With batch invariance, 0 of 25 differed. The connector's safety tests haven't been run on 0.5.7 yet. Then change the connector's `namespace`, because chunks stored during the fallback may be wrong.
 
 ## Safety checks
 

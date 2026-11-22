@@ -38,6 +38,24 @@ pip install target/wheels/hypercache_lmcache_native-*.whl
 | `timeout_s` | Daemon request timeout in seconds (default 30). Commits get at least 300. |
 | `max_capacity_gb` | Keep at 0. The daemon owns capacity and evicts under pressure. |
 
+## Check LMCache's GPU kernels first
+
+LMCache copies KV data between the GPU and its memory tier with compiled kernels in `lmcache.cuda_ops`. If they don't load, LMCache falls back to plain torch ops and logs a single warning:
+
+```
+lmcache.cuda_ops compiled extension not found; CudaDeviceOps stays on the torch baseline for all ops.
+```
+
+With that fallback, answers at temperature 0 changed after a cache hit on 24 or 25 of 25 test prompts, with or without HyperCache. LMCache [#6673](https://github.com/LMCache/LMCache/issues/6673) traces it to the fallback's copy not waiting for the GPU kernel that fills it, so a store can save stale KV data. HyperCache then keeps exactly those bytes, so **anything stored while the fallback was active may be wrong, and stays wrong after the fix**: change `namespace` once the kernels load. It happens in the `vllm/vllm-openai:v0.33.0` image, whose LMCache 0.5.6 was built for torch 2.13 while the image has 2.14. See `benchmarks/results/lmcache_rust_connector_xeon.md`.
+
+Check before going live, in the environment that runs the LMCache server, with a GPU visible:
+
+```sh
+python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"
+```
+
+It prints `None` when the kernels load, and the reason when they don't. The connector runs the same check at startup and prints a warning to stderr on a problem. It does not stop LMCache from starting. Fix it with an LMCache build that matches the installed torch. vLLM 0.31.0 with LMCache 0.5.5 is a tested pair whose answers matched. In the vLLM 0.33.0 image, LMCache 0.5.7.post1 from PyPI loads its kernels, and with batch invariance cached answers matched cold answers on 25 of 25. The connector's safety tests haven't been run on 0.5.7 yet.
+
 ## What isn't supported
 
 - `list_l2_keys` and LMCache's IsolatedLRU quotas.

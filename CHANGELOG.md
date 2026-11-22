@@ -5,7 +5,9 @@
 ### Added
 - `lmcache-connector/`: an L2 connector for LMCache multiprocess mode, written in Rust and loaded
   through LMCache's `native_plugin` type. Built separately with maturin. Tested on LMCache 0.5.5 and
-  0.5.6 and vLLM 0.31.0 and 0.33.0.
+  0.5.6 and vLLM 0.31.0 and 0.33.0. At startup it warns when LMCache's compiled GPU kernels
+  (`lmcache.cuda_ops`) don't load, as in the `vllm/vllm-openai:v0.33.0` image: LMCache's torch
+  fallback changed model output after a cache hit. `check_lmcache_gpu_ops()` runs the same check.
 - `commit_write` accepts `local_only` and `chunk_checksums`. A `LOCAL_ONLY` object is never flushed
   to a backend and stays evictable. Both fields are optional on the wire; older clients are unaffected.
 - `locate` reports `sync_status` for HITs, so a reader can refuse an object that is still staged.

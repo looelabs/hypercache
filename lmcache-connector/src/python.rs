@@ -84,6 +84,55 @@ fn runtime_error(error: std::io::Error) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+/// Why LMCache's compiled GPU copy kernels can't be used, or None when they load or don't apply.
+/// Without them LMCache falls back to plain torch ops with a single log line. That fallback can
+/// store stale KV data (LMCache issue #6673), which then changes answers after a cache hit, so the
+/// connector says so loudly.
+fn lmcache_gpu_ops_problem(py: Python<'_>) -> PyResult<Option<String>> {
+    let find_spec = py.import("importlib.util")?.getattr("find_spec")?;
+    if find_spec.call1(("lmcache",))?.is_none() {
+        return Ok(None);
+    }
+    let error = match py.import("lmcache.cuda_ops") {
+        Ok(_) => return Ok(None),
+        Err(error) => error,
+    };
+    // Only CUDA builds have these kernels. Without torch or a CUDA GPU there is nothing to check.
+    let Ok(torch) = py.import("torch") else {
+        return Ok(None);
+    };
+    let cuda = torch.getattr("cuda")?.call_method0("is_available")?.extract::<bool>()?;
+    let hip = !torch.getattr("version")?.getattr("hip")?.is_none();
+    if !cuda || hip {
+        return Ok(None);
+    }
+    let torch_version: String = torch.getattr("__version__")?.extract()?;
+    Ok(Some(format!(
+        "lmcache.cuda_ops failed to load under torch {torch_version}: {}",
+        error.value(py)
+    )))
+}
+
+/// Checks that LMCache's compiled GPU copy kernels load. Returns None when they do, or the reason
+/// they don't. The connector runs this at startup and prints a warning on a problem.
+#[pyfunction]
+fn check_lmcache_gpu_ops(py: Python<'_>) -> PyResult<Option<String>> {
+    lmcache_gpu_ops_problem(py)
+}
+
+fn warn_on_lmcache_gpu_ops(py: Python<'_>) {
+    match lmcache_gpu_ops_problem(py) {
+        Ok(None) => {}
+        Ok(Some(problem)) => eprintln!(
+            "hypercache connector: WARNING: {problem}. LMCache is using its torch fallback for GPU \
+             copies, which can store wrong KV data and change model output after a cache hit \
+             (LMCache issue #6673). Install an LMCache build that matches this torch version. KV \
+             data stored while this warning showed may be wrong: after the fix, use a new namespace."
+        ),
+        Err(error) => eprintln!("hypercache connector: could not check lmcache.cuda_ops: {error}"),
+    }
+}
+
 /// Stores LMCache objects in HyperCache. Load it through LMCache's `native_plugin` adapter type.
 #[pyclass(module = "hypercache_lmcache_native")]
 struct HyperCacheNativeConnector {
@@ -95,6 +144,7 @@ impl HyperCacheNativeConnector {
     #[new]
     #[pyo3(signature = (namespace, socket_path=None, tier="nvme", num_workers=32, timeout_s=30.0))]
     fn new(
+        py: Python<'_>,
         namespace: &str,
         socket_path: Option<&str>,
         tier: &str,
@@ -104,6 +154,7 @@ impl HyperCacheNativeConnector {
         if !(timeout_s.is_finite() && timeout_s > 0.0) {
             return Err(PyValueError::new_err("timeout_s must be above zero"));
         }
+        warn_on_lmcache_gpu_ops(py);
         let config = Config {
             namespace: namespace.to_string(),
             socket_path: socket_path.map(PathBuf::from).unwrap_or_else(default_socket_path),
@@ -185,6 +236,7 @@ impl HyperCacheNativeConnector {
 #[pymodule]
 fn hypercache_lmcache_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<HyperCacheNativeConnector>()?;
+    module.add_function(wrap_pyfunction!(check_lmcache_gpu_ops, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
