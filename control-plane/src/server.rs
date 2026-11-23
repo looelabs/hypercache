@@ -120,6 +120,17 @@ impl Server {
         }
     }
 
+    /// Clean shutdown: stop skipping flushes for local-only commits, flush every device, write the
+    /// manifest, and only then remove the unflushed marker. Any error leaves the marker in place, so
+    /// the next start drops local-only entries instead of trusting them.
+    pub async fn shutdown_cleanly(&self) -> anyhow::Result<()> {
+        self.metadata.stop_skipping_local_only_flush();
+        let devices = self.metadata.allocated_devices();
+        self.ingestion.striper().sync_devices(&devices).await?;
+        self.metadata.flush_to_disk().await?;
+        self.metadata.clear_unflushed_marker()
+    }
+
     pub fn metadata(&self) -> &MetadataStore {
         &self.metadata
     }
@@ -656,8 +667,13 @@ impl Server {
             error!("Commit of '{}' rejected: {:#}", uri, e);
             return Response::error(format!("{:#}", e));
         }
-        if let Err(e) = self.ingestion.striper().sync_chunks(&meta.chunk_layout).await {
-            return Response::error(format!("Failed to flush staged data to stable storage: {:#}", e));
+        // Local-only data (KV cache) can be recomputed, so it skips the device flush while the
+        // unflushed marker guarantees that a restart after an unclean stop drops it instead of
+        // trusting it (see `metadata::unflushed_marker_path`).
+        if !self.metadata.skip_local_only_flush() {
+            if let Err(e) = self.ingestion.striper().sync_chunks(&meta.chunk_layout).await {
+                return Response::error(format!("Failed to flush staged data to stable storage: {:#}", e));
+            }
         }
         // With a digest, the daemon hashes the staged data itself and records its own CRCs. Any
         // CRCs the client also sent must then agree with what is really on the device.

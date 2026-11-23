@@ -36,7 +36,7 @@ exclude_root_device = true
 storage_backing_mode = "raw_block"
 chunk_size_bytes = 4194304
 device_start_offset_bytes = 4096
-metadata_persistence_enabled = true    # keep the KV cache across daemon restarts
+metadata_persistence_enabled = true    # keep the KV cache across clean daemon restarts
 agent_enabled = false
 metrics_enabled = false
 ram_cache_enabled = false
@@ -145,6 +145,7 @@ It prints `None` when the kernels load, and the reason when they don't. The conn
 
 - Any doubt about a block is a miss. Lookup only accepts committed local-only blocks with a checksum for every chunk, and load verifies every chunk before reporting success.
 - If the daemon restarts, the connector reconnects by itself. A request that couldn't be sent is resent once, and one the daemon may have received is never resent, so it reports a failure.
+- The daemon does not flush the drive's write cache for KV blocks, because a lost block only costs a recompute. A clean stop (SIGINT or SIGTERM) flushes the drives and keeps every block. After a crash, `kill -9` or power cut, the next start drops every KV block, so they are misses rather than data that may never have reached the drive. Checkpoints and other objects still flush on every commit.
 - Blocks are never flushed to a backend. Against an older daemon, stores fail before any data is written and lookups miss. Support is checked again on every new connection, because a restarted daemon may be a different version, and a commit only counts when the daemon confirms `LOCAL_ONLY`.
 - A commit names the layout this connector staged, so if another writer replaced the block in between, the daemon refuses it and the store fails.
 - Two stores of the same block in one process run one after the other, and each reports its real outcome. A block already stored counts only if its size and layout match.

@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+use super::flush_gate::{FlushFn, FlushGate};
 use crate::config::Config;
 use crate::metadata::MetadataStore;
 use crate::protocol::{ChunkDescriptor, StorageTier};
@@ -24,6 +25,8 @@ pub struct Striper {
     ram_pool: Option<Arc<RamMemoryPool>>,
     // Write handles per device, reused across chunks instead of reopening per write
     device_files: Arc<Mutex<HashMap<String, Arc<File>>>>,
+    // One flush gate per device, so concurrent commits share device flushes (group commit)
+    flush_gates: Arc<Mutex<HashMap<String, Arc<FlushGate>>>>,
 }
 
 impl Striper {
@@ -33,6 +36,7 @@ impl Striper {
             metadata,
             ram_pool,
             device_files: Arc::new(Mutex::new(HashMap::new())),
+            flush_gates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -96,7 +100,8 @@ impl Striper {
 
     /// Flushes device write caches for every NVMe device referenced by `chunks`. Must be
     /// called before a layout is published so a crash can never leave the manifest pointing
-    /// at blocks whose data never reached stable storage.
+    /// at blocks whose data never reached stable storage. Concurrent callers share flushes
+    /// (see `flush_gate`), and each still waits for a flush that started after it was called.
     pub async fn sync_chunks(&self, chunks: &[ChunkDescriptor]) -> Result<()> {
         let mut devices: Vec<String> = chunks
             .iter()
@@ -107,10 +112,24 @@ impl Striper {
         devices.dedup();
         for dev in devices {
             let file = self.open_device(&dev)?;
-            tokio::task::spawn_blocking(move || file.sync_data())
+            let gate = Arc::clone(self.flush_gates.lock().unwrap().entry(dev.clone()).or_default());
+            let flush: FlushFn = Arc::new(move || file.sync_data());
+            gate.flush(flush)
                 .await
-                .context("Device sync task panicked")?
-                .with_context(|| format!("Failed to sync device {}", dev))?;
+                .map_err(|e| anyhow::anyhow!("Failed to sync device {}: {}", dev, e))?;
+        }
+        Ok(())
+    }
+
+    /// Flushes the given devices (used at shutdown for every device that holds allocations).
+    pub async fn sync_devices(&self, devices: &[String]) -> Result<()> {
+        for dev in devices {
+            let file = self.open_device(dev)?;
+            let gate = Arc::clone(self.flush_gates.lock().unwrap().entry(dev.clone()).or_default());
+            let flush: FlushFn = Arc::new(move || file.sync_data());
+            gate.flush(flush)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to sync device {}: {}", dev, e))?;
         }
         Ok(())
     }

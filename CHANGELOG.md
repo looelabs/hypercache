@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Faster stores for KV cache and for many small commits.
+
+### Changed
+- KV cache blocks (`LOCAL_ONLY` commits, used by the LMCache connector and `HyperCacheKVStore`) no
+  longer wait for a device flush. A lost block only costs a recompute, so instead of flushing every
+  commit the daemon keeps a marker file next to the manifest while it runs. A clean shutdown
+  (SIGINT or SIGTERM) flushes every device and removes it; a start that finds it (after a crash,
+  `kill -9` or power cut) drops every KV block, which become misses. Checkpoints and other objects
+  still flush before their commit returns.
+- Concurrent commits share device flushes (group commit). Each commit still returns only after a
+  flush that started after it arrived, so their durability is unchanged.
+- LMCache L2 benchmark on one Gen4 drive (EPYC 7443, LMCache 0.5.7.post1, connector 0.10.0), stores
+  in GB/s, 0.10.0 -> this release: 2 MiB blocks 2.03 -> 3.18, 6 MiB 2.72 -> 3.25, 14 MiB 2.98 -> 3.28,
+  level with LMCache's `raw_block` (3.18-3.24) and `fs_native` (3.10-3.23), which never flush.
+
+### Upgrading
+- No configuration change is needed. KV blocks stored by 0.10.0 are kept after the upgrade.
+- KV blocks no longer survive a crash or power cut, only a clean stop.
+- Before rolling back to 0.10.0 after a crash, start this release once and stop it cleanly: 0.10.0
+  ignores the marker and would keep KV blocks whose data may not have been flushed.
+
 ### Docs
 - The hardware requirements now say to use identical drives. HyperCache stripes evenly, so the
   slowest drive sets the speed, and performance with mixed drives isn't guaranteed.

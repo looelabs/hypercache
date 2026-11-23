@@ -187,6 +187,26 @@ struct Inner {
     reclaim_grace_ms: AtomicU64,
     metrics: Option<Arc<MetricsState>>,
     persister: Option<Persister>,
+    /// True while `LOCAL_ONLY` commits may skip the device flush: always without a manifest (nothing
+    /// survives a restart), otherwise only while the unflushed marker is in place.
+    skip_local_only_flush: AtomicBool,
+}
+
+/// The marker that says `LOCAL_ONLY` data may not have reached stable storage. It exists while the
+/// daemon runs and is removed only after a clean shutdown has flushed every device. A daemon that
+/// finds it at startup did not stop cleanly, so it drops every `LOCAL_ONLY` entry instead of trusting
+/// data that a power cut may have lost.
+pub fn unflushed_marker_path(manifest_path: &Path) -> PathBuf {
+    manifest_path.with_extension("local-only-unflushed")
+}
+
+fn fsync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("Failed to sync directory {:?}", parent))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -209,6 +229,7 @@ impl MetadataStore {
             max_capacity_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
         );
 
+        let skip_local_only_flush = AtomicBool::new(persistence_path.is_none());
         let inner = Arc::new(Inner {
             entries_mirror: Mutex::new(HashMap::new()),
             local_alloc: Mutex::new(HashMap::new()),
@@ -224,6 +245,7 @@ impl MetadataStore {
                 write_lock: tokio::sync::Mutex::new(()),
                 writer_started: AtomicBool::new(false),
             }),
+            skip_local_only_flush,
         });
 
         let listener_inner: Weak<Inner> = Arc::downgrade(&inner);
@@ -620,6 +642,56 @@ impl MetadataStore {
         }
     }
 
+    /// Whether a `LOCAL_ONLY` commit may skip the device flush (see `unflushed_marker_path`).
+    pub fn skip_local_only_flush(&self) -> bool {
+        self.inner.skip_local_only_flush.load(Ordering::SeqCst)
+    }
+
+    /// Creates the unflushed marker durably, then lets `LOCAL_ONLY` commits skip the device flush.
+    /// Must run before the daemon serves requests. On error the flag stays off and every commit keeps
+    /// flushing.
+    pub fn arm_unflushed_marker(&self) -> Result<()> {
+        let Some(ref persister) = self.inner.persister else {
+            return Ok(());
+        };
+        let marker = unflushed_marker_path(&persister.path);
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("Failed to create {:?}", parent))?;
+        }
+        std::fs::File::create(&marker)
+            .and_then(|f| f.sync_all())
+            .with_context(|| format!("Failed to create {:?}", marker))?;
+        fsync_parent_dir(&marker)?;
+        self.inner.skip_local_only_flush.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// First step of a clean shutdown: from here on every `LOCAL_ONLY` commit flushes again, so a
+    /// device flush that starts after this call covers every commit that skipped one.
+    pub fn stop_skipping_local_only_flush(&self) {
+        self.inner.skip_local_only_flush.store(false, Ordering::SeqCst);
+    }
+
+    /// Last step of a clean shutdown, after every device was flushed and the manifest written.
+    pub fn clear_unflushed_marker(&self) -> Result<()> {
+        let Some(ref persister) = self.inner.persister else {
+            return Ok(());
+        };
+        let marker = unflushed_marker_path(&persister.path);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => fsync_parent_dir(&marker),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("Failed to remove {:?}", marker)),
+        }
+    }
+
+    /// Devices that hold or held NVMe allocations, for the shutdown flush.
+    pub fn allocated_devices(&self) -> Vec<String> {
+        let mut devices: Vec<String> = self.inner.local_alloc.lock().unwrap().keys().cloned().collect();
+        devices.sort();
+        devices
+    }
+
     fn delete_ram_chunks(inner: &Inner, chunks: &[ChunkDescriptor]) {
         let maybe_pool = inner.ram_pool.read().unwrap().clone();
         for chunk in chunks.iter().filter(|c| c.tier == StorageTier::Ram) {
@@ -941,10 +1013,44 @@ impl MetadataStore {
             }
         }
 
-        let manifest = match loaded_manifest {
+        let mut manifest = match loaded_manifest {
             Some(m) => m,
             None => return Ok(None),
         };
+
+        // The previous daemon did not stop cleanly, so LOCAL_ONLY data may never have reached the
+        // drives: drop those entries and return their space. They become misses.
+        if unflushed_marker_path(path).exists() {
+            let dropped = std::mem::take(&mut manifest.local_only_entries);
+            for pool in manifest.free_pools.values_mut() {
+                pool.normalize();
+            }
+            let mut dropped_bytes = 0u64;
+            for meta in dropped.values() {
+                dropped_bytes += meta.object_size;
+                for chunk in &meta.chunk_layout {
+                    if chunk.tier == StorageTier::Ram {
+                        let _ = std::fs::remove_file(&chunk.device);
+                    } else {
+                        Self::free_extent_locked(
+                            &mut manifest.free_pools,
+                            &mut manifest.local_alloc,
+                            &chunk.device,
+                            chunk.offset,
+                            Self::align_up_4k(chunk.length.max(4096)),
+                        );
+                    }
+                }
+            }
+            if !dropped.is_empty() {
+                warn!(
+                    "The previous daemon did not stop cleanly: dropped {} local-only object(s) ({} bytes), \
+                     such as KV cache blocks, whose data may not have been flushed. They will be misses.",
+                    dropped.len(),
+                    dropped_bytes
+                );
+            }
+        }
 
         let store = Self::new(max_capacity_bytes, metrics.clone(), Some(path.to_path_buf()));
 
@@ -1873,6 +1979,97 @@ mod tests {
             Some(SyncStatus::Committed)
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A daemon that did not stop cleanly leaves the unflushed marker; the next start must drop
+    /// every local-only object (its data may never have been flushed) and keep everything else.
+    #[tokio::test]
+    async fn test_unclean_restart_drops_local_only_entries() {
+        let path = temp_manifest_path("unclean");
+        let store = MetadataStore::new(1 << 30, None, Some(path.clone()));
+        assert!(!store.skip_local_only_flush(), "must flush until the marker is armed");
+        store.arm_unflushed_marker().unwrap();
+        assert!(store.skip_local_only_flush());
+        assert!(unflushed_marker_path(&path).exists());
+
+        let kv_off = store.allocate_chunk_offset("/dev/r0", 8192, 4096).await.unwrap();
+        let ck_off = store.allocate_chunk_offset("/dev/r0", 4096, 4096).await.unwrap();
+        let kv = "hypercache://kv_cache/ns/m/0/0/_/ab.kv";
+        let ck = "hypercache://checkpoints/step1.bin";
+        store
+            .save_layout_with_status(
+                kv,
+                8192,
+                4194304,
+                vec![nvme_crc("/dev/r0", kv_off, 8192)],
+                Some(SyncStatus::LocalOnly),
+            )
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                ck,
+                4096,
+                4194304,
+                vec![nvme_crc("/dev/r0", ck_off, 4096)],
+                Some(SyncStatus::Committed),
+            )
+            .await
+            .unwrap();
+        store.flush_to_disk().await.unwrap();
+        drop(store); // crash: the marker stays
+
+        let (reloaded, count, _) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(reloaded.get_sync_status(kv).await.unwrap(), None);
+        assert_eq!(reloaded.get_sync_status(ck).await.unwrap(), Some(SyncStatus::Committed));
+        // The dropped object's space is free again
+        assert_eq!(
+            reloaded.allocate_chunk_offset("/dev/r0", 8192, 4096).await.unwrap(),
+            kv_off
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// After a clean shutdown (devices flushed, manifest written, marker removed) local-only objects
+    /// survive a restart.
+    #[tokio::test]
+    async fn test_clean_shutdown_keeps_local_only_entries() {
+        let path = temp_manifest_path("cleanstop");
+        let store = store_with_dirty_and_local_only(&path).await;
+        store.arm_unflushed_marker().unwrap();
+        store.stop_skipping_local_only_flush();
+        assert!(!store.skip_local_only_flush());
+        store.flush_to_disk().await.unwrap();
+        store.clear_unflushed_marker().unwrap();
+        assert!(!unflushed_marker_path(&path).exists());
+        drop(store);
+
+        let (reloaded, count, _) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            reloaded
+                .get_sync_status("hypercache://kv_cache/ns/m/0/0/_/ab.kv")
+                .await
+                .unwrap(),
+            Some(SyncStatus::LocalOnly)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Without a manifest nothing survives a restart, so local-only commits never need a flush.
+    #[tokio::test]
+    async fn test_no_persistence_skips_local_only_flush() {
+        let store = MetadataStore::new(1 << 30, None, None);
+        assert!(store.skip_local_only_flush());
+        store.arm_unflushed_marker().unwrap();
+        assert!(store.skip_local_only_flush());
     }
 
     #[tokio::test]
