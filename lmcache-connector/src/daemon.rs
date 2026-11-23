@@ -83,6 +83,9 @@ pub struct DaemonClient {
     commit_timeout: Duration,
     stream: Option<BufReader<UnixStream>>,
     line: String,
+    /// Set once the daemon on the current connection has shown it understands local-only
+    /// commits. Cleared on every new connection, because the daemon behind it may have changed.
+    local_only_verified: bool,
 }
 
 impl DaemonClient {
@@ -95,7 +98,17 @@ impl DaemonClient {
             commit_timeout,
             stream: None,
             line: String::new(),
+            local_only_verified: false,
         }
+    }
+
+    /// True when the daemon on the current connection has shown local-only support.
+    pub fn local_only_verified(&self) -> bool {
+        self.stream.is_some() && self.local_only_verified
+    }
+
+    pub fn mark_local_only_verified(&mut self) {
+        self.local_only_verified = self.stream.is_some();
     }
 
     fn request(&mut self, body: &Value, timeout: Duration) -> io::Result<Response> {
@@ -146,6 +159,7 @@ impl DaemonClient {
 
     fn send(&mut self, message: &[u8], timeout: Duration) -> io::Result<()> {
         if self.stream.is_none() {
+            self.local_only_verified = false;
             self.stream = Some(BufReader::new(UnixStream::connect(&self.socket_path)?));
         }
         let reader = self.stream.as_mut().expect("connected above");
@@ -206,24 +220,55 @@ impl DaemonClient {
         Ok(response)
     }
 
-    pub fn commit_local_only(&mut self, uri: &str, checksums: &[u32]) -> io::Result<()> {
-        let body = json!({
+    /// Commits a staged block as local-only. It goes out only on a connection whose daemon has
+    /// shown local-only support, and is never resent on a new connection: an older daemon there
+    /// would ignore `local_only` and upload the block. The daemon refuses the commit if the layout
+    /// isn't the one this client staged (`generation`), and must confirm LOCAL_ONLY in its reply.
+    pub fn commit_local_only(&mut self, uri: &str, generation: Option<u64>, checksums: &[u32]) -> io::Result<()> {
+        if !self.local_only_verified() {
+            return Err(io::Error::other(
+                "not committing: the daemon on this connection hasn't shown local-only support",
+            ));
+        }
+        let mut body = json!({
             "action": "commit_write",
             "uri": uri,
             "write_through": false,
             "local_only": true,
             "chunk_checksums": checksums,
         });
-        let response = self.request(&body, self.commit_timeout)?;
+        if let Some(generation) = generation {
+            body["generation"] = json!(generation);
+        }
+        let mut message = serde_json::to_vec(&body)?;
+        message.push(b'\n');
+        let result = self
+            .send(&message, self.commit_timeout)
+            .and_then(|()| self.read_response());
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                // A timeout or reset leaves the stream at an unknown position: start clean next time
+                self.stream = None;
+                return Err(error);
+            }
+        };
         if response.status != "WRITECOMMITTED" && response.status != "WRITE_COMMITTED" {
             return Err(io::Error::other(format!("commit_write failed: {}", response.message())));
+        }
+        if response.sync_status.as_deref() != Some("LOCAL_ONLY") {
+            return Err(io::Error::other(format!(
+                "the daemon committed {uri} as {} instead of LOCAL_ONLY; upgrade it",
+                response.sync_status.as_deref().unwrap_or("unknown")
+            )));
         }
         Ok(())
     }
 
     pub fn evict(&mut self, uri: &str) -> io::Result<bool> {
         let response = self.request(&json!({"action": "evict", "uri": uri}), self.timeout)?;
-        Ok(matches!(response.status.as_str(), "EVICTED" | "PONG" | "OK"))
+        // The daemon replies EVICTED on success and ERROR otherwise (not found included)
+        Ok(response.status == "EVICTED")
     }
 }
 

@@ -185,8 +185,9 @@ struct Shared {
     lookup_queue: Queue,
     completions: Mutex<Vec<Completion>>,
     notifier: Notifier,
+    /// URIs a worker is storing right now. Another store of the same URI waits for it to finish.
     storing: Mutex<HashSet<String>>,
-    local_only_confirmed: AtomicBool,
+    store_finished: Condvar,
     closed: AtomicBool,
     io: ChunkIo,
     counters: Counters,
@@ -214,7 +215,7 @@ impl Connector {
             completions: Mutex::new(Vec::new()),
             notifier: Notifier::new()?,
             storing: Mutex::new(HashSet::new()),
-            local_only_confirmed: AtomicBool::new(false),
+            store_finished: Condvar::new(),
             closed: AtomicBool::new(false),
             io: ChunkIo::new(),
             counters: Counters::default(),
@@ -378,9 +379,24 @@ impl Connector {
         std::mem::take(&mut *self.shared.completions.lock().expect("completions lock"))
     }
 
+    /// True in a child forked from the process that created this connector.
+    fn in_forked_child(&self) -> bool {
+        std::process::id() != self.owner_pid
+    }
+
     /// Stops the workers. Queued work fails fast, and I/O already running finishes first. After
     /// this returns, no worker touches any caller's buffer.
+    ///
+    /// In a forked child this does nothing: the workers, and any lock one of them held at the
+    /// fork, exist only in the parent, so joining or locking here could hang the child for good.
     pub fn close(&self) {
+        if self.in_forked_child() {
+            if let Ok(mut workers) = self.workers.try_lock() {
+                // Dropping a handle would detach a thread that doesn't exist in this process
+                std::mem::forget(std::mem::take(&mut *workers));
+            }
+            return;
+        }
         self.shared.closed.store(true, SeqCst);
         for queue in [
             &self.shared.store_queue,
@@ -403,6 +419,15 @@ impl Connector {
 
 impl Drop for Connector {
     fn drop(&mut self) {
+        if self.in_forked_child() {
+            // No lock needed with &mut self, and close() can't take it if a parent thread held it
+            let workers = match self.workers.get_mut() {
+                Ok(workers) => workers,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::forget(std::mem::take(workers));
+            return;
+        }
         self.close();
     }
 }
@@ -479,6 +504,20 @@ struct StoreGuard<'a> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         self.shared.storing.lock().expect("storing lock").remove(self.uri);
+        self.shared.store_finished.notify_all();
+    }
+}
+
+impl Shared {
+    /// Claims a URI for storing. When another worker is storing it, waits for that store to end
+    /// first, so the caller then sees its outcome instead of assuming it will succeed.
+    fn claim_store<'a>(&'a self, uri: &'a str) -> StoreGuard<'a> {
+        let mut storing = self.storing.lock().expect("storing lock");
+        while storing.contains(uri) {
+            storing = self.store_finished.wait(storing).expect("storing lock");
+        }
+        storing.insert(uri.to_string());
+        StoreGuard { shared: self, uri }
     }
 }
 
@@ -547,19 +586,20 @@ impl Worker {
         if buffer.len == 0 {
             return Err(io::Error::other("empty object"));
         }
-        if !shared.storing.lock().expect("storing lock").insert(uri.clone()) {
-            return Ok(()); // already being stored
-        }
-        let _guard = StoreGuard {
-            shared: &shared,
-            uri: &uri,
-        };
+        // A store of a URI another worker is storing waits for it, then checks below whether that
+        // store succeeded, so success is only ever reported for a block that is really there
+        let _guard = shared.claim_store(&uri);
 
-        if self.client.locate(&uri)?.is_valid_block() {
+        // Only a block a load would accept counts as already stored: same size, fully covered
+        let existing = self.client.locate(&uri)?;
+        if existing.is_valid_block()
+            && existing.object_size == Some(buffer.len as u64)
+            && layout_covers(existing.layout(), buffer.len)
+        {
             return Ok(());
         }
         let staged = self.client.stage_write(&uri, buffer.len as u64, &shared.config.tier)?;
-        let result = self.write_and_commit(&uri, staged.layout(), buffer);
+        let result = self.write_and_commit(&uri, &staged, buffer);
         if result.is_err() {
             if let Err(error) = self.client.evict(&uri) {
                 eprintln!("hypercache connector: could not clean up {uri}: {error}");
@@ -568,8 +608,9 @@ impl Worker {
         result
     }
 
-    fn write_and_commit(&mut self, uri: &str, layout: &[Chunk], buffer: RawBuffer) -> io::Result<()> {
+    fn write_and_commit(&mut self, uri: &str, staged: &Response, buffer: RawBuffer) -> io::Result<()> {
         self.require_local_only_support(uri)?;
+        let layout = staged.layout();
         if !layout_covers(layout, buffer.len) {
             return Err(io::Error::other("staged layout does not match the object size"));
         }
@@ -582,13 +623,14 @@ impl Worker {
             checksums.push(crc32fast::hash(data));
             position += chunk.length as usize;
         }
-        self.client.commit_local_only(uri, &checksums)
+        self.client.commit_local_only(uri, staged.generation, &checksums)
     }
 
-    /// An older daemon ignores local_only and would upload the block to its backend, so this is
-    /// settled before the first commit. Only newer daemons report status on locate.
+    /// An older daemon ignores local_only and would upload the block to its backend, so support is
+    /// settled before any data is written, once per connection: after a reconnect the daemon may
+    /// be a different one. Only daemons with local-only support report status on locate.
     fn require_local_only_support(&mut self, uri: &str) -> io::Result<()> {
-        if self.shared.local_only_confirmed.load(SeqCst) {
+        if self.client.local_only_verified() {
             return Ok(());
         }
         if self.client.locate(uri)?.sync_status.as_deref() != Some("STAGED") {
@@ -596,7 +638,7 @@ impl Worker {
                 "the HyperCache daemon has no local-only commit support; upgrade it",
             ));
         }
-        self.shared.local_only_confirmed.store(true, SeqCst);
+        self.client.mark_local_only_verified();
         Ok(())
     }
 
@@ -740,6 +782,13 @@ mod tests {
         commits: usize,
         requests: usize,
         requested_flush: usize,
+        /// Generations sent with commits, in order
+        commit_generations: Vec<Option<u64>>,
+        /// Fail every commit, as a full or failing device would
+        fail_commits: bool,
+        /// Report STAGED on locate like a new daemon, but commit like an old one that ignores
+        /// local_only, as when the daemon is swapped for an older one between the two
+        commit_like_legacy: bool,
     }
 
     /// Speaks the real wire format with file-backed storage.
@@ -854,20 +903,36 @@ mod tests {
                         status: "STAGED",
                     },
                 );
-                json!({"status": "WRITESTAGED", "object_size": size, "chunk_layout": layout})
+                json!({"status": "WRITESTAGED", "object_size": size, "chunk_layout": layout, "generation": generation})
             }
             "commit_write" => {
-                let local_only = request["local_only"].as_bool().unwrap_or(false);
+                // An older daemon ignores local_only and the generation, and commits for write-back
+                let honours_local_only = !legacy && !state.commit_like_legacy;
+                let local_only = honours_local_only && request["local_only"].as_bool().unwrap_or(false);
                 let checksums = request["chunk_checksums"].as_array().cloned().unwrap_or_default();
+                let generation = request["generation"].as_u64();
                 state.commits += 1;
+                state.commit_generations.push(generation);
+                if state.fail_commits {
+                    return json!({"status": "ERROR", "error_message": "device full"});
+                }
                 let Some(object) = state.objects.get_mut(&uri) else {
                     return json!({"status": "ERROR", "error_message": "not staged"});
                 };
+                if local_only {
+                    // The real daemon's rules: only the layout this writer staged, and only while STAGED
+                    if generation.is_some_and(|g| g != object.generation) {
+                        return json!({"status": "ERROR", "error_message": "replaced since it was staged"});
+                    }
+                    if object.status != "STAGED" {
+                        return json!({"status": "ERROR", "error_message": "not STAGED"});
+                    }
+                }
                 for (chunk, checksum) in object.layout.iter_mut().zip(&checksums) {
                     chunk["checksum"] = checksum.clone();
                 }
                 object.status = if local_only { "LOCAL_ONLY" } else { "COMMITTED" };
-                json!({"status": "WRITECOMMITTED"})
+                json!({"status": "WRITECOMMITTED", "sync_status": object.status})
             }
             "evict" => {
                 if state.objects.remove(&uri).is_some() {
@@ -1100,6 +1165,114 @@ mod tests {
             "the buffer must not be touched"
         );
         assert_eq!(exists(&connector, &keys), [true]);
+    }
+
+    /// Review item 3: the commit names the layout this writer staged.
+    #[test]
+    fn commit_carries_the_staged_generation() {
+        let daemon = FakeDaemon::start("commitgen", false);
+        let connector = daemon.connector("ns");
+        let mut sources = vec![Aligned::new(&pattern(SIZE, 1))];
+        assert!(store(&connector, &[key(1)], &mut sources).ok);
+        let state = daemon.state.lock().unwrap();
+        let uri = connector.uri(&key(1)).unwrap();
+        assert_eq!(state.commit_generations, [Some(state.objects[&uri].generation)]);
+    }
+
+    /// Review item 4: a daemon that commits for write-back instead of LOCAL_ONLY fails the store,
+    /// and the block is cleaned up so it is never readable.
+    #[test]
+    fn commit_not_confirmed_local_only_fails_the_store() {
+        let daemon = FakeDaemon::start("notlocal", false);
+        let connector = daemon.connector("ns");
+        daemon.state.lock().unwrap().commit_like_legacy = true;
+        let mut sources = vec![Aligned::new(&pattern(SIZE, 1))];
+        let done = store(&connector, &[key(1)], &mut sources);
+        assert!(!done.ok);
+        assert!(done.error.contains("instead of LOCAL_ONLY"), "{}", done.error);
+        assert!(
+            daemon.state.lock().unwrap().objects.is_empty(),
+            "the block must be evicted"
+        );
+        assert_eq!(exists(&connector, &[key(1)]), [false]);
+    }
+
+    /// Review item 5: a second store of a URI being stored must not report success for a store
+    /// that then fails.
+    #[test]
+    fn duplicate_store_reports_the_real_outcome() {
+        let daemon = FakeDaemon::start("dupfail", false);
+        let connector = daemon.connector("ns");
+        daemon.state.lock().unwrap().fail_commits = true;
+        let keys = vec![key(1); 4];
+        let mut sources: Vec<Aligned> = (0..4).map(|_| Aligned::new(&pattern(SIZE, 1))).collect();
+        let done = store(&connector, &keys, &mut sources);
+        assert!(!done.ok);
+        assert_eq!(done.results, [false; 4], "no duplicate may claim success");
+
+        daemon.state.lock().unwrap().fail_commits = false;
+        let done = store(&connector, &keys, &mut sources);
+        assert_eq!(done.results, [true; 4]);
+        assert_eq!(exists(&connector, &[key(1)]), [true]);
+    }
+
+    /// Review item 4b: an existing block of another size is replaced, not counted as stored.
+    #[test]
+    fn existing_block_of_another_size_is_replaced() {
+        let daemon = FakeDaemon::start("resize", false);
+        let connector = daemon.connector("ns");
+        let keys = vec![key(1)];
+        let mut first = vec![Aligned::new(&pattern(SIZE, 1))];
+        assert!(store(&connector, &keys, &mut first).ok);
+        let smaller = pattern(SIZE - 4096, 9);
+        let mut second = vec![Aligned::new(&smaller)];
+        assert!(store(&connector, &keys, &mut second).ok);
+        assert_eq!(daemon.state.lock().unwrap().commits, 2, "the new size must be written");
+        let mut target = vec![Aligned::new(&vec![0u8; SIZE - 4096])];
+        assert_eq!(load(&connector, &keys, &mut target).results, [true]);
+        assert_eq!(target[0].bytes(), &smaller[..]);
+    }
+
+    /// Review item 3b: dropping or closing the connector in a forked child must not touch the
+    /// parent's workers or their locks, which may be held forever in the child.
+    #[test]
+    fn close_in_a_forked_child_returns() {
+        let daemon = FakeDaemon::start("fork", false);
+        for use_close in [true, false] {
+            let connector = daemon.connector("ns");
+            // A lock held by some parent thread at the fork stays held forever in the child
+            let shared = connector.shared.clone();
+            let held = shared.load_queue.jobs.lock().unwrap();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                if use_close {
+                    connector.close();
+                }
+                drop(connector);
+                std::mem::forget(held);
+                unsafe { libc::_exit(0) };
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut status = 0;
+            loop {
+                let done = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if done == pid {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    panic!("the forked child hung in close (use_close={use_close})");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(held);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            // The parent's connector still works
+            let mut sources = vec![Aligned::new(&pattern(4096, 2))];
+            assert!(store(&connector, &[key(use_close as u8)], &mut sources).ok);
+        }
     }
 
     #[test]

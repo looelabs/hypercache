@@ -118,8 +118,19 @@ struct WriteFds {
     block_size: usize,
 }
 
-/// Open device handles, shared by all workers. Failed opens aren't remembered.
-struct Table<T>(RwLock<HashMap<String, Arc<T>>>);
+/// The file a path names right now, as (device, inode). A handle opened for an older file at the
+/// same path, for example an arena file the daemon recreated, must not be reused.
+type FileIdentity = (u64, u64);
+
+fn file_identity(path: &str) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Open device handles, shared by all workers. Failed opens aren't remembered, and a handle is
+/// reopened when its path names a different file than the one it was opened for.
+struct Table<T>(RwLock<HashMap<String, (FileIdentity, Arc<T>)>>);
 
 impl<T> Table<T> {
     fn new() -> Self {
@@ -127,17 +138,33 @@ impl<T> Table<T> {
     }
 
     fn get(&self, path: &str, open: impl FnOnce() -> io::Result<T>) -> io::Result<Arc<T>> {
-        if let Some(entry) = self.0.read().expect("table lock").get(path) {
-            return Ok(entry.clone());
+        let identity = file_identity(path)?;
+        if let Some((opened_for, entry)) = self.0.read().expect("table lock").get(path) {
+            if *opened_for == identity {
+                return Ok(entry.clone());
+            }
         }
         let opened = Arc::new(open()?);
-        Ok(self
-            .0
-            .write()
+        // The path could change between the stat and the open: record the file really opened.
+        // An identity that changed again just means the next call reopens.
+        let identity = file_identity(path)?;
+        let mut table = self.0.write().expect("table lock");
+        match table.get(path) {
+            Some((current, entry)) if *current == identity => Ok(entry.clone()),
+            _ => {
+                table.insert(path.to_string(), (identity, opened.clone()));
+                Ok(opened)
+            }
+        }
+    }
+
+    fn handles(&self) -> Vec<Arc<T>> {
+        self.0
+            .read()
             .expect("table lock")
-            .entry(path.to_string())
-            .or_insert(opened)
-            .clone())
+            .values()
+            .map(|(_, handle)| handle.clone())
+            .collect()
     }
 }
 
@@ -323,7 +350,7 @@ impl ChunkIo {
 
     /// Pushes page-cache writes to disk. Runs at shutdown only: commits are what make data durable.
     pub fn sync(&self) {
-        for fds in self.writers.0.read().expect("table lock").values() {
+        for fds in self.writers.handles() {
             let _ = fds.buffered.sync_all();
         }
     }
@@ -369,7 +396,19 @@ fn write_ram_chunk(path: &str, data: &[u8]) -> io::Result<()> {
             ),
         ));
     }
-    File::create(path)?.write_all(data)
+    // The daemon pre-creates every staged RAM chunk file, and a client must never create one
+    // (AGENTS.md 7.C): a missing file means this process can't see the daemon's copy.
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("RAM chunk file {path} was not pre-created by the daemon: {error}"),
+            )
+        })?
+        .write_all(data)
 }
 
 fn open_for_read(path: &str) -> io::Result<ReadFds> {
@@ -455,6 +494,37 @@ mod tests {
             length: data.len() as u64,
             checksum: Some(crc32fast::hash(data)),
         }
+    }
+
+    /// Review item 7: a RAM chunk file the daemon didn't pre-create is never created here.
+    #[test]
+    fn ram_chunk_write_never_creates_a_file() {
+        let dir = std::env::temp_dir().join(format!("hc-io-{}-ramdir", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chunk_0");
+        let _ = std::fs::remove_file(&path);
+        let path = path.to_str().unwrap();
+        assert!(write_ram_chunk(path, b"data").is_err());
+        assert!(!Path::new(path).exists(), "the file must not be created");
+        std::fs::write(path, b"old contents that are longer").unwrap();
+        write_ram_chunk(path, b"data").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"data");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handle is reopened when its path names a new file, e.g. an arena the daemon recreated.
+    #[test]
+    fn handle_table_reopens_a_replaced_file() {
+        let path = temp_file("replaced", 4096);
+        let table: Table<File> = Table::new();
+        let first = table.get(&path, || File::open(&path)).unwrap();
+        let again = table.get(&path, || File::open(&path)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
+        let reopened = table.get(&path, || File::open(&path)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &reopened));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
