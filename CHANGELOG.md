@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- LMCache connector: how to set `num_workers` for the drive type. Keep 32 on enterprise drives; on
+  consumer or DRAM-less drives set 4, which loaded 2.2-3.0 times as fast with no loss on stores.
+  Results in `benchmarks/results/lmcache_connector_workers.md`.
+
 ## 0.10.1
 
 Faster stores for KV cache and for many small commits: KV blocks no longer wait for a device flush,
