@@ -26,15 +26,8 @@
   `benchmarks/results/lmcache_rust_connector_xeon.md` and
   `benchmarks/results/lmcache_rust_connector_nvme.md`.
 
+
 ### Fixes
-- Each object now starts on its own drive, chosen from a hash of its URI. Previously every object
-  started on the first drive. Objects that don't fill a whole stripe left the last drives underused,
-  and objects smaller than one chunk all landed on the first drive, however many drives were in the
-  pool. Measured through LMCache's L2 benchmark on 4 Micron 7450 Gen4 drives, 32 workers, median of
-  3 runs: 2 MiB objects load at 24609 MB/s (was 6321) and store at 15390 MB/s (was 4962), and 14 MiB
-  objects load at 24884 MB/s (was 20740) and store at 18549 MB/s (was 16129).
-- Upgrading needs no migration. Objects already stored keep their placement and stay readable, and
-  objects stored after the upgrade stay readable if you roll back. Existing objects aren't rebalanced.
 - `HyperCacheKVStore` commits are now `LOCAL_ONLY` unless `write_through` is set. Previously every
   commit started a backend upload of prompt-derived data, ignoring `auto_flush_s3=False`, and a failed
   upload left the block dirty and impossible to evict. Reads now verify a CRC32 on every chunk and
@@ -53,6 +46,24 @@
 - Fixed the pipelined loader README example, which did not match the API.
 - Removed the claims of LMCache and Dynamo KVBM readiness. LMCache now has a real adapter; Dynamo
   KVBM has no integration.
+
+## 0.9.4
+
+Faster loads and stores for objects that don't fill a whole stripe.
+
+### Fixes
+- Each object now starts on its own drive, chosen from a hash of its URI. Previously every object
+  started on the first drive. Objects that don't fill a whole stripe left the last drives underused,
+  and objects smaller than one chunk all landed on the first drive, however many drives were in the
+  pool. Measured through LMCache's L2 benchmark on 4 Micron 7450 Gen4 drives, 32 workers, median of
+  3 runs: 2 MiB objects load at 24609 MB/s (was 6321) and store at 15390 MB/s (was 4962), and 14 MiB
+  objects load at 24884 MB/s (was 20740) and store at 18549 MB/s (was 16129).
+- Upgrading needs no migration. Objects already stored keep their placement and stay readable, and
+  objects stored after the upgrade stay readable if you roll back. Existing objects aren't rebalanced.
+- CI: the bare-metal e2e script loaded its client from the checkout, which uid 1000 can't read on a
+  GitHub runner. It now runs the client from a world-readable work dir.
+- Release: `release.yml` now stops before building or publishing if the release tag doesn't match
+  the version files.
 
 ## 0.9.3
 

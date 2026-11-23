@@ -12,6 +12,9 @@ automatically. Update AGENTS.md, not this file, when project knowledge changes.
   Linux-only code, IPC, ingest, the fleet controller or S3, run the full harness (Docker stages
   included) and report the summary table faithfully.
 - Do not commit, tag or push unless the maintainer explicitly asks. They push releases manually.
+- A merge to `main` releases nothing. Only a `v*` tag does, and that tag publishes immediately and
+  can't be moved or deleted. When a user-facing change merges, tell the maintainer it is unreleased
+  and ask whether to cut a release. Version rules and the release checklist are in AGENTS.md, section 7.E.
 - Long harness runs (the `linux` and `image` stages take several minutes) belong in the background.
   Do not edit `scripts/verify_release.sh` while one is running.
 - Never "fix" the user's Docker or toolchain setup on their machine. Work around it (for example

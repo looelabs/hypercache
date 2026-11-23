@@ -12,6 +12,75 @@ maturin build --release -i python3.12
 pip install target/wheels/hypercache_lmcache_native-*.whl
 ```
 
+## Quick start with vLLM
+
+This is the setup the vLLM results (`benchmarks/results/lmcache_rust_connector_vllm.md`) ran with: vLLM 0.33.0, LMCache 0.5.7.post1 in multiprocess (MP) mode, and HyperCache on one NVMe drive. In MP mode, vLLM sends KV cache to a separate LMCache server process. That server keeps it in memory (L1) and hands it to this connector (L2), which stores it on the drive through the HyperCache daemon.
+
+**1. Start the daemon on a dedicated drive.** The daemon writes to the raw device, so use a drive with nothing on it: no filesystem, not mounted. Save as `kv.toml`:
+
+```toml
+device_discovery_mode = "manual"
+block_devices = ["/dev/nvme1n1"]
+include_partitions = false
+exclude_root_device = true
+storage_backing_mode = "raw_block"
+chunk_size_bytes = 4194304
+device_start_offset_bytes = 4096
+metadata_persistence_enabled = true    # keep the KV cache across daemon restarts
+agent_enabled = false
+metrics_enabled = false
+ram_cache_enabled = false
+# KV blocks are local-only and never flushed. The backend defaults to S3, so point it at an
+# address that answers nothing: nothing can then be uploaded by mistake.
+authoritative_backend = "s3"
+s3_endpoint = "http://127.0.0.1:9"
+s3_region = "us-east-1"
+s3_bucket = "unused"
+allow_synthetic_s3_fallback = false
+```
+
+```sh
+sudo hypercache -c kv.toml start      # socket: /run/hypercache/hypercache.sock
+```
+
+**2. Install LMCache and the connector where the LMCache server runs.** Use LMCache 0.5.7.post1. The `vllm/vllm-openai:v0.33.0` image ships 0.5.6, whose GPU kernels don't load there (see below), so install 0.5.7.post1 over it. Build the connector wheel as in [Build](#build) with the same Python, then check the kernels:
+
+```sh
+pip install "lmcache==0.5.7.post1"
+pip install hypercache_lmcache_native-*.whl
+python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"   # must print None
+```
+
+**3. Start the LMCache server with the connector as its L2.** Pick a `namespace` that names the model and its revision (see [Use](#use)):
+
+```sh
+lmcache server --host 127.0.0.1 --port 18555 --l1-size-gb 6 --eviction-policy LRU --chunk-size 256 \
+  --l2-adapter '{"type": "native_plugin", "module_path": "hypercache_lmcache_native",
+                 "class_name": "HyperCacheNativeConnector", "max_capacity_gb": 0,
+                 "adapter_params": {"namespace": "qwen2.5-7b-awq-b250375", "tier": "nvme"}}'
+```
+
+**4. Start vLLM pointed at that server:**
+
+```sh
+vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --kv-transfer-config \
+  '{"kv_connector": "LMCacheMPConnector", "kv_role": "kv_both",
+    "kv_connector_extra_config": {"lmcache.mp.host": "127.0.0.1", "lmcache.mp.port": 18555}}'
+```
+
+**5. Check it works.** Send the same long prompt twice: the second first-token time should drop sharply. Then restart the LMCache server and vLLM, leave the daemon running, and send it again. LMCache's `Prefetch request completed` log line should count the keys as L2, which means they came from the drive. `scripts/e2e/lmcache_vllm_e2e.py` automates this and compares the answers. The connector prints any store or checksum failure to the LMCache server's stderr.
+
+**In containers:** the LMCache server's container needs the daemon's socket directory mounted (`-v /run/hypercache:/run/hypercache`) and the drive itself (`--device /dev/nvme1n1`), because the connector reads and writes the drive directly. Without `--device`, every store fails and LMCache quietly runs on L1 alone, so check its log for failed L2 stores. With `tier: "ram"`, it needs the host's `/dev/shm` instead.
+
+**Troubleshooting:**
+
+| Symptom | Cause |
+|---|---|
+| Every store fails with "no local-only commit support" | The daemon is older than the connector. Upgrade the daemon. |
+| Every store fails with a permission or "No such file" error on the drive | The process can't open the drive: add `--device`, or add its user to the daemon's `client_gid`. |
+| Warning "cuda_ops compiled extension not found" | LMCache doesn't match the installed torch. Its fallback can store wrong KV data: fix the install, then change `namespace`. |
+| Hits but no speedup after a restart | L1 is too small for the load to fit (LMCache only evicts L1 down to 80%), or the prompt is shorter than one 256-token chunk. |
+
 ## Use
 
 ```json
@@ -86,7 +155,9 @@ LMCache's `NativeConnectorL2Adapter` wrapper sits between LMCache and this conne
 
 ```sh
 cargo test                                   # no Python, LMCache or GPU needed
-python3 scripts/e2e/lmcache_l2_e2e.py --socket /run/hc/hc.sock
+scripts/e2e/lmcache_l2_ci.sh --python python3   # 30 checks against real LMCache on a loop device
+python3 scripts/e2e/lmcache_l2_e2e.py --socket /run/hypercache/hypercache.sock
+python3 scripts/e2e/lmcache_vllm_e2e.py --fillers 40   # against a running vLLM + LMCache
 ```
 
-The second needs a running daemon on a real device, and damages one stored chunk on purpose. Results are in `benchmarks/results/lmcache_rust_connector.md`, `lmcache_rust_connector_xeon.md` and `lmcache_rust_connector_nvme.md`.
+`lmcache_l2_ci.sh` needs LMCache, torch (CPU is fine) and the connector wheel installed for that Python, and sudo for `losetup`; CI runs it on every pull request. `lmcache_l2_e2e.py` runs the same checks against a daemon you already started, on a real device, and damages one stored chunk on purpose. `lmcache_vllm_e2e.py` checks that answers loaded from L2 match cold ones. Results are in `benchmarks/results/lmcache_rust_connector.md`, `lmcache_rust_connector_xeon.md` and `lmcache_rust_connector_nvme.md`.
