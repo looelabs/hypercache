@@ -550,6 +550,12 @@ async fn run_daemon(
         }
     }
 
+    // Before serving anything: local-only commits may skip the device flush only once the
+    // unflushed marker is durably in place.
+    if let Err(e) = metadata.arm_unflushed_marker() {
+        warn!("Local-only commits will keep flushing every commit: {:#}", e);
+    }
+
     let server = Arc::new(Server::new(
         config.clone(),
         metadata,
@@ -617,8 +623,11 @@ async fn run_daemon(
             }
         }
         _ = server::shutdown_signal() => {
-            println!("\nReceived shutdown signal. Flushing metadata manifest and stopping cleanly...");
-            let _ = server.metadata().flush_to_disk().await;
+            println!("\nReceived shutdown signal. Flushing devices and metadata manifest, stopping cleanly...");
+            if let Err(e) = server.shutdown_cleanly().await {
+                warn!("Shutdown was not clean, local-only objects will be dropped at the next start: {:#}", e);
+                let _ = server.metadata().flush_to_disk().await;
+            }
         }
     }
 

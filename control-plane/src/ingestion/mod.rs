@@ -1,3 +1,4 @@
+pub mod flush_gate;
 pub mod nfs;
 pub mod s3;
 pub mod striper;
