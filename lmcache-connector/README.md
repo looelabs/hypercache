@@ -130,6 +130,8 @@ vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --kv-transfer-config \
 | 6 MiB | 4.29 | 1.76 | 3.26 | 3.14 |
 | 14 MiB | 4.65 | 2.13 | 3.27 | 3.12 |
 
+  With vLLM on that drive, 4 workers brought the first token of a 14k-token prompt loaded from the drive from 0.65 s to 0.41 s ([results](../benchmarks/results/lmcache_rust_connector_vllm.md#worker-count)).
+
   Both directions need the lower count: writing with 4 and reading with 32, or the other way round, loaded at only 1.6-2.5 GB/s. With two such drives, 4 to 6 workers were fastest.
 - **Not sure?** Run `lmcache bench l2` with 4, 8, 16 and 32 workers on your drives and keep the fastest. `nvme id-ctrl /dev/nvmeX | grep hmpre` prints a nonzero value on a DRAM-less drive that borrows host memory instead.
 

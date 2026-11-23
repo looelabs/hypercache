@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Docs
+- vLLM first-token time with the connector at 4 workers on a DRAM-less drive: a 14k-token prompt
+  loaded from the drive reached its first token in 0.41 s against 0.65 s at the default 32.
+  Replaces the note that those runs hadn't been repeated.
 - LMCache connector: how to set `num_workers` for the drive type. Keep 32 on enterprise drives; on
   consumer or DRAM-less drives set 4, which loaded 2.2-3.0 times as fast with no loss on stores.
   Results in `benchmarks/results/lmcache_connector_workers.md`.

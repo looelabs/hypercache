@@ -41,10 +41,35 @@ Storing costs almost nothing on the first send. The output text matched the no-c
 9 prompts in every phase, including from the drive.
 
 At 14k tokens the drive adds about 0.42 s over L1 for about 770 MB of KV, about 1.8 GB/s, with the
-connector's default 32 workers. Later tests found that this drive loads 2.2 to 3.0 times as fast
-with 4 workers (see [Load speed](#load-speed)). Also, a second
+connector's default 32 workers. With 4 workers it adds about 0.19 s (see
+[Worker count](#worker-count)). Also, a second
 send right after a load from the drive loaded from the drive again: LMCache 0.5.7.post1 didn't keep
 those chunks in L1.
+
+## Worker count
+
+Measured 2026-11-23 on the same machine and setup, HyperCache at `bd50fb5` (0.10.1), all four setups
+in one session, each with the drives wiped first. `num_workers` sets how many objects the connector
+writes and reads at once; see [`lmcache_connector_workers.md`](lmcache_connector_workers.md) for why
+this DRAM-less drive is faster with fewer.
+
+| From the drive | 2k tokens | 8k tokens | 14k tokens |
+|---|---|---|---|
+| One drive, 32 workers (default) | 0.156 s | 0.447 s | 0.646 s |
+| **One drive, 4 workers** | **0.135 s** | **0.278 s** | **0.413 s** |
+| Two drives, 32 workers | 0.131 s | 0.389 s | 0.565 s |
+| **Two drives, 4 workers** | **0.133 s** | **0.266 s** | **0.379 s** |
+
+No cache took 0.637, 2.871 and 5.475 s, and L1 about 0.10, 0.17 and 0.23 s.
+
+- **On one drive, 4 workers reach the first token 36% sooner at 14k tokens.** The drive adds about
+  0.19 s over L1 instead of 0.42 s, about 4.0 GB/s instead of 1.9.
+- **On two drives, 4 workers cut the drive's share from 0.33 to 0.15 s,** and the 14k-token prompt
+  reaches its first token 14.4 times as fast as with no cache.
+- **At 2k tokens it makes little difference:** that load is only 7 chunks.
+- Every load in the drive phase came from the drive, and the output matched the no-cache answer on 9
+  of 9 prompts in every phase of every setup. No GPU-kernel fallback warnings, failed stores or media
+  errors. Raw data: `lmcache_l2_raw/vllm-4060ti/ttft_2026-11-23_workers_*.jsonl`.
 
 ## Load speed
 
@@ -53,8 +78,8 @@ Measured 2026-11-23 on the same machine, HyperCache at `a5bfbc9`, page cache dro
 **Correction (2026-11-23):** the first two points below were wrong. With 4 workers on both stores and
 loads, the connector loaded this drive at 4.3 to 4.9 GB/s through LMCache `bench l2`. With many
 objects written and read at once, this DRAM-less drive's reads turn random and slow down. See
-[`lmcache_connector_workers.md`](lmcache_connector_workers.md). The TTFT runs above weren't repeated
-with 4 workers.
+[`lmcache_connector_workers.md`](lmcache_connector_workers.md), and [Worker count](#worker-count) for
+first-token times with 4 workers.
 
 - **The drive is the limit (wrong, see above).** On data that has been written, fio reads this drive at 2.1 to 3.1 GB/s
   with 4 MiB random reads from 8 or 32 threads, 4.1 GB/s with 32 reads in flight from one thread,
