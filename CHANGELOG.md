@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.10.1
 
-Faster stores for KV cache and for many small commits.
+Faster stores for KV cache and for many small commits: KV blocks no longer wait for a device flush,
+and other commits share flushes.
 
 ### Changed
 - KV cache blocks (`LOCAL_ONLY` commits, used by the LMCache connector and `HyperCacheKVStore`) no
