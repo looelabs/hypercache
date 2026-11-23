@@ -314,7 +314,7 @@ cargo build --release --manifest-path control-plane/Cargo.toml
 4. Run the full `scripts/verify_release.sh` until it prints `RESULT: PASSED`.
 5. Open a PR. The maintainer reviews and merges it, because `main` only accepts changes through a PR.
 6. Once CI passes on that commit in `main`, the maintainer tags it: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`.
-7. Check that the `Release Binaries & Container Image` run passed, then check the GitHub release, the container image and the PyPI package.
+7. Check that the `Release Binaries & Container Image` run passed, then check the GitHub release, the container image and both PyPI packages (`hypercache-io` and the LMCache connector, `hypercache-lmcache-native`).
 
 Leave committing, merging, tagging and pushing to the maintainer unless they explicitly ask you to do it.
 

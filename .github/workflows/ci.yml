@@ -76,3 +76,7 @@ jobs:
           (cd lmcache-connector && /tmp/lmcache-venv/bin/maturin build --release -o /tmp/connector-wheel -i /tmp/lmcache-venv/bin/python)
           /tmp/lmcache-venv/bin/pip install -q --no-deps /tmp/connector-wheel/*.whl
           scripts/e2e/lmcache_l2_ci.sh --python /tmp/lmcache-venv/bin/python
+
+      # The exact build release.yml publishes, so a break shows up here and not at release time
+      - name: LMCache connector PyPI wheels
+        run: scripts/build_connector_wheels.sh /tmp/dist-connector

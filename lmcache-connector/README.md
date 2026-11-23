@@ -2,9 +2,19 @@
 
 Lets an LMCache MP-mode server keep KV-cache chunks on HyperCache's NVMe and RAM tiers. LMCache loads it through its `native_plugin` adapter type. Below LMCache's own wrapper, all the work runs in Rust worker threads without the Python interpreter lock.
 
+## Install
+
+From PyPI, in the environment that runs the LMCache server (Linux x86_64, CPython 3.10 to 3.13), from the first HyperCache release that publishes it:
+
+```sh
+pip install hypercache-lmcache-native
+```
+
+Use the same version as the HyperCache daemon; the two are released together.
+
 ## Build
 
-Needs a Rust toolchain and maturin. Build against the Python that runs LMCache:
+To build it yourself, you need a Rust toolchain and maturin. Build against the Python that runs LMCache:
 
 ```sh
 cd lmcache-connector
@@ -43,11 +53,11 @@ allow_synthetic_s3_fallback = false
 sudo hypercache -c kv.toml start      # socket: /run/hypercache/hypercache.sock
 ```
 
-**2. Install LMCache and the connector where the LMCache server runs.** Use LMCache 0.5.7.post1. The `vllm/vllm-openai:v0.33.0` image ships 0.5.6, whose GPU kernels don't load there (see below), so install 0.5.7.post1 over it. Build the connector wheel as in [Build](#build) with the same Python, then check the kernels:
+**2. Install LMCache and the connector where the LMCache server runs.** Use LMCache 0.5.7.post1. The `vllm/vllm-openai:v0.33.0` image ships 0.5.6, whose GPU kernels don't load there (see below), so install 0.5.7.post1 over it. Install the connector as in [Install](#install), then check the kernels:
 
 ```sh
 pip install "lmcache==0.5.7.post1"
-pip install hypercache_lmcache_native-*.whl
+pip install hypercache-lmcache-native
 python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"   # must print None
 ```
 

@@ -17,6 +17,9 @@
   older daemons skip, so rolling back to 0.9.4 keeps every other object, including ones not yet
   flushed. The older daemon doesn't know the local-only objects, so their space isn't reused until
   the arena is reset. Upgrading reads 0.9.4 manifests as before.
+- The connector is published to PyPI as `hypercache-lmcache-native` (manylinux_2_28 x86_64 wheels for
+  CPython 3.10 to 3.13, and an sdist), at the same version as HyperCache. `release.yml` publishes it
+  with PyPI trusted publishing, and CI builds the same wheels on every pull request.
 - `locate` reports `sync_status` for HITs, so a reader can refuse an object that is still staged.
 - `DirectBlockWriter(direct_on_block_devices=True)` writes to raw block devices with O_DIRECT, falling
   back to the page cache for anything it can't take. Off by default.

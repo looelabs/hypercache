@@ -316,7 +316,7 @@ scrape_configs:
 
 The connector in `lmcache-connector/` lets an LMCache server in multiprocess mode keep KV-cache chunks on HyperCache's NVMe tier. It's tested with LMCache 0.5.5, 0.5.6 and 0.5.7.post1 and vLLM 0.31.0 and 0.33.0. In the `vllm/vllm-openai:v0.33.0` image, install LMCache 0.5.7.post1: the image's 0.5.6 can't load its GPU kernels there, and its fallback can store wrong KV data. The [connector quick start](lmcache-connector/README.md#quick-start-with-vllm) has a complete example, including the daemon config for a dedicated drive and running in containers.
 
-**1. Build and install it.** It isn't published as a package yet, so this needs a Rust toolchain and maturin. Use the same Python that runs LMCache:
+**1. Install it** where the LMCache server runs: `pip install hypercache-lmcache-native` (Linux x86_64, CPython 3.10 to 3.13; published from the first release that includes it, at the same version as the daemon). To build it yourself instead, you need a Rust toolchain and maturin. Use the same Python that runs LMCache:
 
 ```bash
 cd lmcache-connector
