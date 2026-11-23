@@ -694,7 +694,7 @@ The loader splits the object by bytes and returns bytes. Your code has to supply
 
 ### 6. KV-Cache Storage for LMCache
 
-[`lmcache-connector/`](lmcache-connector/README.md) is an L2 connector for LMCache's multiprocess mode, written in Rust. It's tested with LMCache 0.5.5 and 0.5.6 and vLLM 0.31.0 and 0.33.0, and needs a daemon built from this version or later. Build it with maturin, install the wheel where the LMCache server runs, and pass:
+[`lmcache-connector/`](lmcache-connector/README.md) is an L2 connector for LMCache's multiprocess mode, written in Rust. It's tested with LMCache 0.5.5, 0.5.6 and 0.5.7.post1 and vLLM 0.31.0 and 0.33.0, and needs a daemon built from this version or later. In the `vllm/vllm-openai:v0.33.0` image, LMCache 0.5.6's compiled GPU kernels don't load and its fallback can store wrong KV data, so install LMCache 0.5.7.post1 there (see the [connector README](lmcache-connector/README.md#check-lmcaches-gpu-kernels-first)). Build it with maturin, install the wheel where the LMCache server runs, and pass:
 
 ```bash
 lmcache server --l1-size-gb 60 --eviction-policy LRU --l2-adapter '{
@@ -712,7 +712,9 @@ lmcache server --l1-size-gb 60 --eviction-policy LRU --l2-adapter '{
 - **Not supported:** `list_l2_keys` and LMCache's IsolatedLRU quotas.
 - **Size L1 for loads.** Loads go through L1, and LMCache only evicts it down to 80%. If the load doesn't fit, vLLM recomputes.
 
-On 4 Gen4 NVMe drives it loads 14 MiB objects at 24.9 GB/s and stores them at 18.5 GB/s, while verifying a CRC32 on every chunk. That's 90% of the drives' raw read speed. LMCache's `raw_block` adapter uses one drive, where the two are about even on throughput, and its lookups are about 3 times as fast. See the [NVMe results](benchmarks/results/lmcache_rust_connector_nvme.md).
+On 4 Gen4 NVMe drives it loads 14 MiB objects at 24.9 GB/s and stores them at 18.5 GB/s, while verifying a CRC32 on every chunk. That's 90% of the drives' raw read speed. LMCache's `raw_block` adapter uses one drive, where the two are about even on throughput. Lookups take about 4 µs per key, slightly faster than `raw_block`'s on a Ryzen 5 5600 and an EPYC 7443. See the [NVMe results](benchmarks/results/lmcache_rust_connector_nvme.md).
+
+With vLLM 0.33.0 and Qwen2.5-7B on an RTX 4060 Ti and one Gen4 drive, a 14k-token prompt whose KV cache came from the drive reached its first token in 0.65 s, against 5.47 s with no cache, with the same answers. With 16 long-document requests at once, the median first-token time was 3.6 s against 50 s. See the [vLLM results](benchmarks/results/lmcache_rust_connector_vllm.md).
 
 For code that manages its own KV blocks, use `HyperCacheKVStore`:
 

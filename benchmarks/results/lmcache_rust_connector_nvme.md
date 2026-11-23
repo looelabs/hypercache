@@ -14,7 +14,7 @@ Measured 2026-11-04 on a rented bare-metal node with no GPU. Raw data is in `lmc
 - **The stripe fix matters most for small objects.** 2 MiB objects load 3.9 times as fast, because they used to land on one drive.
 - **On 4 drives, the connector matches the best `raw_block` result on RAID 0, and holds it.** `raw_block` on RAID 0 reached the same speed in 2 of 6 runs and got stuck near 15.2 GB/s in the other 4. The cause isn't known, and could be our array setup.
 - **No load returned wrong bytes** across crashes, restarts, corruption, eviction and a 30-minute soak.
-- **Lookups were slower than `raw_block`'s on this node**, at about 2.6 ms against 0.9-1.0 ms per round on one drive. A later change made them faster than `raw_block`'s on a Ryzen 5 5600, which hasn't been repeated on this node. See [lookup speed](#lookup-speed).
+- **Lookups were slower than `raw_block`'s on this node**, at about 2.6 ms against 0.9-1.0 ms per round on one drive. A later change made them faster than `raw_block`'s on a Ryzen 5 5600 and on an EPYC 7443. This 9474F node hasn't been measured again. See [lookup speed](#lookup-speed).
 - **Full-speed writes cut reads hard.** Most of that comes from the drives themselves. See [mixed reads and writes](#mixed-reads-and-writes).
 
 ## What the drives can do without HyperCache
@@ -124,7 +124,17 @@ The two versions are about the same. The speed of loads alone moved by about 2% 
 
 **Safety on the final code:** run on the 5600, on loop devices on a RAM disk rather than real drives, with lower volumes to fit in RAM (256 objects, 4 GiB limits). The safety script passed 30 of 30 on LMCache 0.5.5 and 0.5.6, on 1 and 2 devices. All 19 failure tests passed. The 5 new ones cover lookups: each of 2,000 mixed batches returned the right result for every key, `kill -9` with and without saved metadata, a frozen daemon whose late replies must not answer later lookups, and deletes during lookups. No key that was never stored was ever reported as found. The upgrade test wasn't repeated, because the daemon didn't change.
 
-**Not known yet:** the speed on this EPYC node, where times were about twice as long before the change.
+**Repeated 2026-11-21 on an EPYC 7443** (Zen 3, 24 cores, 1 socket), LMCache 0.5.6, the same 224 KiB objects with every device in `/dev/shm`, so again no drive is involved. µs per key, median of 3:
+
+| Setup | 16 in flight, hits | 16 in flight, misses | 64 in flight, hits | 64 in flight, misses |
+|---|---|---|---|---|
+| **Rust, 4 workers, batched** | **4.77** | **3.36** | **4.06** | **3.79** |
+| `raw_block`, posix | 4.84 | 4.45 | 4.69 | 4.53 |
+| `fs_native`, page cache on | 5.55 | 4.84 | 6.58 | 4.79 |
+
+Rust is ahead of both on this CPU too. Loads with lookups running, on tmpfs so limited by CPU (a worst case): one batch at a time at 5,000 keys/s cost loads 3.6%, and at 20,000 keys/s 9.8%, the same as on the 5600. Bursts of 512 keys every 20 ms (25,600 keys/s) cost 11.7%, with each burst answered in 2.7 ms at p50 and 3.4 ms at p99. Bursts every 5 ms (102,000 keys/s) cost 29%, at 2.9 and 3.6 ms; a burst alone takes 1.5 ms.
+
+**Not known yet:** the speed on the 9474F node above, where times were about twice as long before the change.
 
 ## Mixed reads and writes
 

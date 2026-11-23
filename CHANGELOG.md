@@ -4,12 +4,19 @@
 
 ### Added
 - `lmcache-connector/`: an L2 connector for LMCache multiprocess mode, written in Rust and loaded
-  through LMCache's `native_plugin` type. Built separately with maturin. Tested on LMCache 0.5.5 and
-  0.5.6 and vLLM 0.31.0 and 0.33.0. At startup it warns when LMCache's compiled GPU kernels
+  through LMCache's `native_plugin` type. Built separately with maturin. Tested on LMCache 0.5.5,
+  0.5.6 and 0.5.7.post1 and vLLM 0.31.0 and 0.33.0. At startup it warns when LMCache's compiled GPU kernels
   (`lmcache.cuda_ops`) don't load, as in the `vllm/vllm-openai:v0.33.0` image: LMCache's torch
   fallback changed model output after a cache hit. `check_lmcache_gpu_ops()` runs the same check.
-- `commit_write` accepts `local_only` and `chunk_checksums`. A `LOCAL_ONLY` object is never flushed
-  to a backend and stays evictable. Both fields are optional on the wire; older clients are unaffected.
+- `commit_write` accepts `local_only`, `chunk_checksums` and `generation`. A `LOCAL_ONLY` object is
+  never flushed to a backend and stays evictable. A local-only commit is refused unless the object is
+  still `STAGED` with the `generation` its writer was given, and a `sha256`, when sent, is verified.
+  The reply's `sync_status` confirms `LOCAL_ONLY`. All three fields are optional on the wire; older
+  clients are unaffected.
+- **Rolling back:** local-only objects are saved in a separate part of the metadata manifest that
+  older daemons skip, so rolling back to 0.9.4 keeps every other object, including ones not yet
+  flushed. The older daemon doesn't know the local-only objects, so their space isn't reused until
+  the arena is reset. Upgrading reads 0.9.4 manifests as before.
 - `locate` reports `sync_status` for HITs, so a reader can refuse an object that is still staged.
 - `DirectBlockWriter(direct_on_block_devices=True)` writes to raw block devices with O_DIRECT, falling
   back to the page cache for anything it can't take. Off by default.
@@ -30,7 +37,13 @@
   objects stored after the upgrade stay readable if you roll back. Existing objects aren't rebalanced.
 - `HyperCacheKVStore` commits are now `LOCAL_ONLY` unless `write_through` is set. Previously every
   commit started a backend upload of prompt-derived data, ignoring `auto_flush_s3=False`, and a failed
-  upload left the block dirty and impossible to evict. Reads now treat staged blocks as misses.
+  upload left the block dirty and impossible to evict. Reads now verify a CRC32 on every chunk and
+  return a block only when it is `LOCAL_ONLY` (or `SYNCED_BACKEND` for write-through); anything else
+  is a miss, so a block evicted and reused during a read is never returned. A store that fails is
+  evicted.
+- `HyperCacheClient.commit_write(local_only=True)` returns False unless the daemon confirms
+  `LOCAL_ONLY`, and `stage_write` results carry the layout `generation`.
+- `DirectBlockWriter.write_chunks` waits for every chunk write to finish before raising an error.
 - `DirectBlockWriter` retries short writes instead of ignoring them, no longer copies each chunk, and
   no longer leaks a file descriptor when two threads open the same device.
 

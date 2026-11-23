@@ -54,19 +54,22 @@ Check before going live, in the environment that runs the LMCache server, with a
 python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"
 ```
 
-It prints `None` when the kernels load, and the reason when they don't. The connector runs the same check at startup and prints a warning to stderr on a problem. It does not stop LMCache from starting. Fix it with an LMCache build that matches the installed torch. vLLM 0.31.0 with LMCache 0.5.5 is a tested pair whose answers matched. In the vLLM 0.33.0 image, LMCache 0.5.7.post1 from PyPI loads its kernels, and with batch invariance cached answers matched cold answers on 25 of 25. The connector's safety tests haven't been run on 0.5.7 yet.
+It prints `None` when the kernels load, and the reason when they don't. The connector runs the same check at startup and prints a warning to stderr on a problem. It does not stop LMCache from starting. Fix it with an LMCache build that matches the installed torch. vLLM 0.31.0 with LMCache 0.5.5 is a tested pair whose answers matched. In the vLLM 0.33.0 image, LMCache 0.5.7.post1 from PyPI loads its kernels, and with batch invariance cached answers matched cold answers on 25 of 25. The connector's safety and failure tests pass on 0.5.7.post1, and answers from KV loaded off the drive matched no-cache answers on 9 of 9 prompts (`benchmarks/results/lmcache_rust_connector_vllm.md`).
 
 ## What isn't supported
 
 - `list_l2_keys` and LMCache's IsolatedLRU quotas.
-- Versions other than LMCache 0.5.5 and 0.5.6, which are the ones tested. Nothing in the connector enforces that yet.
+- Versions other than LMCache 0.5.5, 0.5.6 and 0.5.7.post1, which are the ones tested. Nothing in the connector enforces that yet.
 - A daemon without `local_only` commits. Stores fail before writing any data, and lookups miss.
 
 ## Behaviour
 
 - Any doubt about a block is a miss. Lookup only accepts committed local-only blocks with a checksum for every chunk, and load verifies every chunk before reporting success.
 - If the daemon restarts, the connector reconnects by itself. A request that couldn't be sent is resent once, and one the daemon may have received is never resent, so it reports a failure.
-- Blocks are never flushed to a backend. Against an older daemon, stores fail before any data is written and lookups miss.
+- Blocks are never flushed to a backend. Against an older daemon, stores fail before any data is written and lookups miss. Support is checked again on every new connection, because a restarted daemon may be a different version, and a commit only counts when the daemon confirms `LOCAL_ONLY`.
+- A commit names the layout this connector staged, so if another writer replaced the block in between, the daemon refuses it and the store fails.
+- Two stores of the same block in one process run one after the other, and each reports its real outcome. A block already stored counts only if its size and layout match.
+- In a process forked from the one that opened the connector, closing it does nothing: the workers belong to the parent.
 - A block that fails its checksum is evicted, unless it was replaced during the read.
 - On raw block devices, writes use O_DIRECT. Page-aligned L1 buffers (`--l1-align-bytes 4096`) go to and from the drive with no copy. A partial last block goes through the page cache on writes and an aligned copy on reads.
 
