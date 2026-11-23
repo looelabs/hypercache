@@ -1,10 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
+
+Adds the Rust LMCache connector, which keeps LMCache's KV cache on HyperCache's NVMe and RAM tiers,
+published to PyPI as `hypercache-lmcache-native`.
+
+### Upgrading
+- `HyperCacheKVStore` no longer uploads blocks to the backend by default: commits are `LOCAL_ONLY`.
+  Pass `write_through=True` to keep uploading.
+- The daemon and the connector must both be 0.10.0 or later: a daemon without local-only commits
+  makes every connector store fail and every lookup miss.
+- Rolling back the daemon to 0.9.4 keeps all objects except the local-only ones; see the manifest
+  note below.
 
 ### Added
 - `lmcache-connector/`: an L2 connector for LMCache multiprocess mode, written in Rust and loaded
-  through LMCache's `native_plugin` type. Built separately with maturin. Tested on LMCache 0.5.5,
+  through LMCache's `native_plugin` type. Install with `pip install hypercache-lmcache-native`. Tested on LMCache 0.5.5,
   0.5.6 and 0.5.7.post1 and vLLM 0.31.0 and 0.33.0. At startup it warns when LMCache's compiled GPU kernels
   (`lmcache.cuda_ops`) don't load, as in the `vllm/vllm-openai:v0.33.0` image: LMCache's torch
   fallback changed model output after a cache hit. `check_lmcache_gpu_ops()` runs the same check.
