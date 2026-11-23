@@ -180,7 +180,7 @@ For 8-GPU data center deployments, below are recommended enterprise node chassis
 ### 4. Operating System & Software Prerequisites
 * **Operating System**: Linux (`x86_64`, Kernel 5.15+ recommended for optimal `O_DIRECT`, HugePages, and NUMA sysfs discovery).
 * **Permissions**: Root privileges (`sudo`) or `CAP_SYS_RAWIO` + `disk` group read/write access on target `/dev/nvme*` block devices (verify anytime with `./hypercache check`).
-* **Build & Runtime Toolchains**: Rust `1.75+` (`cargo`) and Python `3.9+` (`pip`, `venv`), both installed automatically if you run `./install.sh`.
+* **Build & Runtime Toolchains**: Rust `1.88+` (`cargo`) to build from source, and Python `3.9+` (`pip`, `venv`; `3.10+` for the LMCache connector). `./install.sh` installs both if they are missing, but an older Rust already on the machine must be updated first (`rustup update`). The release binaries need no toolchain.
 
 ---
 
@@ -204,7 +204,7 @@ cd hypercache
 
 ### Option B: Manual Build (`./build.sh` + `pip`)
 
-If you already have **Rust (1.75+)** and **Python (3.9+)** installed:
+If you already have **Rust (1.88+)** and **Python (3.9+)** installed:
 
 #### 1. Compile the Native Rust Binaries
 ```bash
