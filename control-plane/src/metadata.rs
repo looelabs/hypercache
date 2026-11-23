@@ -115,11 +115,51 @@ impl DeviceFreePool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataManifest {
+    /// Never holds a `LOCAL_ONLY` entry: those go in `local_only_entries`.
     pub entries: HashMap<String, StoredMetadata>,
     pub local_alloc: HashMap<String, u64>,
     #[serde(default)]
     pub free_pools: HashMap<String, DeviceFreePool>,
     pub updated_at: i64,
+    /// Local-only objects, such as KV cache blocks. They are kept out of `entries`, and this field
+    /// stays last, so a daemon from before `LOCAL_ONLY` (0.9.4 and older) can still load the
+    /// manifest after a rollback: its JSON reader ignores an unknown field, and its bincode reader
+    /// ignores trailing bytes. It then keeps every other object and simply doesn't see these.
+    #[serde(default)]
+    pub local_only_entries: HashMap<String, StoredMetadata>,
+}
+
+/// The manifest as 0.9.4 and older wrote it. A bincode manifest has no field names, so one written
+/// before `local_only_entries` existed only decodes with this layout.
+#[derive(Deserialize)]
+struct ManifestWithoutLocalOnly {
+    entries: HashMap<String, StoredMetadata>,
+    local_alloc: HashMap<String, u64>,
+    #[serde(default)]
+    free_pools: HashMap<String, DeviceFreePool>,
+    updated_at: i64,
+}
+
+impl From<ManifestWithoutLocalOnly> for MetadataManifest {
+    fn from(old: ManifestWithoutLocalOnly) -> Self {
+        MetadataManifest {
+            entries: old.entries,
+            local_alloc: old.local_alloc,
+            free_pools: old.free_pools,
+            updated_at: old.updated_at,
+            local_only_entries: HashMap::new(),
+        }
+    }
+}
+
+/// Decodes a bincode manifest in the current layout, or in the layout from before
+/// `local_only_entries`, so an upgrade never starts cold over a format change.
+fn decode_bincode_manifest(bytes: &[u8]) -> Option<MetadataManifest> {
+    bincode::deserialize::<MetadataManifest>(bytes).ok().or_else(|| {
+        bincode::deserialize::<ManifestWithoutLocalOnly>(bytes)
+            .ok()
+            .map(Into::into)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -777,7 +817,13 @@ impl MetadataStore {
     }
 
     fn snapshot(inner: &Inner) -> MetadataManifest {
-        let entries = inner.entries_mirror.lock().unwrap().clone();
+        let (local_only_entries, entries): (HashMap<_, _>, HashMap<_, _>) = inner
+            .entries_mirror
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(uri, meta)| (uri.clone(), meta.clone()))
+            .partition(|(_, meta)| meta.sync_status == Some(SyncStatus::LocalOnly));
         let mut free_pools = inner.free_pools.lock().unwrap().clone();
         let local_alloc = inner.local_alloc.lock().unwrap().clone();
         // Quarantined extents are persisted as free: after a daemon restart no reader can
@@ -793,6 +839,7 @@ impl MetadataStore {
             local_alloc,
             free_pools,
             updated_at: chrono::Utc::now().timestamp(),
+            local_only_entries,
         }
     }
 
@@ -851,7 +898,7 @@ impl MetadataStore {
 
         if path.extension().is_some_and(|e| e == "bin" || e == "bincode") {
             if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(m) = bincode::deserialize::<MetadataManifest>(&bytes) {
+                if let Some(m) = decode_bincode_manifest(&bytes) {
                     loaded_manifest = Some(m);
                 }
             }
@@ -868,7 +915,7 @@ impl MetadataStore {
 
             if use_bin_fastpath {
                 if let Ok(bytes) = std::fs::read(&bin_path) {
-                    if let Ok(m) = bincode::deserialize::<MetadataManifest>(&bytes) {
+                    if let Some(m) = decode_bincode_manifest(&bytes) {
                         loaded_manifest = Some(m);
                     }
                 }
@@ -902,11 +949,15 @@ impl MetadataStore {
         let store = Self::new(max_capacity_bytes, metrics.clone(), Some(path.to_path_buf()));
 
         let mut total_bytes: u64 = 0;
-        let count = manifest.entries.len();
+        let count = manifest.entries.len() + manifest.local_only_entries.len();
         let mut max_generation = 0u64;
 
         // Entries from releases without generations get unique ones assigned on load
-        let mut entries: Vec<(String, StoredMetadata)> = manifest.entries.into_iter().collect();
+        let mut entries: Vec<(String, StoredMetadata)> = manifest
+            .entries
+            .into_iter()
+            .chain(manifest.local_only_entries)
+            .collect();
         for (_, meta) in entries.iter() {
             max_generation = max_generation.max(meta.generation);
         }
@@ -1686,5 +1737,183 @@ mod tests {
                 .await
         );
         assert_eq!(store.get_sync_status(uri).await.unwrap(), Some(SyncStatus::Committed));
+    }
+
+    /// The manifest schema exactly as 0.9.4 reads it: a SyncStatus without LOCAL_ONLY, in the same
+    /// variant order (bincode stores the index), and no `local_only_entries`.
+    #[allow(dead_code)] // the fields mirror the old layout; only a few are checked
+    mod v094 {
+        use super::super::{ChunkDescriptor, DeviceFreePool};
+        use serde::Deserialize;
+        use std::collections::HashMap;
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        pub enum SyncStatus {
+            #[serde(rename = "STAGED")]
+            Staged,
+            #[serde(rename = "COMMITTED")]
+            Committed,
+            #[serde(rename = "SYNCING_BACKEND")]
+            SyncingBackend,
+            #[serde(rename = "SYNCED_BACKEND")]
+            SyncedBackend,
+            #[serde(rename = "SYNC_FAILED")]
+            SyncFailed,
+            #[serde(rename = "REPLICA_COMMITTED")]
+            ReplicaCommitted,
+        }
+
+        #[derive(Debug, Deserialize)]
+        pub struct StoredMetadata {
+            pub object_size: u64,
+            pub chunk_size: usize,
+            pub chunk_layout: Vec<ChunkDescriptor>,
+            pub created_at: i64,
+            #[serde(default)]
+            pub sync_status: Option<SyncStatus>,
+            #[serde(default)]
+            pub pinned: bool,
+            #[serde(default)]
+            pub generation: u64,
+        }
+
+        #[derive(Debug, Deserialize)]
+        pub struct MetadataManifest {
+            pub entries: HashMap<String, StoredMetadata>,
+            pub local_alloc: HashMap<String, u64>,
+            #[serde(default)]
+            pub free_pools: HashMap<String, DeviceFreePool>,
+            pub updated_at: i64,
+        }
+    }
+
+    /// A chunk with a recorded CRC. Bincode can't decode a chunk without one, because
+    /// `checksum` is skipped when None (a separate, existing issue), so these tests use CRCs.
+    fn nvme_crc(device: &str, offset: u64, length: u64) -> ChunkDescriptor {
+        let mut chunk = nvme(device, offset, length);
+        chunk.checksum = Some(0x1234_5678);
+        chunk
+    }
+
+    /// A store holding one object waiting for write-back and one local-only KV block.
+    async fn store_with_dirty_and_local_only(path: &Path) -> MetadataStore {
+        let store = MetadataStore::new(1 << 30, None, Some(path.to_path_buf()));
+        store
+            .save_layout_with_status(
+                "hypercache://checkpoints/unflushed.bin",
+                4096,
+                4194304,
+                vec![nvme_crc("/dev/r0", 4096, 4096)],
+                Some(SyncStatus::Committed),
+            )
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                "hypercache://kv_cache/ns/m/0/0/_/ab.kv",
+                8192,
+                4194304,
+                vec![nvme_crc("/dev/r0", 8192, 8192)],
+                Some(SyncStatus::LocalOnly),
+            )
+            .await
+            .unwrap();
+        store.flush_to_disk().await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_0_9_4_keeps_unflushed_objects() {
+        // A 0.9.4 daemon can't parse LOCAL_ONLY. If one were in `entries`, the whole manifest would
+        // fail to load and the daemon would start cold, losing objects not yet flushed.
+        let path = temp_manifest_path("rollback");
+        let _store = store_with_dirty_and_local_only(&path).await;
+
+        let json = std::fs::read_to_string(&path).unwrap();
+        let old: v094::MetadataManifest = serde_json::from_str(&json).expect("0.9.4 must parse the JSON manifest");
+        let unflushed = &old.entries["hypercache://checkpoints/unflushed.bin"];
+        assert_eq!(unflushed.sync_status, Some(v094::SyncStatus::Committed));
+        assert_eq!(old.entries.len(), 1, "local-only blocks are invisible to 0.9.4");
+
+        let bin = std::fs::read(path.with_extension("bin")).unwrap();
+        let old: v094::MetadataManifest = bincode::deserialize(&bin).expect("0.9.4 must decode the bincode manifest");
+        assert_eq!(old.entries.len(), 1);
+        assert!(old.entries.contains_key("hypercache://checkpoints/unflushed.bin"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_local_only_entries_survive_a_restart() {
+        let path = temp_manifest_path("localreload");
+        let _store = store_with_dirty_and_local_only(&path).await;
+        let manifest: MetadataManifest = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(manifest
+            .entries
+            .values()
+            .all(|m| m.sync_status != Some(SyncStatus::LocalOnly)));
+        assert_eq!(manifest.local_only_entries.len(), 1);
+
+        let (reloaded, count, _) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            reloaded
+                .get_sync_status("hypercache://kv_cache/ns/m/0/0/_/ab.kv")
+                .await
+                .unwrap(),
+            Some(SyncStatus::LocalOnly)
+        );
+        assert_eq!(
+            reloaded
+                .get_sync_status("hypercache://checkpoints/unflushed.bin")
+                .await
+                .unwrap(),
+            Some(SyncStatus::Committed)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_reads_a_0_9_4_bincode_manifest() {
+        // A bincode manifest has no field names, so one written by 0.9.4 lacks the new last field.
+        // The upgraded daemon must still load it rather than start cold.
+        #[derive(Serialize)]
+        struct OldManifest {
+            entries: HashMap<String, StoredMetadata>,
+            local_alloc: HashMap<String, u64>,
+            free_pools: HashMap<String, DeviceFreePool>,
+            updated_at: i64,
+        }
+        let meta = StoredMetadata {
+            object_size: 4096,
+            chunk_size: 4194304,
+            chunk_layout: vec![nvme_crc("/dev/u0", 4096, 4096)],
+            created_at: 1,
+            sync_status: Some(SyncStatus::SyncFailed),
+            pinned: false,
+            generation: 7,
+        };
+        let old = OldManifest {
+            entries: HashMap::from([("hypercache://old.bin".to_string(), meta)]),
+            local_alloc: HashMap::from([("/dev/u0".to_string(), 8192)]),
+            free_pools: HashMap::new(),
+            updated_at: 1,
+        };
+        let path = temp_manifest_path("upgradebin").with_extension("bin");
+        std::fs::write(&path, bincode::serialize(&old).unwrap()).unwrap();
+        assert!(bincode::deserialize::<MetadataManifest>(&std::fs::read(&path).unwrap()).is_err());
+
+        let (store, count, _) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            store.get_sync_status("hypercache://old.bin").await.unwrap(),
+            Some(SyncStatus::SyncFailed)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

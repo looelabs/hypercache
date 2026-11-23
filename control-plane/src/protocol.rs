@@ -97,6 +97,10 @@ pub enum Request {
         /// Per-chunk CRC32 values computed by the client, in layout order.
         #[serde(default)]
         chunk_checksums: Option<Vec<u32>>,
+        /// Layout generation returned by `stage_write`. A local-only commit is refused when the
+        /// layout was replaced since, so one writer can never publish another writer's layout.
+        #[serde(default)]
+        generation: Option<u64>,
     },
     Pin {
         uri: String,
