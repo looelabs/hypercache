@@ -1,6 +1,6 @@
 [package]
 name = "hypercache-lmcache-connector"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "LMCache native L2 connector backed by the HyperCache daemon"
