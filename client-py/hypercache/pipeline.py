@@ -1,10 +1,12 @@
 """
-HyperCache Layer-by-Layer Pipelined Loader & Compute-I/O Overlap Engine.
+HyperCache layer-by-layer pipelined loader.
 
-Enables sub-100ms perceived cold starts for LLM inference by:
-1. Immediately loading the Embedding & Layer 0 into GPU VRAM / Host RAM.
-2. Beginning model forward pass execution without waiting for the full 70B model.
-3. Concurrently prefetching Layer i+1 in a background worker while the GPU executes Layer i.
+Reads a model's byte ranges in order and prefetches the next ranges in the background. An
+engine that can run layers as their weights arrive can use this to overlap compute with I/O.
+
+This module only returns bytes. It does not know true layer boundaries unless the caller sets
+`layers`, and it does not run the model. The first token needs every layer, so overlap saves at
+most min(T_io, T_compute). See benchmarks/results/lmcache_and_ttft.md.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ class LayerDescriptor:
 
 class HyperCachePipelinedLoader:
     """
-    Pipelined, compute-overlapped model loader for streaming transformer weights.
+    Pipelined reader for streaming transformer weights in order.
     """
 
     def __init__(
@@ -102,7 +104,8 @@ class HyperCachePipelinedLoader:
     def load_initial_layer(self) -> Tuple[LayerDescriptor, bytes]:
         """
         Synchronously loads Layer 0 / Embedding and triggers background prefetching for Layer 1.
-        Unblocks the inference engine in ~20-50 ms.
+        This takes as long as the first range takes to read: 880 ms for a 1 GB embedding table in
+        benchmarks/results/lmcache_and_ttft.md.
         """
         if not self.layers:
             raise ValueError("No layers found in model.")

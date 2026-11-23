@@ -31,8 +31,9 @@ jobs:
           cargo_v=$(grep -m1 '^version' control-plane/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           py_v=$(grep -m1 '^version' client-py/pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
           init_v=$(grep -m1 '__version__' client-py/hypercache/__init__.py | sed 's/.*"\(.*\)".*/\1/')
-          echo "tag=$RELEASE_TAG Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v"
-          for version in "$cargo_v" "$py_v" "$init_v"; do
+          conn_v=$(grep -m1 '^version' lmcache-connector/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=$RELEASE_TAG Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v lmcache-connector=$conn_v"
+          for version in "$cargo_v" "$py_v" "$init_v" "$conn_v"; do
             if [ "$RELEASE_TAG" != "v$version" ]; then
               echo "::error::Release tag $RELEASE_TAG does not match version $version"
               exit 1
@@ -172,4 +173,28 @@ jobs:
         with:
           packages-dir: dist-pypi/
           password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  # The LMCache connector (lmcache-connector/), built by the same script CI runs. Uploads use PyPI
+  # trusted publishing: no token, but the project must list this repository and this workflow as
+  # a trusted publisher on PyPI, or the upload step fails and nothing is published.
+  publish-pypi-connector:
+    name: Publish LMCache connector (hypercache-lmcache-native) to PyPI
+    runs-on: ubuntu-22.04
+    needs: check-release-tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build wheels (CPython 3.10 to 3.13, manylinux_2_28) and sdist
+        run: scripts/build_connector_wheels.sh dist-connector
+
+      - name: Publish to PyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-connector/
           skip-existing: true

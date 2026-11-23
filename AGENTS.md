@@ -93,6 +93,7 @@ hypercache-poc/
 │   └── tests/
 │       └── s3_live.rs          # #[ignore]d live S3 tests (run by scripts/verify_release.sh)
 │
+├── lmcache-connector/          # LMCache native L2 connector in Rust (PyO3, built with maturin); separate from the daemon
 ├── scripts/
 │   ├── verify_release.sh       # Release verification harness (static, rust, python, e2e, s3, linux, image)
 │   ├── e2e/hypercache_e2e.py   # End-to-end daemon / fleet / S3 scenarios against the real binaries
@@ -110,7 +111,7 @@ hypercache-poc/
     │   ├── datapath.py         # Direct Block DMA / GDS direct I/O reader
     │   ├── fsspec_fs.py        # AbstractFileSystem implementation for torch.load/save
     │   ├── kv_store.py         # Content-addressed KV-Cache Prefix Block Store
-    │   ├── pipeline.py         # Double-buffered pipelined GPU tensor loader
+    │   ├── pipeline.py         # In-order byte-range reader with background prefetch; returns bytes, runs no model
     │   └── integrations/
     │       ├── safetensors_loader.py # Zero-copy Safetensors & vLLM weight loader
     │       └── dcp.py          # PyTorch Distributed Checkpoint (DCP) StorageReader/Writer
@@ -118,6 +119,7 @@ hypercache-poc/
         ├── test_client.py      # Unit tests for UDS protocol and client metadata parsing
         ├── test_fsspec.py      # Unit tests for fsspec file operations and streaming writes
         ├── test_integrations_and_kv.py # Unit tests for Safetensors/vLLM, DCP, and KV-Cache store
+        ├── test_direct_writer.py       # DirectBlockWriter O_DIRECT mode: alignment, partial blocks, fallbacks
         ├── test_pipelined_and_numa.py  # Unit tests for pipelined DMA and NUMA affinity
         └── test_robustness.py  # Thread/fork safety, framing, O_DIRECT bounce buffers, CRC verification
 ```
@@ -306,13 +308,13 @@ cargo build --release --manifest-path control-plane/Cargo.toml
 - **Record changes as you make them.** Add them under `## Unreleased` in `CHANGELOG.md`. The release renames that heading to the new version.
 
 **Release checklist:**
-1. On a branch, bump the version in `control-plane/Cargo.toml`, `client-py/pyproject.toml`, `client-py/hypercache/__init__.py` and the default tag in `.github/workflows/release.yml`. The static stage fails if they disagree. The binaries read their version from Cargo (`env!("CARGO_PKG_VERSION")`), so never hardcode version strings in Rust.
+1. On a branch, bump the version in `control-plane/Cargo.toml`, `client-py/pyproject.toml`, `client-py/hypercache/__init__.py`, `lmcache-connector/Cargo.toml` (its wheel takes the version from there) and the default tag in `.github/workflows/release.yml`. The static stage fails if they disagree. The binaries read their version from Cargo (`env!("CARGO_PKG_VERSION")`), so never hardcode version strings in Rust.
 2. Run `cargo update` only on purpose. `Cargo.lock` is committed and every build uses `--locked`.
 3. In `CHANGELOG.md`, rename `## Unreleased` to the new version and add a line saying what the release is for.
 4. Run the full `scripts/verify_release.sh` until it prints `RESULT: PASSED`.
 5. Open a PR. The maintainer reviews and merges it, because `main` only accepts changes through a PR.
 6. Once CI passes on that commit in `main`, the maintainer tags it: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`.
-7. Check that the `Release Binaries & Container Image` run passed, then check the GitHub release, the container image and the PyPI package.
+7. Check that the `Release Binaries & Container Image` run passed, then check the GitHub release, the container image and both PyPI packages (`hypercache-io` and the LMCache connector, `hypercache-lmcache-native`).
 
 Leave committing, merging, tagging and pushing to the maintainer unless they explicitly ask you to do it.
 

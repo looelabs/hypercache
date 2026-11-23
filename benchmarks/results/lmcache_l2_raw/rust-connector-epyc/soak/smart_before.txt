@@ -1,0 +1,24 @@
+--- nvme1n1
+critical_warning			: 0
+temperature				: 23 °C (296 K)
+percentage_used				: 5%
+media_errors				: 0
+num_err_log_entries			: 0
+--- nvme2n1
+critical_warning			: 0
+temperature				: 23 °C (296 K)
+percentage_used				: 14%
+media_errors				: 0
+num_err_log_entries			: 0
+--- nvme3n1
+critical_warning			: 0
+temperature				: 24 °C (297 K)
+percentage_used				: 26%
+media_errors				: 0
+num_err_log_entries			: 0
+--- nvme4n1
+critical_warning			: 0
+temperature				: 23 °C (296 K)
+percentage_used				: 8%
+media_errors				: 0
+num_err_log_entries			: 0

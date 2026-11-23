@@ -17,7 +17,7 @@ jobs:
   verify:
     name: Lint, test, E2E and live S3 (Linux)
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,7 +30,9 @@ jobs:
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "control-plane -> target"
+          workspaces: |
+            control-plane -> target
+            lmcache-connector -> target
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,6 +45,16 @@ jobs:
           python -m pip install "numpy>=1.22" "fsspec>=2023.1.0" pytest boto3 safetensors pyyaml build
           sudo apt-get install -y -qq lsof
 
+      # In this job, not its own, so the check that main requires covers the connector too.
+      # The tests need no Python or LMCache. The Python bindings are only linted here.
+      - name: LMCache connector
+        working-directory: lmcache-connector
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --features extension-module -- -D warnings
+          cargo test --locked
+
       # Runs every stage except `linux` (the runner already is a clean Linux host) and `k8s`
       # (needs minikube). The s3 stage starts a throwaway versitygw container, and the image
       # stage builds the release image and tests host access to the containerized daemon.
@@ -50,3 +62,21 @@ jobs:
         env:
           PYTHON: python
         run: scripts/verify_release.sh --stages static,rust,python,e2e,s3,image
+
+      # The connector against real LMCache and a real daemon on a 4 KiB-sector loop device: 30
+      # checks of round trips, misses, corruption, O_DIRECT and close. No GPU is needed, so torch is
+      # the CPU build. Its own venv keeps LMCache's pins (numpy, setuptools) away from the harness.
+      - name: LMCache connector end to end (LMCache 0.5.7.post1)
+        run: |
+          python -m venv /tmp/lmcache-venv
+          /tmp/lmcache-venv/bin/pip install -q --upgrade pip
+          /tmp/lmcache-venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          /tmp/lmcache-venv/bin/pip install -q "lmcache==0.5.7.post1" "maturin>=1.8,<2"
+          cargo build --locked --release --bin hypercache --manifest-path control-plane/Cargo.toml
+          (cd lmcache-connector && /tmp/lmcache-venv/bin/maturin build --release -o /tmp/connector-wheel -i /tmp/lmcache-venv/bin/python)
+          /tmp/lmcache-venv/bin/pip install -q --no-deps /tmp/connector-wheel/*.whl
+          scripts/e2e/lmcache_l2_ci.sh --python /tmp/lmcache-venv/bin/python
+
+      # The exact build release.yml publishes, so a break shows up here and not at release time
+      - name: LMCache connector PyPI wheels
+        run: scripts/build_connector_wheels.sh /tmp/dist-connector

@@ -1,0 +1,14 @@
+{"step": "clean_main_stores", "mode": "store", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "clean_fixed_reads_main", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "clean_fixed_stores", "mode": "store", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme4n1": 72, "/dev/nvme2n1": 72, "/dev/nvme1n1": 78, "/dev/nvme3n1": 78}}
+{"step": "clean_fixed_reads_fixed", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme4n1": 72, "/dev/nvme2n1": 72, "/dev/nvme1n1": 78, "/dev/nvme3n1": 78}}
+{"step": "clean_fixed_reads_main_again", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "clean_rollback_reads_main", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "clean_rollback_reads_fixed", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme4n1": 72, "/dev/nvme2n1": 72, "/dev/nvme1n1": 78, "/dev/nvme3n1": 78}}
+{"step": "kill_main_stores", "mode": "store", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "kill_fixed_reads_main", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "kill_fixed_stores", "mode": "store", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme4n1": 72, "/dev/nvme2n1": 72, "/dev/nvme1n1": 78, "/dev/nvme3n1": 78}}
+{"step": "kill_fixed_reads_fixed", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme4n1": 72, "/dev/nvme2n1": 72, "/dev/nvme1n1": 78, "/dev/nvme3n1": 78}}
+{"step": "kill_fixed_reads_main_again", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "kill_rollback_reads_main", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme1n1": 300}}
+{"step": "kill_rollback_reads_fixed", "mode": "check", "objects": 300, "right": 300, "miss": 0, "wrong": 0, "first_chunk": {"/dev/nvme4n1": 72, "/dev/nvme2n1": 72, "/dev/nvme1n1": 78, "/dev/nvme3n1": 78}}

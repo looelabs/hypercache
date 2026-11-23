@@ -280,7 +280,21 @@ impl Server {
                 uri,
                 sha256,
                 write_through,
-            }) => self.handle_commit_write(&uri, sha256, write_through, t_start).await,
+                local_only,
+                chunk_checksums,
+                generation,
+            }) => {
+                if local_only {
+                    if write_through {
+                        Response::error("local_only and write_through cannot be combined".to_string())
+                    } else {
+                        self.handle_commit_local_only(&uri, generation, sha256, chunk_checksums, t_start)
+                            .await
+                    }
+                } else {
+                    self.handle_commit_write(&uri, sha256, write_through, t_start).await
+                }
+            }
             Ok(Request::GetWriteStatus { uri }) => self.handle_get_write_status(&uri).await,
             Ok(Request::PreloadBatch { uris, tier }) => self.handle_preload_batch(uris, tier, t_start).await,
             Ok(Request::RecordTelemetry {
@@ -370,7 +384,9 @@ impl Server {
                     let _ = self.metadata.set_pinned(uri, true).await;
                 }
                 self.record_event("CACHE_HIT", "HIT", uri, meta.object_size, &meta.chunk_layout, t_start);
-                Response::hit(meta.object_size, meta.chunk_size, meta.chunk_layout).with_generation(meta.generation)
+                Response::hit(meta.object_size, meta.chunk_size, meta.chunk_layout)
+                    .with_generation(meta.generation)
+                    .with_sync_status(meta.sync_status)
             }
             Ok(None) => {
                 self.record_event("CACHE_MISS", "MISS", uri, 0, &[], t_start);
@@ -601,6 +617,100 @@ impl Server {
         );
         self.spawn_writeback(uri.to_string(), generation, layout, true);
         Response::write_committed(uri.to_string(), size)
+    }
+
+    /// Commits a staged object that has no authoritative copy. Its data is synced to the cache
+    /// device, but it is never flushed to a backend and stays evictable.
+    ///
+    /// Only a `STAGED` layout can be committed this way, so an object waiting for write-back can
+    /// never lose its flush. With `generation`, the layout must be the one the caller staged.
+    async fn handle_commit_local_only(
+        &self,
+        uri: &str,
+        generation: Option<u64>,
+        sha256: Option<String>,
+        chunk_checksums: Option<Vec<u32>>,
+        t_start: Instant,
+    ) -> Response {
+        let meta = match self.metadata.get_layout(uri).await {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return Response::error(format!("URI '{}' was not staged prior to commit", uri)),
+            Err(e) => return Response::error(format!("Metadata lookup failed for commit: {}", e)),
+        };
+        if let Some(staged) = generation {
+            if staged != meta.generation {
+                return Response::error(format!(
+                    "'{}' was replaced since it was staged (staged generation {}, current {})",
+                    uri, staged, meta.generation
+                ));
+            }
+        }
+        if meta.sync_status != Some(SyncStatus::Staged) {
+            let status = meta.sync_status.map_or("none", SyncStatus::as_str);
+            return Response::error(format!(
+                "'{}' is {}, not STAGED: only a staged write can be committed as local-only",
+                uri, status
+            ));
+        }
+        if let Err(e) = verify_ram_chunks_written(&meta.chunk_layout) {
+            error!("Commit of '{}' rejected: {:#}", uri, e);
+            return Response::error(format!("{:#}", e));
+        }
+        if let Err(e) = self.ingestion.striper().sync_chunks(&meta.chunk_layout).await {
+            return Response::error(format!("Failed to flush staged data to stable storage: {:#}", e));
+        }
+        // With a digest, the daemon hashes the staged data itself and records its own CRCs. Any
+        // CRCs the client also sent must then agree with what is really on the device.
+        let mut chunk_checksums = chunk_checksums;
+        if let Some(expected) = sha256.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            match self.ingestion.digest_layout(&meta.chunk_layout).await {
+                Ok((actual, crcs)) => {
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        error!(
+                            "Commit of '{}' rejected: SHA-256 mismatch (expected {}, got {})",
+                            uri, expected, actual
+                        );
+                        return Response::error(format!(
+                            "SHA-256 mismatch for '{}': client reported {}, staged data hashes to {}",
+                            uri, expected, actual
+                        ));
+                    }
+                    if chunk_checksums.as_ref().is_some_and(|client| *client != crcs) {
+                        return Response::error(format!(
+                            "Checksum mismatch for '{}': the client's chunk CRC32s differ from the staged data",
+                            uri
+                        ));
+                    }
+                    chunk_checksums = Some(crcs);
+                }
+                Err(e) => return Response::error(format!("Failed to verify staged data for '{}': {:#}", uri, e)),
+            }
+        }
+        if let Some(crcs) = chunk_checksums {
+            if !self.metadata.set_chunk_checksums(uri, meta.generation, &crcs).await {
+                return Response::error(format!(
+                    "Could not record {} checksum(s) for '{}': the layout changed or has a different chunk count",
+                    crcs.len(),
+                    uri
+                ));
+            }
+        }
+        if !self
+            .metadata
+            .update_sync_status_if_generation(uri, meta.generation, SyncStatus::LocalOnly)
+            .await
+        {
+            return Response::error(format!("'{}' was replaced or evicted during commit", uri));
+        }
+        info!(
+            "Committed local-only write for '{}': {} bytes in {:.2} ms.",
+            uri,
+            meta.object_size,
+            t_start.elapsed().as_secs_f64() * 1000.0
+        );
+        // The reply says LOCAL_ONLY, so a client can tell this daemon really kept the object local.
+        // An older daemon ignores local_only and replies COMMITTED.
+        Response::write_committed(uri.to_string(), meta.object_size).with_sync_status(Some(SyncStatus::LocalOnly))
     }
 
     /// Flushes a committed object to the authoritative backend in the background, retrying
@@ -1064,6 +1174,240 @@ mod tests {
             f.write_all(&data[pos..pos + c.length as usize]).unwrap();
             pos += c.length as usize;
         }
+    }
+
+    #[tokio::test]
+    async fn test_local_only_commit_is_never_flushed_and_stays_evictable() {
+        let (server, dir) = nvme_server("local", 16, |config| {
+            // A flush attempt would be visible: this path would appear under the NFS root.
+            config.authoritative_backend = "nfs".to_string();
+        });
+        let uri = "hypercache://kv_cache/model/0/0/_/abc.kv";
+        let data: Vec<u8> = (0..(2 * 1024 * 1024 + 123)).map(|i| (i % 251) as u8).collect();
+        let t = Instant::now();
+
+        let staged = server
+            .handle_stage_write(uri, data.len() as u64, None, false, false, false, t)
+            .await;
+        let layout = staged.chunk_layout.unwrap();
+        write_staged(&server, &layout, &data).await;
+
+        // Before commit, locate reports the staged status so a reader can refuse the object
+        let before = server.handle_locate(uri, false, None, false, t).await;
+        assert_eq!(before.sync_status, Some(SyncStatus::Staged));
+
+        let mut pos = 0usize;
+        let crcs: Vec<u32> = layout
+            .iter()
+            .map(|c| {
+                let crc = crc32fast::hash(&data[pos..pos + c.length as usize]);
+                pos += c.length as usize;
+                crc
+            })
+            .collect();
+        let committed = server
+            .handle_commit_local_only(uri, staged.generation, None, Some(crcs.clone()), t)
+            .await;
+        assert_eq!(committed.status, crate::protocol::ResponseStatus::WriteCommitted);
+        // The reply proves this daemon kept the object local; an older one would say COMMITTED
+        assert_eq!(committed.sync_status, Some(SyncStatus::LocalOnly));
+
+        let after = server.handle_locate(uri, false, None, false, t).await;
+        assert_eq!(after.sync_status, Some(SyncStatus::LocalOnly));
+        let recorded: Vec<u32> = after
+            .chunk_layout
+            .unwrap()
+            .iter()
+            .map(|c| c.checksum.unwrap())
+            .collect();
+        assert_eq!(recorded, crcs);
+
+        let meta = server.metadata().get_layout(uri).await.unwrap().unwrap();
+        assert!(!meta.is_dirty(), "local-only objects must stay evictable");
+        assert!(server.metadata().list_dirty_entries().await.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            files,
+            vec![std::ffi::OsString::from("dev0.raw")],
+            "no backend flush may run"
+        );
+        assert_eq!(
+            server.metadata().get_sync_status(uri).await.unwrap(),
+            Some(SyncStatus::LocalOnly)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_only_commit_rejects_wrong_checksum_count_and_write_through() {
+        let (server, dir) = nvme_server("localbad", 16, |_| {});
+        let uri = "hypercache://kv_cache/model/0/0/_/bad.kv";
+        let t = Instant::now();
+        let staged = server.handle_stage_write(uri, 4096, None, false, false, false, t).await;
+        write_staged(&server, &staged.chunk_layout.unwrap(), &[7u8; 4096]).await;
+
+        let bad = server
+            .handle_commit_local_only(uri, None, None, Some(vec![1, 2, 3]), t)
+            .await;
+        assert_eq!(bad.status, crate::protocol::ResponseStatus::Error);
+        assert_eq!(
+            server.metadata().get_sync_status(uri).await.unwrap(),
+            Some(SyncStatus::Staged)
+        );
+
+        let line = format!(r#"{{"action":"commit_write","uri":"{uri}","local_only":true,"write_through":true}}"#);
+        let conflict = server.handle_request_line(&line).await;
+        assert_eq!(conflict.status, crate::protocol::ResponseStatus::Error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn crc_per_chunk(layout: &[ChunkDescriptor], data: &[u8]) -> Vec<u32> {
+        let mut pos = 0usize;
+        layout
+            .iter()
+            .map(|c| {
+                let crc = crc32fast::hash(&data[pos..pos + c.length as usize]);
+                pos += c.length as usize;
+                crc
+            })
+            .collect()
+    }
+
+    fn local_commit_line(uri: &str, generation: Option<u64>, extra: &str) -> String {
+        let generation = generation.map_or(String::new(), |g| format!(r#","generation":{g}"#));
+        format!(r#"{{"action":"commit_write","uri":"{uri}","local_only":true{generation}{extra}}}"#)
+    }
+
+    #[tokio::test]
+    async fn test_local_only_commit_refuses_a_layout_staged_by_someone_else() {
+        // Two writers of one key: B re-stages while A is writing. A's commit must not publish B's
+        // layout, whose data may not be written yet (durable before visible).
+        let (server, dir) = nvme_server("localgen", 16, |_| {});
+        let uri = "hypercache://kv_cache/model/0/0/_/gen.kv";
+        let t = Instant::now();
+        let data = vec![3u8; 8192];
+        let a = server.handle_stage_write(uri, 8192, None, false, false, false, t).await;
+        write_staged(&server, a.chunk_layout.as_ref().unwrap(), &data).await;
+        let b = server.handle_stage_write(uri, 8192, None, false, false, false, t).await;
+        assert_ne!(a.generation, b.generation);
+        let crcs = crc_per_chunk(a.chunk_layout.as_ref().unwrap(), &data);
+
+        let line = local_commit_line(uri, a.generation, &format!(r#","chunk_checksums":{crcs:?}"#));
+        let stale = server.handle_request_line(&line).await;
+        assert_eq!(stale.status, crate::protocol::ResponseStatus::Error);
+        assert!(stale.error_message.unwrap().contains("replaced since it was staged"));
+        let meta = server.metadata().get_layout(uri).await.unwrap().unwrap();
+        assert_eq!(
+            meta.sync_status,
+            Some(SyncStatus::Staged),
+            "B's layout stays unpublished"
+        );
+        assert_eq!(Some(meta.generation), b.generation);
+
+        // B, the current writer, can still commit its own layout
+        write_staged(&server, b.chunk_layout.as_ref().unwrap(), &data).await;
+        let line = local_commit_line(uri, b.generation, &format!(r#","chunk_checksums":{crcs:?}"#));
+        let ok = server.handle_request_line(&line).await;
+        assert_eq!(ok.status, crate::protocol::ResponseStatus::WriteCommitted);
+        assert_eq!(ok.sync_status, Some(SyncStatus::LocalOnly));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_only_commit_never_turns_a_dirty_object_local() {
+        // An object waiting for write-back must keep its flush: a local-only commit of it is refused
+        let (server, dir) = nvme_server("localdirty", 16, |config| {
+            config.authoritative_backend = "nfs".to_string();
+        });
+        let uri = "hypercache://checkpoints/step1.bin";
+        let t = Instant::now();
+        let staged = server.handle_stage_write(uri, 4096, None, false, false, false, t).await;
+        write_staged(&server, &staged.chunk_layout.unwrap(), &[9u8; 4096]).await;
+        let generation = staged.generation.unwrap();
+        // Committed and still dirty, as it is while write-back runs or after it failed
+        assert!(
+            server
+                .metadata()
+                .update_sync_status_if_generation(uri, generation, SyncStatus::SyncFailed)
+                .await
+        );
+
+        for line in [
+            local_commit_line(uri, None, ""),
+            local_commit_line(uri, Some(generation), ""),
+        ] {
+            let refused = server.handle_request_line(&line).await;
+            assert_eq!(refused.status, crate::protocol::ResponseStatus::Error);
+            assert!(refused.error_message.unwrap().contains("not STAGED"));
+        }
+        let meta = server.metadata().get_layout(uri).await.unwrap().unwrap();
+        assert_eq!(meta.sync_status, Some(SyncStatus::SyncFailed));
+        assert!(meta.is_dirty(), "the object must still be flushed and not evictable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_only_commit_verifies_a_requested_sha256() {
+        use sha2::{Digest, Sha256};
+        let (server, dir) = nvme_server("localsha", 16, |_| {});
+        let t = Instant::now();
+        let data: Vec<u8> = (0..(1024 * 1024 + 4096)).map(|i| (i % 253) as u8).collect();
+        let digest = hex::encode(Sha256::digest(&data));
+
+        // A torn write: the staged data isn't what the client meant to write
+        let torn = "hypercache://kv_cache/model/0/0/_/torn.kv";
+        let staged = server
+            .handle_stage_write(torn, data.len() as u64, None, false, false, false, t)
+            .await;
+        let mut wrong = data.clone();
+        wrong[100] ^= 0xff;
+        write_staged(&server, &staged.chunk_layout.unwrap(), &wrong).await;
+        let line = local_commit_line(torn, staged.generation, &format!(r#","sha256":"{digest}""#));
+        let refused = server.handle_request_line(&line).await;
+        assert_eq!(refused.status, crate::protocol::ResponseStatus::Error);
+        assert!(refused.error_message.unwrap().contains("SHA-256 mismatch"));
+        assert_eq!(
+            server.metadata().get_sync_status(torn).await.unwrap(),
+            Some(SyncStatus::Staged)
+        );
+
+        // Client CRCs that disagree with the device are refused when a digest is checked
+        let good = "hypercache://kv_cache/model/0/0/_/good.kv";
+        let staged = server
+            .handle_stage_write(good, data.len() as u64, None, false, false, false, t)
+            .await;
+        let layout = staged.chunk_layout.unwrap();
+        write_staged(&server, &layout, &data).await;
+        let crcs = crc_per_chunk(&layout, &data);
+        let bad_crcs: Vec<u32> = crcs.iter().map(|c| c ^ 1).collect();
+        let line = local_commit_line(
+            good,
+            staged.generation,
+            &format!(r#","sha256":"{digest}","chunk_checksums":{bad_crcs:?}"#),
+        );
+        let refused = server.handle_request_line(&line).await;
+        assert_eq!(refused.status, crate::protocol::ResponseStatus::Error);
+        assert!(refused.error_message.unwrap().contains("Checksum mismatch"));
+
+        // The right digest commits and records the daemon's own CRCs
+        let line = local_commit_line(good, staged.generation, &format!(r#","sha256":"{digest}""#));
+        let ok = server.handle_request_line(&line).await;
+        assert_eq!(ok.status, crate::protocol::ResponseStatus::WriteCommitted);
+        let recorded: Vec<u32> = server
+            .handle_locate(good, false, None, false, t)
+            .await
+            .chunk_layout
+            .unwrap()
+            .iter()
+            .map(|c| c.checksum.unwrap())
+            .collect();
+        assert_eq!(recorded, crcs);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

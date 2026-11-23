@@ -67,6 +67,12 @@ if layout.is_hit:
 
 ---
 
+## LMCache
+
+The LMCache integration isn't part of this package. It's a separate Rust connector, covered in [`lmcache-connector/README.md`](../lmcache-connector/README.md). For code that manages its own KV blocks, use `HyperCacheKVStore` from this package.
+
+---
+
 ## Running Unit Tests
 
 ```bash

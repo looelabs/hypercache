@@ -2,18 +2,33 @@
 HyperCache KV-Cache Prefix Block Store (`HyperCacheKVStore`).
 
 Provides a content-addressed key-value block interface over HyperCache's Tier-1
-Host RAM (`/dev/shm` / HugePages) and Tier-2 Striped NVMe engine, enabling
-plug-and-play KV-cache offloading for LMCache, vLLM prefix caching, and
-NVIDIA Dynamo KVBM.
+Host RAM (`/dev/shm` / HugePages) and Tier-2 Striped NVMe engine.
+
+This is a building block for code that manages its own KV-cache blocks. For LMCache,
+use the connector in `lmcache-connector/`. There is no NVIDIA Dynamo KVBM integration.
+
+Blocks stay on this host and remain evictable, unless write_through=True asks for a
+synchronous backend flush.
+
+Every block is checked against per-chunk CRC32 values on read, and a block whose state or
+checksums can't be confirmed is a miss: a wrong block is never returned.
 """
 
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Optional, Sequence, Union
+import logging
+import zlib
+from typing import Any, List, Optional, Sequence, Union
 
 from hypercache.client import HyperCacheClient
-from hypercache.datapath import DirectBlockWriter, get_data_reader
+from hypercache.datapath import ChunkLocation, DirectBlockWriter, get_data_reader
+
+logger = logging.getLogger(__name__)
+
+# States in which a block's data is complete and stays put: LOCAL_ONLY for normal blocks,
+# SYNCED_BACKEND for write-through ones. Anything else (staged, being rewritten, unknown) is a miss.
+_READABLE_STATES = ("LOCAL_ONLY", "SYNCED_BACKEND")
 
 
 class HyperCacheKVStore:
@@ -102,8 +117,36 @@ class HyperCacheKVStore:
         if not stage_res.is_staged:
             return False
 
-        self._writer.write_chunks(stage_res.chunk_layout, raw_bytes)
-        return self._client.commit_write(uri, write_through=self.write_through)
+        layout = stage_res.chunk_layout
+        try:
+            if sum(c.length for c in layout) != len(raw_bytes):
+                raise IOError(f"staged layout for {uri} does not match the block size")
+            self._writer.write_chunks(layout, raw_bytes)
+            if self.write_through:
+                # The daemon verifies the digest and records per-chunk CRCs from it
+                committed = self._client.commit_write(
+                    uri, sha256=hashlib.sha256(raw_bytes).hexdigest(), write_through=True
+                )
+            else:
+                committed = self._client.commit_write(
+                    uri,
+                    local_only=True,
+                    chunk_checksums=_chunk_crcs(layout, raw_bytes),
+                    generation=stage_res.generation,
+                )
+        except Exception:
+            self._discard(uri)
+            raise
+        if not committed:
+            self._discard(uri)
+        return committed
+
+    def _discard(self, uri: str) -> None:
+        # A block that failed to store must not linger: it may be unwritten or not local-only
+        try:
+            self._client.evict(uri)
+        except Exception as e:  # noqa: BLE001 - best effort; the block is unreadable anyway
+            logger.warning(f"Could not evict failed KV block {uri}: {e}")
 
     def get_kv_block(
         self,
@@ -117,35 +160,66 @@ class HyperCacheKVStore:
         """
         uri = self._make_uri(block_key)
         loc = self._client.locate(uri, auto_ingest=False)
-        if not loc.is_hit:
+        if not self._is_readable(loc):
+            return None
+        if out_tensor is not None and _nbytes(out_tensor) != loc.object_size:
+            # A buffer of another size can't hold this block; leave it untouched
+            return None
+
+        # Read to host memory and check every chunk before anything reaches the caller, so a
+        # stale or torn block is a miss rather than wrong data in out_tensor
+        try:
+            raw = bytes(self._reader.read_range(loc.chunk_layout, 0, loc.object_size))
+        except (IOError, OSError) as e:
+            logger.warning(f"KV block {uri} could not be read, treating it as a miss: {e}")
+            return None
+        if len(raw) != loc.object_size or _chunk_crcs(loc.chunk_layout, raw) != [
+            c.checksum for c in loc.chunk_layout
+        ]:
+            logger.warning(f"KV block {uri} failed its checksum, treating it as a miss")
             return None
 
         if out_tensor is not None:
-            try:
-                import torch
-                if isinstance(out_tensor, torch.Tensor):
-                    if out_tensor.is_cuda:
-                        self._reader.read_into_gpu(
-                            loc.chunk_layout,
-                            start_offset=0,
-                            length=loc.object_size,
-                            gpu_buffer=out_tensor.view(torch.uint8).reshape(-1),
-                        )
-                    else:
-                        raw = self._reader.read_range(loc.chunk_layout, 0, loc.object_size)
-                        src = torch.frombuffer(bytearray(raw), dtype=out_tensor.dtype).reshape(out_tensor.shape)
-                        out_tensor.copy_(src)
-                    return out_tensor
-            except ImportError:
-                pass
+            import torch
 
-        return bytes(self._reader.read_range(loc.chunk_layout, 0, loc.object_size))
+            src = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+            out_tensor.view(torch.uint8).reshape(-1).copy_(src)
+            return out_tensor
+        return raw
 
     def exists_kv_block(self, block_key: str) -> bool:
         uri = self._make_uri(block_key)
-        return self._client.locate(uri, auto_ingest=False).is_hit
+        return self._is_readable(self._client.locate(uri, auto_ingest=False))
+
+    @staticmethod
+    def _is_readable(loc: Any) -> bool:
+        # Only a finished block whose every chunk has a recorded CRC can be verified. A staged
+        # layout is published before its data is written, and an old daemon reports no state.
+        layout = loc.chunk_layout or []
+        return (
+            loc.is_hit
+            and loc.sync_status in _READABLE_STATES
+            and bool(layout)
+            and all(c.checksum is not None for c in layout)
+            and sum(c.length for c in layout) == loc.object_size
+        )
 
     def close(self) -> None:
         self._reader.close()
         self._writer.close()
         self._client.close()
+
+
+def _chunk_crcs(layout: List[ChunkLocation], data: bytes) -> List[int]:
+    """CRC32 of each chunk's slice of the block, in layout order."""
+    view = memoryview(data)
+    crcs = []
+    position = 0
+    for chunk in layout:
+        crcs.append(zlib.crc32(view[position : position + chunk.length]) & 0xFFFFFFFF)
+        position += chunk.length
+    return crcs
+
+
+def _nbytes(tensor: Any) -> int:
+    return tensor.numel() * tensor.element_size()

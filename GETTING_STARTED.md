@@ -309,3 +309,44 @@ scrape_configs:
 4. **Proxies and Sidecars**: If the controller sits behind a local proxy (Istio/Envoy sidecar, nginx, `kubectl port-forward`), set `allow_local_admin_bypass = false` in `hypercache-controller.toml`. Otherwise forwarded remote calls arrive from `127.0.0.1` and skip the token check.
 5. **Restrict Filesystem Access**: `file://` and `nfs://` URIs may only reach `nfs_mount_path` and the directories listed in `nfs_allowed_paths`. Add dataset or checkpoint directories there explicitly instead of widening `nfs_mount_path` to `/`.
 6. **Verify Before Rollout**: Run `scripts/verify_release.sh` on the build you deploy. It exercises the daemon, the fleet controller and a live S3 endpoint end to end.
+
+---
+
+## 9. KV-Cache Storage for LMCache
+
+The connector in `lmcache-connector/` lets an LMCache server in multiprocess mode keep KV-cache chunks on HyperCache's NVMe tier. It's tested with LMCache 0.5.5, 0.5.6 and 0.5.7.post1 and vLLM 0.31.0 and 0.33.0. In the `vllm/vllm-openai:v0.33.0` image, install LMCache 0.5.7.post1: the image's 0.5.6 can't load its GPU kernels there, and its fallback can store wrong KV data. The [connector quick start](lmcache-connector/README.md#quick-start-with-vllm) has a complete example, including the daemon config for a dedicated drive and running in containers.
+
+**1. Install it** where the LMCache server runs: `pip install hypercache-lmcache-native` (Linux x86_64, CPython 3.10 to 3.13; published from the first release that includes it, at the same version as the daemon). To build it yourself instead, you need a Rust toolchain and maturin. Use the same Python that runs LMCache:
+
+```bash
+cd lmcache-connector
+maturin build --release -i python3.12
+pip install target/wheels/hypercache_lmcache_native-*.whl
+```
+
+**2. Start the daemon** on the node, as in section 3.
+
+**3. Start LMCache with the connector:**
+
+```bash
+lmcache server --l1-size-gb 60 --eviction-policy LRU --l1-align-bytes 4096 --l2-adapter '{
+  "type": "native_plugin",
+  "module_path": "hypercache_lmcache_native",
+  "class_name": "HyperCacheNativeConnector",
+  "adapter_params": {"namespace": "my-model-rev-abc123", "tier": "nvme", "num_workers": 32},
+  "max_capacity_gb": 0
+}'
+```
+
+Change `namespace` whenever the model weights, dtype or engine settings change, because LMCache's key has no model revision. Keep `max_capacity_gb` at 0, since the daemon owns capacity. Use `num_workers` 8 on one drive and 32 on four. If LMCache runs in a container, give it the daemon's socket directory and the drives (`--device`); without the drives every store fails and LMCache silently runs on L1 alone.
+
+**4. Point vLLM at the LMCache server** (add `--host` and `--port` to `lmcache server` above to fix where it listens; the example uses 127.0.0.1:18555):
+
+```bash
+vllm serve <model> --kv-transfer-config '{"kv_connector": "LMCacheMPConnector", "kv_role": "kv_both",
+  "kv_connector_extra_config": {"lmcache.mp.host": "127.0.0.1", "lmcache.mp.port": 18555}}'
+```
+
+**5. Check the GPU kernels and the cache.** `python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"` must print `None` in the LMCache server's environment. Then send the same long prompt twice: the second first-token time should drop. `scripts/e2e/lmcache_vllm_e2e.py` also checks that answers loaded from the drive match cold ones.
+
+The settings, behaviour and limits are in [`lmcache-connector/README.md`](lmcache-connector/README.md), and measurements are in [`benchmarks/results/lmcache_rust_connector_nvme.md`](benchmarks/results/lmcache_rust_connector_nvme.md).

@@ -74,6 +74,7 @@ else
 fi
 
 CARGO_MANIFEST="control-plane/Cargo.toml"
+CONNECTOR_MANIFEST="lmcache-connector/Cargo.toml"
 RELEASE_DIR="$REPO_ROOT/control-plane/target/release"
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hc-verify-logs.XXXXXX")"
 
@@ -124,13 +125,16 @@ section() { echo; echo "== $1"; }
 # ------------------------------------------------------------------------------
 
 check_versions() {
-    local cargo_v py_v init_v rel_v
+    local cargo_v py_v init_v rel_v conn_v
     cargo_v=$(grep -m1 '^version' control-plane/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
     py_v=$(grep -m1 '^version' client-py/pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
     init_v=$(grep -m1 '__version__' client-py/hypercache/__init__.py | sed 's/.*"\(.*\)".*/\1/')
     rel_v=$(grep -m1 'default: "v' .github/workflows/release.yml | sed 's/.*"v\(.*\)".*/\1/')
-    echo "Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v release.yml=$rel_v"
-    [ -n "$cargo_v" ] && [ "$cargo_v" = "$py_v" ] && [ "$cargo_v" = "$init_v" ] && [ "$cargo_v" = "$rel_v" ]
+    # The LMCache connector's wheel takes its version from its Cargo.toml (pyproject is dynamic)
+    conn_v=$(grep -m1 '^version' lmcache-connector/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+    echo "Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v release.yml=$rel_v lmcache-connector=$conn_v"
+    [ -n "$cargo_v" ] && [ "$cargo_v" = "$py_v" ] && [ "$cargo_v" = "$init_v" ] && [ "$cargo_v" = "$rel_v" ] \
+        && [ "$cargo_v" = "$conn_v" ]
 }
 
 check_no_hardcoded_versions() {
@@ -208,7 +212,8 @@ except ImportError:
     except ImportError:
         print("tomllib unavailable (Python < 3.11); skipping")
         sys.exit(0)
-for f in glob.glob("configs/*.toml") + ["control-plane/Cargo.toml", "client-py/pyproject.toml", "control-plane/rustfmt.toml"]:
+for f in glob.glob("configs/*.toml") + ["control-plane/Cargo.toml", "client-py/pyproject.toml", "control-plane/rustfmt.toml",
+                                         "lmcache-connector/Cargo.toml", "lmcache-connector/pyproject.toml"]:
     with open(f, "rb") as fh:
         tomllib.load(fh)
     print(f"{f}: ok")
@@ -229,10 +234,13 @@ check_config_keys_load() {
 
 stage_static() {
     section "static"
-    step "version numbers agree (Cargo, pyproject, __init__, release.yml)" check_versions
+    step "version numbers agree (Cargo, pyproject, __init__, release.yml, lmcache-connector)" check_versions
     step "no hardcoded version strings in Rust sources and tests" check_no_hardcoded_versions
     step "zero-emoji policy (AGENTS.md rule 1)" check_emoji_policy
     step "cargo fmt --check" cargo fmt --manifest-path "$CARGO_MANIFEST" -- --check
+    step "lmcache-connector: cargo fmt --check" cargo fmt --manifest-path "$CONNECTOR_MANIFEST" -- --check
+    step "lmcache-connector: cargo clippy -D warnings" \
+        cargo clippy --locked --manifest-path "$CONNECTOR_MANIFEST" --all-targets -- -D warnings
     step "cargo clippy --all-targets -D warnings (Cargo.lock locked)" \
         cargo clippy --locked --manifest-path "$CARGO_MANIFEST" --all-targets -- -D warnings
     step "python byte-compile (client + scripts)" check_python_compile
@@ -271,6 +279,7 @@ check_missing_config_is_error() {
 stage_rust() {
     section "rust"
     step "cargo test (unit + integration, locked)" cargo test --locked --manifest-path "$CARGO_MANIFEST"
+    step "lmcache-connector: cargo test" cargo test --locked --manifest-path "$CONNECTOR_MANIFEST"
     step "cargo build --release" cargo build --locked --release --manifest-path "$CARGO_MANIFEST"
     step "release binaries: --version and every subcommand --help" check_binaries
     step "daemon refuses to start without a config file" check_missing_config_is_error
