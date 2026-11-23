@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- The README now gives the real minimum Rust version for building from source, 1.88 (the locked
+  dependencies need it; it said 1.75), and Python 3.10 for the LMCache connector.
+
 ## 0.10.1
 
 Faster stores for KV cache and for many small commits: KV blocks no longer wait for a device flush,
