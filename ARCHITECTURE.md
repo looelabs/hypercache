@@ -400,7 +400,7 @@ loader = DataLoader(dataset, batch_size=16, num_workers=4)
 - **No flush for local-only commits:** while the daemon runs, a marker file next to the manifest (`*.local-only-unflushed`) says that local-only data may not have reached stable storage, and local-only commits skip the device flush. A clean shutdown stops skipping, flushes every device, writes the manifest and only then removes the marker. A daemon that finds the marker at startup did not stop cleanly and drops every local-only entry, returning its space. Other commits flush as before, and concurrent flushes on a device are shared (`ingestion/flush_gate.rs`).
 - **Data path:** workers read and write chunks directly on the devices the layout names, with `O_DIRECT` into LMCache's page-aligned L1 buffers, and verify a CRC32 per chunk on load.
 - **Failure rule:** any doubt is a miss. A block that fails its checksum is evicted. If the daemon restarts, workers reconnect, and a request the daemon may have received is never resent.
-- **Concurrency:** a worker handles one object at a time and reads its chunks in order, so `num_workers` sets the queue depth.
+- **Concurrency:** a worker handles one object at a time and reads or writes its chunks in order, so `num_workers` sets how many objects are in flight. Enterprise drives are fastest with many (32); DRAM-less drives with about 4, because many concurrent objects make their writes interleave on flash and their reads random.
 
 See [`lmcache-connector/README.md`](lmcache-connector/README.md).
 

@@ -40,8 +40,9 @@ with an empty LMCache memory cache (L1) and the page cache dropped, so every loa
 Storing costs almost nothing on the first send. The output text matched the no-cache answer on 9 of
 9 prompts in every phase, including from the drive.
 
-At 14k tokens the drive adds about 0.42 s over L1 for about 770 MB of KV, about 1.8 GB/s. That is
-this drive's limit, not the connector's or LMCache's (see [Load speed](#load-speed)). Also, a second
+At 14k tokens the drive adds about 0.42 s over L1 for about 770 MB of KV, about 1.8 GB/s, with the
+connector's default 32 workers. Later tests found that this drive loads 2.2 to 3.0 times as fast
+with 4 workers (see [Load speed](#load-speed)). Also, a second
 send right after a load from the drive loaded from the drive again: LMCache 0.5.7.post1 didn't keep
 those chunks in L1.
 
@@ -49,11 +50,17 @@ those chunks in L1.
 
 Measured 2026-11-23 on the same machine, HyperCache at `a5bfbc9`, page cache dropped before each read.
 
-- **The drive is the limit.** On data that has been written, fio reads this drive at 2.1 to 3.1 GB/s
+**Correction (2026-11-23):** the first two points below were wrong. With 4 workers on both stores and
+loads, the connector loaded this drive at 4.3 to 4.9 GB/s through LMCache `bench l2`. With many
+objects written and read at once, this DRAM-less drive's reads turn random and slow down. See
+[`lmcache_connector_workers.md`](lmcache_connector_workers.md). The TTFT runs above weren't repeated
+with 4 workers.
+
+- **The drive is the limit (wrong, see above).** On data that has been written, fio reads this drive at 2.1 to 3.1 GB/s
   with 4 MiB random reads from 8 or 32 threads, 4.1 GB/s with 32 reads in flight from one thread,
   and 5 to 6 GB/s sequentially. On discarded blocks it reports about 7 GB/s, but the drive
   answers those without reading flash, so that number doesn't apply to stored KV.
-- **The connector reaches that limit.** Loading 55 blocks of 14 MiB (one 14k-token prompt) with the
+- **The connector reaches that limit (wrong, see above).** Loading 55 blocks of 14 MiB (one 14k-token prompt) with the
   connector alone, no LMCache, ran at 1.9 to 2.6 GB/s with 8, 32 or 64 workers, aligned or
   unaligned buffers. The 55 daemon lookups took 2.7 ms in total.
 - **Placement isn't the cause.** Most blocks are already stored contiguously (51 of 55 when stored 32

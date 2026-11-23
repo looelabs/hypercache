@@ -113,9 +113,27 @@ vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --kv-transfer-config \
 | `namespace` | Required. Must change when the model weights, dtype or engine settings change. LMCache's key has a model name but no revision, so without this a weight change could return wrong KV data. |
 | `socket_path` | Daemon socket. Defaults to the same search order as the Python client. |
 | `tier` | `nvme` (default) or `ram`. For `ram`, LMCache must share `/dev/shm` with the daemon. |
-| `num_workers` | Objects read or written at once, per direction (default 32). Each object is read one chunk at a time, so this sets the queue depth. On one drive, 8 loaded fastest. On 4 drives, 32 did. |
+| `num_workers` | Objects read or written at once, per direction (default 32). Each object is read or written front to back, one chunk at a time. Keep 32 on enterprise drives; set 4 on consumer or DRAM-less drives. See [Tuning](#tuning). |
 | `timeout_s` | Daemon request timeout in seconds (default 30). Commits get at least 300. |
 | `max_capacity_gb` | Keep at 0. The daemon owns capacity and evicts under pressure. |
+
+## Tuning
+
+`num_workers` is how many objects are written at once and how many are read at once. The right number depends on the drive:
+
+- **Enterprise NVMe drives (with their own DRAM): keep the default 32.** On 4 Micron 7450 drives, 32 workers loaded fastest: 25.0 GB/s for 14 MiB blocks, against 22.5 with 16 and 16.1 with 8.
+- **Consumer or DRAM-less drives: set `"num_workers": 4`.** These drives keep little of their address map on board. With many objects written at once, the data lands interleaved on flash, and with many read at once the reads turn random, so their latency jumps (from about 2 to 13 ms per request on the drive below). On one Samsung MZVL8256HFJD (Gen4 x4, no DRAM), LMCache `bench l2` in GB/s:
+
+| Block | Loads, 4 workers | Loads, 32 (default) | Stores, 4 workers | Stores, 32 |
+|---|---|---|---|---|
+| 2 MiB | 4.93 | 1.62 | 3.09 | 3.16 |
+| 6 MiB | 4.29 | 1.76 | 3.26 | 3.14 |
+| 14 MiB | 4.65 | 2.13 | 3.27 | 3.12 |
+
+  Both directions need the lower count: writing with 4 and reading with 32, or the other way round, loaded at only 1.6-2.5 GB/s. With two such drives, 4 to 6 workers were fastest.
+- **Not sure?** Run `lmcache bench l2` with 4, 8, 16 and 32 workers on your drives and keep the fastest. `nvme id-ctrl /dev/nvmeX | grep hmpre` prints a nonzero value on a DRAM-less drive that borrows host memory instead.
+
+Full results, hardware and versions: [`benchmarks/results/lmcache_connector_workers.md`](../benchmarks/results/lmcache_connector_workers.md).
 
 ## Check LMCache's GPU kernels first
 

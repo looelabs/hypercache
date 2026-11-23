@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Docs
+- LMCache connector: how to set `num_workers` for the drive type. Keep 32 on enterprise drives; on
+  consumer or DRAM-less drives set 4, which loaded 2.2-3.0 times as fast with no loss on stores.
+  Results in `benchmarks/results/lmcache_connector_workers.md`.
+- Benchmarks: removed the results for the old Python LMCache adapter, which the Rust connector
+  replaced. The Python client's pipelined loader and O_DIRECT probe results moved to
+  `benchmarks/results/python_client.md`.
 - The README now gives the real minimum Rust version for building from source, 1.88 (the locked
   dependencies need it; it said 1.75), and Python 3.10 for the LMCache connector.
 

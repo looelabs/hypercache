@@ -340,7 +340,7 @@ lmcache server --l1-size-gb 60 --eviction-policy LRU --l1-align-bytes 4096 --l2-
 }'
 ```
 
-Change `namespace` whenever the model weights, dtype or engine settings change, because LMCache's key has no model revision. Keep `max_capacity_gb` at 0, since the daemon owns capacity. Use `num_workers` 8 on one drive and 32 on four. If LMCache runs in a container, give it the daemon's socket directory and the drives (`--device`); without the drives every store fails and LMCache silently runs on L1 alone.
+Change `namespace` whenever the model weights, dtype or engine settings change, because LMCache's key has no model revision. Keep `max_capacity_gb` at 0, since the daemon owns capacity. Keep `num_workers` at 32 on enterprise NVMe drives. On consumer or DRAM-less drives set it to 4, which loaded 2.2-3.0 times as fast in our tests (see "Tuning" in the connector README). If LMCache runs in a container, give it the daemon's socket directory and the drives (`--device`); without the drives every store fails and LMCache silently runs on L1 alone.
 
 **4. Point vLLM at the LMCache server** (add `--host` and `--port` to `lmcache server` above to fix where it listens; the example uses 127.0.0.1:18555):
 

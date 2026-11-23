@@ -6,7 +6,7 @@ engine that can run layers as their weights arrive can use this to overlap compu
 
 This module only returns bytes. It does not know true layer boundaries unless the caller sets
 `layers`, and it does not run the model. The first token needs every layer, so overlap saves at
-most min(T_io, T_compute). See benchmarks/results/lmcache_and_ttft.md.
+most min(T_io, T_compute). See benchmarks/results/python_client.md.
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ class HyperCachePipelinedLoader:
         """
         Synchronously loads Layer 0 / Embedding and triggers background prefetching for Layer 1.
         This takes as long as the first range takes to read: 880 ms for a 1 GB embedding table in
-        benchmarks/results/lmcache_and_ttft.md.
+        benchmarks/results/python_client.md.
         """
         if not self.layers:
             raise ValueError("No layers found in model.")

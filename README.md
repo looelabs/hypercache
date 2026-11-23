@@ -107,7 +107,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 
 ### 1. Fast LLM Inference Cold Starts & Serverless GPU Scaling
 * **Pre-Warm Models Fleet-Wide**: Use `./hypercache-admin preload` to stage base models onto local NVMe or RAM across your cluster ahead of traffic spikes.
-* **Layer-by-Layer Pipelined Loading (`HyperCachePipelinedLoader`)**: Reads a model's byte ranges in order and prefetches the next ones in the background, so an engine that can run layers as their weights arrive can overlap compute with I/O. It does not shorten time to first token by itself: the first token needs every layer, so the saving is at most `min(T_io, T_compute)`. In [our test](benchmarks/results/lmcache_and_ttft.md) on a 15 GB model, time to first token moved between -3.4% and +1.1%.
+* **Layer-by-Layer Pipelined Loading (`HyperCachePipelinedLoader`)**: Reads a model's byte ranges in order and prefetches the next ones in the background, so an engine that can run layers as their weights arrive can overlap compute with I/O. It does not shorten time to first token by itself: the first token needs every layer, so the saving is at most `min(T_io, T_compute)`. In [our test](benchmarks/results/python_client.md) on a 15 GB model, time to first token moved between -3.4% and +1.1%.
 * **Zero-Copy Multi-Tenant Model Sharing (`MAP_SHARED`)**: If you run multiple inference worker processes or containers on the same machine, they map the exact same physical RAM pages in Tier 1 shared memory with **0 bytes of memory duplication**.
 
 ### 2. Sub-Millisecond Multi-LoRA Adapter Hot-Swapping
@@ -691,7 +691,7 @@ for layer, layer_bytes in loader.stream_layers():
     run_layer_forward_pass(layer.layer_idx, layer_bytes)
 ```
 
-The loader splits the object by bytes and returns bytes. Your code has to supply true layer boundaries (`loader.layers`), turn bytes into tensors and run the model. The first token still needs every layer, so the saving is at most `min(T_io, T_compute)`. See the [measurements](benchmarks/results/lmcache_and_ttft.md).
+The loader splits the object by bytes and returns bytes. Your code has to supply true layer boundaries (`loader.layers`), turn bytes into tensors and run the model. The first token still needs every layer, so the saving is at most `min(T_io, T_compute)`. See the [measurements](benchmarks/results/python_client.md).
 
 ### 6. KV-Cache Storage for LMCache
 
