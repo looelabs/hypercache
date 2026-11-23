@@ -314,7 +314,7 @@ scrape_configs:
 
 ## 9. KV-Cache Storage for LMCache
 
-The connector in `lmcache-connector/` lets an LMCache server in multiprocess mode keep KV-cache chunks on HyperCache's NVMe tier. It's tested with LMCache 0.5.5 and 0.5.6.
+The connector in `lmcache-connector/` lets an LMCache server in multiprocess mode keep KV-cache chunks on HyperCache's NVMe tier. It's tested with LMCache 0.5.5, 0.5.6 and 0.5.7.post1 and vLLM 0.31.0 and 0.33.0. In the `vllm/vllm-openai:v0.33.0` image, install LMCache 0.5.7.post1: the image's 0.5.6 can't load its GPU kernels there, and its fallback can store wrong KV data. The [connector quick start](lmcache-connector/README.md#quick-start-with-vllm) has a complete example, including the daemon config for a dedicated drive and running in containers.
 
 **1. Build and install it.** It isn't published as a package yet, so this needs a Rust toolchain and maturin. Use the same Python that runs LMCache:
 
@@ -338,6 +338,15 @@ lmcache server --l1-size-gb 60 --eviction-policy LRU --l1-align-bytes 4096 --l2-
 }'
 ```
 
-Change `namespace` whenever the model weights, dtype or engine settings change, because LMCache's key has no model revision. Keep `max_capacity_gb` at 0, since the daemon owns capacity. Use `num_workers` 8 on one drive and 32 on four.
+Change `namespace` whenever the model weights, dtype or engine settings change, because LMCache's key has no model revision. Keep `max_capacity_gb` at 0, since the daemon owns capacity. Use `num_workers` 8 on one drive and 32 on four. If LMCache runs in a container, give it the daemon's socket directory and the drives (`--device`); without the drives every store fails and LMCache silently runs on L1 alone.
+
+**4. Point vLLM at the LMCache server** (add `--host` and `--port` to `lmcache server` above to fix where it listens; the example uses 127.0.0.1:18555):
+
+```bash
+vllm serve <model> --kv-transfer-config '{"kv_connector": "LMCacheMPConnector", "kv_role": "kv_both",
+  "kv_connector_extra_config": {"lmcache.mp.host": "127.0.0.1", "lmcache.mp.port": 18555}}'
+```
+
+**5. Check the GPU kernels and the cache.** `python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"` must print `None` in the LMCache server's environment. Then send the same long prompt twice: the second first-token time should drop. `scripts/e2e/lmcache_vllm_e2e.py` also checks that answers loaded from the drive match cold ones.
 
 The settings, behaviour and limits are in [`lmcache-connector/README.md`](lmcache-connector/README.md), and measurements are in [`benchmarks/results/lmcache_rust_connector_nvme.md`](benchmarks/results/lmcache_rust_connector_nvme.md).
