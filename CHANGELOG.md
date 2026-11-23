@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- The hardware requirements now say to use identical drives. HyperCache stripes evenly, so the
+  slowest drive sets the speed, and performance with mixed drives isn't guaranteed.
+
 ## 0.10.0
 
 Adds the Rust LMCache connector, which keeps LMCache's KV cache on HyperCache's NVMe and RAM tiers,
