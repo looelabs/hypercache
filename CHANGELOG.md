@@ -9,6 +9,8 @@
 - Benchmarks: removed the results for the old Python LMCache adapter, which the Rust connector
   replaced. The Python client's pipelined loader and O_DIRECT probe results moved to
   `benchmarks/results/python_client.md`.
+- The README now gives the real minimum Rust version for building from source, 1.88 (the locked
+  dependencies need it; it said 1.75), and Python 3.10 for the LMCache connector.
 
 ## 0.10.1
 
