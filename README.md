@@ -144,6 +144,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 * **NVMe SSDs vs. SATA SSDs**:
   * **PCIe Gen 4 / Gen 5 NVMe SSDs (Recommended)**: HyperCache is architected for multi-queue PCIe NVMe drives (`/dev/nvme*`), delivering up to **~7 GB/s per PCIe Gen 4 NVMe** and **~14 GB/s per PCIe Gen 5 NVMe** when striped across local drives.
   * **SATA SSDs (Supported at Lower Speeds)**: HyperCache can also discover and stripe across standard SATA SSDs (`/dev/sd*`). However, because SATA III is physically limited to a 6 Gbps interface (**~500-550 MB/s per drive**), SATA SSDs will not achieve NVMe-class throughput.
+* **Use Identical Drives**: Stripe across drives of the same model, capacity and PCIe generation, in slots with the same PCIe lane width. HyperCache spreads every object's chunks evenly across its drives, so each drive moves the same share of every load and store, and the slowest drive sets the speed for all of them. On a test pair whose second drive ran at about half the speed of the first, adding it shortened first-token time by only 7 to 20% ([vLLM results](benchmarks/results/lmcache_rust_connector_vllm.md#two-drives)). Performance figures in this README assume identical drives. With drives of different speeds, they aren't guaranteed.
 
 ---
 

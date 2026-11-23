@@ -23,6 +23,10 @@ Faster stores for KV cache and for many small commits.
 - Before rolling back to 0.10.0 after a crash, start this release once and stop it cleanly: 0.10.0
   ignores the marker and would keep KV blocks whose data may not have been flushed.
 
+### Docs
+- The hardware requirements now say to use identical drives. HyperCache stripes evenly, so the
+  slowest drive sets the speed, and performance with mixed drives isn't guaranteed.
+
 ## 0.10.0
 
 Adds the Rust LMCache connector, which keeps LMCache's KV cache on HyperCache's NVMe and RAM tiers,

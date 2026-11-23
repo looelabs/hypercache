@@ -92,6 +92,8 @@ nohup ./hypercache-admin -c configs/hypercache-controller.toml controller > cont
 
 Each GPU node runs the `./hypercache` agent daemon. The agent automatically discovers striped NVMe drives, manages local RAM metadata, and reports heartbeats to the Controller.
 
+Use identical drives on each node: the same model, capacity and PCIe generation, in slots with the same lane width. HyperCache stripes evenly, so the slowest drive sets the speed for all of them (see [Hardware & System Requirements](README.md#hardware--system-requirements)).
+
 ### Worker Configuration (`configs/hypercache-agent.toml` on GPU Nodes)
 
 ```toml
