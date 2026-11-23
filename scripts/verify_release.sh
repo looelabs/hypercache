@@ -125,13 +125,16 @@ section() { echo; echo "== $1"; }
 # ------------------------------------------------------------------------------
 
 check_versions() {
-    local cargo_v py_v init_v rel_v
+    local cargo_v py_v init_v rel_v conn_v
     cargo_v=$(grep -m1 '^version' control-plane/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
     py_v=$(grep -m1 '^version' client-py/pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
     init_v=$(grep -m1 '__version__' client-py/hypercache/__init__.py | sed 's/.*"\(.*\)".*/\1/')
     rel_v=$(grep -m1 'default: "v' .github/workflows/release.yml | sed 's/.*"v\(.*\)".*/\1/')
-    echo "Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v release.yml=$rel_v"
-    [ -n "$cargo_v" ] && [ "$cargo_v" = "$py_v" ] && [ "$cargo_v" = "$init_v" ] && [ "$cargo_v" = "$rel_v" ]
+    # The LMCache connector's wheel takes its version from its Cargo.toml (pyproject is dynamic)
+    conn_v=$(grep -m1 '^version' lmcache-connector/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+    echo "Cargo.toml=$cargo_v pyproject=$py_v __init__=$init_v release.yml=$rel_v lmcache-connector=$conn_v"
+    [ -n "$cargo_v" ] && [ "$cargo_v" = "$py_v" ] && [ "$cargo_v" = "$init_v" ] && [ "$cargo_v" = "$rel_v" ] \
+        && [ "$cargo_v" = "$conn_v" ]
 }
 
 check_no_hardcoded_versions() {
@@ -231,7 +234,7 @@ check_config_keys_load() {
 
 stage_static() {
     section "static"
-    step "version numbers agree (Cargo, pyproject, __init__, release.yml)" check_versions
+    step "version numbers agree (Cargo, pyproject, __init__, release.yml, lmcache-connector)" check_versions
     step "no hardcoded version strings in Rust sources and tests" check_no_hardcoded_versions
     step "zero-emoji policy (AGENTS.md rule 1)" check_emoji_policy
     step "cargo fmt --check" cargo fmt --manifest-path "$CARGO_MANIFEST" -- --check
