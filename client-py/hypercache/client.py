@@ -70,6 +70,9 @@ class StageWriteResult:
     chunk_layout: List[ChunkLocation]
     sync_status: str
     error_message: Optional[str] = None
+    # Layout generation of this staging. Pass it to commit_write so the commit is refused if
+    # another writer replaced the layout in the meantime.
+    generation: Optional[int] = None
 
     @property
     def is_staged(self) -> bool:
@@ -371,6 +374,7 @@ class HyperCacheClient:
                 chunk_size=resp.get("chunk_size", 4194304),
                 chunk_layout=chunk_layout,
                 sync_status=resp.get("sync_status", "STAGED"),
+                generation=resp.get("generation"),
             )
         else:
             err = resp.get("error_message", "Failed to stage write")
@@ -431,6 +435,7 @@ class HyperCacheClient:
         write_through: bool = False,
         local_only: bool = False,
         chunk_checksums: Optional[List[int]] = None,
+        generation: Optional[int] = None,
     ) -> bool:
         """
         Commits a staged write in the control plane, triggering background sync to S3 (write-back)
@@ -438,8 +443,10 @@ class HyperCacheClient:
 
         With local_only=True the object stays on this host: it is never flushed to a backend
         and remains evictable. chunk_checksums records per-chunk CRC32 values for it, in layout
-        order. A daemon without local-only support ignores both and flushes the object,
-        so check get_write_status() for "LOCAL_ONLY" when that matters.
+        order, and generation (from stage_write) makes the daemon refuse the commit if the layout
+        was replaced since. A daemon without local-only support ignores all three and commits the
+        object for write-back; this returns False then, because the reply doesn't confirm
+        LOCAL_ONLY, but the object stays committed, so evict it if it must not reach the backend.
         """
         req = {
             "action": "commit_write",
@@ -452,12 +459,20 @@ class HyperCacheClient:
             req["local_only"] = True
         if chunk_checksums is not None:
             req["chunk_checksums"] = chunk_checksums
+        if generation is not None:
+            req["generation"] = generation
 
         # Commit hashes the staged data (when sha256 is given) and, for write-through, uploads it
         resp = self._send_request(req, timeout=self.ingest_timeout)
         status = resp.get("status", "ERROR")
         if status not in ("WRITECOMMITTED", "WRITE_COMMITTED"):
             logger.error(f"Commit of '{uri}' failed: {resp.get('error_message', 'unknown error')}")
+            return False
+        if local_only and resp.get("sync_status") != "LOCAL_ONLY":
+            logger.error(
+                f"Commit of '{uri}' was not confirmed as LOCAL_ONLY "
+                f"(got {resp.get('sync_status')}); the daemon may predate local-only support"
+            )
             return False
         return True
 

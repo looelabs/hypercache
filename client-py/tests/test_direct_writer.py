@@ -225,5 +225,30 @@ class RealDirectIOTest(unittest.TestCase):
             self.assertEqual(f.read(len(data)), data)
 
 
+
+class WriteChunksErrorTest(unittest.TestCase):
+    def test_failed_chunk_waits_for_the_others(self):
+        # Review item 6: on an error, no other chunk write may still be reading the caller's buffer
+        import threading
+        import time
+
+        writer = DirectBlockWriter()
+        self.addCleanup(writer.close)
+        finished = []
+        lock = threading.Lock()
+
+        def write(device, data, offset):
+            if offset == 0:
+                raise IOError("device gone")
+            time.sleep(0.3)
+            with lock:
+                finished.append(offset)
+
+        layout = [ChunkLocation(device="/dev/fake", offset=i * BLOCK, length=BLOCK) for i in range(4)]
+        with mock.patch.object(writer, "_write_device_chunk", side_effect=write):
+            with self.assertRaises(IOError):
+                writer.write_chunks(layout, b"\0" * (4 * BLOCK))
+        self.assertEqual(sorted(finished), [BLOCK, 2 * BLOCK, 3 * BLOCK])
+
 if __name__ == "__main__":
     unittest.main()

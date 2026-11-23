@@ -667,9 +667,16 @@ class DirectBlockWriter:
                     self._executor.submit(self._write_device_chunk, chunk.device, slice_bytes, chunk.offset)
                 )
 
-        # Wait for all chunks to write
+        # Wait for every chunk before raising: the caller may reuse or free `data` on an error,
+        # so no write may still be reading it then
+        errors = []
         for t in tasks:
-            t.result()
+            try:
+                t.result()
+            except BaseException as e:  # noqa: BLE001 - re-raised below after all writes end
+                errors.append(e)
+        if errors:
+            raise errors[0]
 
         return total_len
 

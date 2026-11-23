@@ -33,6 +33,9 @@ class TestIntegrationsAndKVStore(unittest.TestCase):
             os.remove(cls.SOCKET_PATH)
 
         cls._catalog = {}
+        cls._generation = 0
+        cls.commits = []
+        cls.legacy_commit = False
         cls._next_offset = 4096
         cls._lock = threading.Lock()
         cls._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -62,22 +65,47 @@ class TestIntegrationsAndKVStore(unittest.TestCase):
                                 size = int(req.get("size_bytes", 0))
                                 off = cls._next_offset
                                 cls._next_offset += ((size + 4095) // 4096) * 4096
-                                layout = [{"device": cls.ARENA_FILE, "offset": off, "length": size, "tier": "nvme"}]
-                                cls._catalog[uri] = {"size": size, "layout": layout}
+                                # Two chunks when possible, so per-chunk CRCs are exercised
+                                first = (size // 2 + 4095) // 4096 * 4096 if size > 4096 else size
+                                layout = [{"device": cls.ARENA_FILE, "offset": off, "length": first, "tier": "nvme"}]
+                                if size > first:
+                                    layout.append(
+                                        {"device": cls.ARENA_FILE, "offset": off + first, "length": size - first, "tier": "nvme"}
+                                    )
+                                cls._generation += 1
+                                cls._catalog[uri] = {
+                                    "size": size, "layout": layout, "status": "STAGED", "generation": cls._generation,
+                                }
                                 resp = {
                                     "status": "WRITESTAGED",
                                     "object_size": size,
                                     "chunk_size": 4194304,
                                     "chunk_layout": layout,
                                     "sync_status": "STAGED",
+                                    "generation": cls._generation,
                                 }
                             elif action == "commit_write":
-                                info = cls._catalog.get(uri, {"size": 0})
-                                resp = {
-                                    "status": "WRITECOMMITTED",
-                                    "object_size": info["size"],
-                                    "sync_status": "COMMITTED",
-                                }
+                                cls.commits.append(req)
+                                info = cls._catalog.get(uri)
+                                # The real daemon's local-only rules, unless acting as an old daemon
+                                local_only = req.get("local_only") and not cls.legacy_commit
+                                if info is None:
+                                    resp = {"status": "ERROR", "error_message": "not staged"}
+                                elif local_only and req.get("generation") not in (None, info["generation"]):
+                                    resp = {"status": "ERROR", "error_message": "replaced since it was staged"}
+                                elif local_only and info["status"] != "STAGED":
+                                    resp = {"status": "ERROR", "error_message": "not STAGED"}
+                                else:
+                                    for chunk, crc in zip(info["layout"], req.get("chunk_checksums") or []):
+                                        chunk["checksum"] = crc
+                                    info["status"] = "LOCAL_ONLY" if local_only else "COMMITTED"
+                                    resp = {
+                                        "status": "WRITECOMMITTED",
+                                        "object_size": info["size"],
+                                        "sync_status": info["status"],
+                                    }
+                            elif action == "evict":
+                                resp = {"status": "EVICTED"} if cls._catalog.pop(uri, None) else {"status": "ERROR"}
                             elif action in ("locate", "ingest"):
                                 if uri in cls._catalog:
                                     info = cls._catalog[uri]
@@ -86,6 +114,8 @@ class TestIntegrationsAndKVStore(unittest.TestCase):
                                         "object_size": info["size"],
                                         "chunk_size": 4194304,
                                         "chunk_layout": info["layout"],
+                                        "generation": info["generation"],
+                                        "sync_status": info["status"],
                                     }
                                 else:
                                     resp = {"status": "MISS"}
@@ -205,6 +235,71 @@ class TestIntegrationsAndKVStore(unittest.TestCase):
 
         fetched = kv.get_kv_block(block_key)
         self.assertEqual(fetched, kv_payload)
+        commit = self.commits[-1]
+        self.assertTrue(commit["local_only"])
+        self.assertEqual(len(commit["chunk_checksums"]), len(self._catalog[commit["uri"]]["layout"]))
+        self.assertIsNotNone(commit["generation"])
+        kv.close()
+
+    def _stored_block(self, name: str, payload: bytes):
+        kv = HyperCacheKVStore(socket_path=self.SOCKET_PATH, prefer_gds=False)
+        self.assertTrue(kv.put_kv_block(name, payload))
+        return kv, kv._make_uri(name)
+
+    def test_kv_corrupt_block_is_a_miss(self):
+        # Review item 2: data that changed under a block is never returned
+        payload = bytes(range(256)) * 64
+        kv, uri = self._stored_block("corrupt", payload)
+        chunk = self._catalog[uri]["layout"][1]
+        with open(self.ARENA_FILE, "r+b") as f:
+            f.seek(chunk["offset"] + 10)
+            f.write(b"\xff\xfe")
+        self.assertIsNone(kv.get_kv_block("corrupt"))
+        kv.close()
+
+    def test_kv_block_in_any_other_state_is_a_miss(self):
+        # Review item 2: staged, write-back and unknown-state blocks can't be verified
+        payload = b"x" * 10000
+        kv, uri = self._stored_block("states", payload)
+        info = self._catalog[uri]
+        for status in ("STAGED", "COMMITTED", "SYNCING_BACKEND", None):
+            info["status"] = status
+            self.assertFalse(kv.exists_kv_block("states"), status)
+            self.assertIsNone(kv.get_kv_block("states"), status)
+        info["status"] = "LOCAL_ONLY"
+        del info["layout"][0]["checksum"]
+        self.assertIsNone(kv.get_kv_block("states"), "a chunk without a CRC")
+        kv.close()
+
+    def test_kv_old_daemon_commit_fails_and_is_evicted(self):
+        # Review items 2 and 4: a commit not confirmed LOCAL_ONLY must not leave a block behind
+        kv = HyperCacheKVStore(socket_path=self.SOCKET_PATH, prefer_gds=False)
+        type(self).legacy_commit = True
+        try:
+            self.assertFalse(kv.put_kv_block("legacy", b"y" * 9000))
+        finally:
+            type(self).legacy_commit = False
+        self.assertNotIn(kv._make_uri("legacy"), self._catalog)
+        kv.close()
+
+    def test_kv_commit_of_a_replaced_layout_is_refused(self):
+        # Review item 3: a writer can't publish a layout another writer staged after it
+        kv = HyperCacheKVStore(socket_path=self.SOCKET_PATH, prefer_gds=False)
+        uri = kv._make_uri("race")
+        stage = kv._client.stage_write(uri, 8192, tier="nvme", auto_flush_s3=False)
+        kv._client.stage_write(uri, 8192, tier="nvme", auto_flush_s3=False)
+        self.assertFalse(kv._client.commit_write(uri, local_only=True, generation=stage.generation))
+        kv.close()
+
+    def test_kv_wrong_size_buffer_is_a_miss(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("needs torch")
+        kv, _ = self._stored_block("size", b"z" * 8192)
+        out = torch.full((100,), 7, dtype=torch.uint8)
+        self.assertIsNone(kv.get_kv_block("size", out_tensor=out))
+        self.assertTrue(bool((out == 7).all()))
         kv.close()
 
 
