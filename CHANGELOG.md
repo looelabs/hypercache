@@ -6,6 +6,9 @@
 - LMCache connector: how to set `num_workers` for the drive type. Keep 32 on enterprise drives; on
   consumer or DRAM-less drives set 4, which loaded 2.2-3.0 times as fast with no loss on stores.
   Results in `benchmarks/results/lmcache_connector_workers.md`.
+- Benchmarks: removed the results for the old Python LMCache adapter, which the Rust connector
+  replaced. The Python client's pipelined loader and O_DIRECT probe results moved to
+  `benchmarks/results/python_client.md`.
 
 ## 0.10.1
 

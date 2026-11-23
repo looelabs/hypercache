@@ -520,7 +520,7 @@ class DirectBlockWriter:
     Writes byte slices to striped physical NVMe block devices or POSIX shared memory chunks.
 
     With direct_on_block_devices=True, writes to raw block devices use O_DIRECT. In testing on one
-    drive this raised both store speed and later read speed (benchmarks/results/lmcache_and_ttft.md).
+    drive this raised both store speed and later read speed (benchmarks/results/python_client.md).
     Whatever O_DIRECT can't take goes through the page cache, so a write never fails because of it.
     Callers must still commit, because the daemon's sync is what makes the data durable.
     """
