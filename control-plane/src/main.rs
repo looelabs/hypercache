@@ -138,6 +138,20 @@ enum Commands {
         uri: String,
     },
 
+    /// Pin cached objects so they are never evicted automatically (re-ingests keep the pin)
+    Pin {
+        /// Object URIs to pin
+        #[arg(required = true)]
+        uris: Vec<String>,
+    },
+
+    /// Unpin cached objects so they can be evicted again
+    Unpin {
+        /// Object URIs to unpin
+        #[arg(required = true)]
+        uris: Vec<String>,
+    },
+
     /// Refresh/re-ingest a model from authoritative S3, updating the local striped SSD cache
     Refresh {
         /// Target object URI to refresh (e.g. hypercache://models/llama-3/weights.safetensors)
@@ -163,9 +177,14 @@ enum Commands {
         pin: bool,
     },
 
-    /// Purge all cached models from memory, NVMe persistence, and reset drive allocation
+    /// Purge cached models from memory and NVMe. Pinned objects are kept unless --include-pinned
+    /// is given; with nothing kept, drive allocation is reset as well
     #[command(alias = "clean")]
-    Purge,
+    Purge {
+        /// Also remove pinned objects (a full wipe)
+        #[arg(long)]
+        include_pinned: bool,
+    },
 
     /// Query the status and live performance metrics of the running daemon
     Status,
@@ -253,6 +272,18 @@ async fn main() -> Result<()> {
                 .to_string();
             run_rm(&sock, &uri).await
         }
+        Commands::Pin { uris } => {
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
+            run_pin(&sock, &uris, true).await
+        }
+        Commands::Unpin { uris } => {
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
+            run_pin(&sock, &uris, false).await
+        }
         Commands::Refresh { uri } => {
             let sock = config::client_socket_path(cli.config.as_deref())?
                 .to_string_lossy()
@@ -270,11 +301,11 @@ async fn main() -> Result<()> {
             };
             run_preload(&sock, uri, file, target_tier, pin).await
         }
-        Commands::Purge => {
+        Commands::Purge { include_pinned } => {
             let sock = config::client_socket_path(cli.config.as_deref())?
                 .to_string_lossy()
                 .to_string();
-            run_purge(&sock).await
+            run_purge(&sock, include_pinned).await
         }
         Commands::Status => {
             let sock = config::client_socket_path(cli.config.as_deref())?
@@ -994,7 +1025,7 @@ async fn run_rm(socket_path: &str, uri: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_purge(socket_path: &str) -> Result<()> {
+async fn run_purge(socket_path: &str, include_pinned: bool) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("HyperCache daemon is not running at {}.", socket_path))?;
@@ -1002,7 +1033,7 @@ async fn run_purge(socket_path: &str) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 
-    let req = serde_json::to_string(&Request::Purge)? + "\n";
+    let req = serde_json::to_string(&Request::Purge { include_pinned })? + "\n";
     writer.write_all(req.as_bytes()).await?;
     writer.flush().await?;
 
@@ -1018,7 +1049,15 @@ async fn run_purge(socket_path: &str) -> Result<()> {
             count,
             format_bytes(freed)
         );
-        println!("  -> Drive allocation pointers reset to initial safety offsets.");
+        let kept = resp.kept_pinned_count.unwrap_or(0);
+        if kept > 0 {
+            println!(
+                "  -> Kept {} pinned object(s). Use --include-pinned to remove them too.",
+                kept
+            );
+        } else {
+            println!("  -> Drive allocation pointers reset to initial safety offsets.");
+        }
     } else {
         let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
         anyhow::bail!("Failed to purge cache: {}", err);
@@ -1026,8 +1065,61 @@ async fn run_purge(socket_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sends one request on a new connection and returns the daemon's reply.
+async fn send_request(socket_path: &str, req: &Request) -> Result<Response> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("HyperCache daemon is not running at {}.", socket_path))?;
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+    writer
+        .write_all((serde_json::to_string(req)? + "\n").as_bytes())
+        .await?;
+    writer.flush().await?;
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    Ok(serde_json::from_str(line.trim())?)
+}
+
+async fn run_pin(socket_path: &str, uris: &[String], pinned: bool) -> Result<()> {
+    let verb = if pinned { "Pinned" } else { "Unpinned" };
+    let mut failed = 0usize;
+    for uri in uris {
+        let resp = send_request(
+            socket_path,
+            &Request::Pin {
+                uri: uri.clone(),
+                pinned,
+            },
+        )
+        .await?;
+        if resp.status == ResponseStatus::Error {
+            failed += 1;
+            eprintln!("  -> {}: {}", uri, resp.error_message.as_deref().unwrap_or("failed"));
+        } else {
+            println!("  -> {} '{}'", verb, uri);
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{} of {} objects could not be updated", failed, uris.len());
+    }
+    Ok(())
+}
+
+/// Whether `uri` is cached and pinned, from the daemon's object list.
+async fn is_pinned(socket_path: &str, uri: &str) -> Result<bool> {
+    let resp = send_request(socket_path, &Request::List).await?;
+    Ok(resp
+        .objects
+        .unwrap_or_default()
+        .iter()
+        .any(|o| o.uri == uri && o.pinned))
+}
+
 async fn run_refresh(socket_path: &str, uri: &str) -> Result<()> {
     println!("Refreshing model checkpoint '{}'...", uri);
+    // Refresh drops the cached copy and ingests it again, so carry the pin across.
+    let pinned = is_pinned(socket_path, uri).await?;
 
     // 1. Evict old copy
     let mut stream = UnixStream::connect(socket_path)
@@ -1052,7 +1144,7 @@ async fn run_refresh(socket_path: &str, uri: &str) -> Result<()> {
         uri: uri.to_string(),
         auto_ingest: true,
         tier: None,
-        pinned: false,
+        pinned,
     })? + "\n";
     writer.write_all(ingest_req.as_bytes()).await?;
     writer.flush().await?;

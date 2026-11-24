@@ -149,8 +149,17 @@ impl FleetClient {
         self.post_fleet("/api/v1/fleet/evict", &payload, "evict").await
     }
 
-    pub async fn purge(&self, nodes: Option<String>, selector: Option<String>) -> Result<Vec<FleetOperationResult>> {
-        let payload = FleetPurgeRequest { nodes, selector };
+    pub async fn purge(
+        &self,
+        nodes: Option<String>,
+        selector: Option<String>,
+        include_pinned: bool,
+    ) -> Result<Vec<FleetOperationResult>> {
+        let payload = FleetPurgeRequest {
+            nodes,
+            selector,
+            include_pinned,
+        };
         self.post_fleet("/api/v1/fleet/purge", &payload, "purge").await
     }
 }
@@ -369,10 +378,11 @@ pub async fn run_fleet_purge(
     auth_token: Option<String>,
     nodes: Option<String>,
     selector: Option<String>,
+    include_pinned: bool,
 ) -> Result<()> {
     let client = FleetClient::new(controller_url.to_string(), auth_token);
     println!("Dispatching fleet cache purge across target nodes...");
-    let results = client.purge(nodes, selector).await?;
+    let results = client.purge(nodes, selector, include_pinned).await?;
 
     for res in &results {
         if res.success {

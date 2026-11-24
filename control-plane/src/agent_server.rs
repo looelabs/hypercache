@@ -329,16 +329,35 @@ async fn handle_agent_evict(
     }
 }
 
-async fn handle_agent_purge(State(ctx): State<AgentContext>, headers: axum::http::HeaderMap) -> Response {
+#[derive(Debug, Default, Deserialize)]
+struct AgentPurgeRequest {
+    /// Also remove pinned objects. Without it (or without a body), pinned objects are kept.
+    #[serde(default)]
+    include_pinned: bool,
+}
+
+async fn handle_agent_purge(
+    State(ctx): State<AgentContext>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<AgentPurgeRequest>>,
+) -> Response {
     if !validate_bearer(&headers, ctx.config.cluster_auth_token.as_deref()) {
         return unauthorized();
     }
 
-    info!("Agent received fleet PURGE directive");
-    match ctx.metadata.purge_all().await {
-        Ok((count, bytes)) => Json(serde_json::json!({
+    let include_pinned = body.map(|Json(b)| b.include_pinned).unwrap_or(false);
+    info!(
+        "Agent received fleet PURGE directive (include_pinned: {})",
+        include_pinned
+    );
+    match ctx.metadata.purge_all(include_pinned).await {
+        Ok((count, bytes, kept)) => Json(serde_json::json!({
             "success": true,
-            "message": format!("Successfully purged {} models ({} bytes freed) and reset drives", count, bytes)
+            "message": if kept > 0 {
+                format!("Purged {} models ({} bytes freed), kept {} pinned", count, bytes, kept)
+            } else {
+                format!("Successfully purged {} models ({} bytes freed) and reset drives", count, bytes)
+            }
         }))
         .into_response(),
         Err(e) => (

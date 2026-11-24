@@ -103,7 +103,8 @@ enum AdminCommands {
         selector: Option<String>,
     },
 
-    /// Wipe cached memory and reset SSD block storage across all nodes in the cluster
+    /// Purge cached models across the cluster. Pinned objects are kept unless --include-pinned is
+    /// given; a node with nothing kept also resets its SSD block allocation
     Purge {
         /// Target node IDs (comma-separated, e.g. --nodes "node-01,node-02" or --nodes all)
         #[arg(long, default_value = "all")]
@@ -112,6 +113,10 @@ enum AdminCommands {
         /// Target nodes by label selector (e.g. --selector "gpu=h100,pool=training")
         #[arg(long)]
         selector: Option<String>,
+
+        /// Also remove pinned objects (a full wipe)
+        #[arg(long)]
+        include_pinned: bool,
     },
 
     /// Display live telemetry metrics and hit ratio counters across the cluster
@@ -212,9 +217,11 @@ async fn main() -> Result<()> {
         AdminCommands::Evict { uri, nodes, selector } => {
             fleet::run_fleet_evict(&controller_url, auth_token, &uri, Some(nodes), selector).await
         }
-        AdminCommands::Purge { nodes, selector } => {
-            fleet::run_fleet_purge(&controller_url, auth_token, Some(nodes), selector).await
-        }
+        AdminCommands::Purge {
+            nodes,
+            selector,
+            include_pinned,
+        } => fleet::run_fleet_purge(&controller_url, auth_token, Some(nodes), selector, include_pinned).await,
         AdminCommands::Status => fleet::run_fleet_nodes(&controller_url, auth_token, false).await,
     }
 }

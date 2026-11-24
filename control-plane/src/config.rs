@@ -191,6 +191,12 @@ pub struct Config {
     #[serde(default = "default_reclaim_grace_secs")]
     pub reclaim_grace_secs: u64,
 
+    /// Percent of each NVMe device kept free ahead of need (0 = none, at most 50). When free
+    /// space drops below it, the least recently used clean, unpinned objects are evicted early,
+    /// so their blocks have served the reclaim grace period before a write needs them.
+    #[serde(default = "default_reclaim_reserve_percent")]
+    pub reclaim_reserve_percent: u64,
+
     /// Controller only: let loopback / controller-host connections skip token authentication.
     /// Disable when the controller sits behind a local proxy or sidecar (all traffic then
     /// appears to come from 127.0.0.1).
@@ -552,6 +558,10 @@ fn default_reclaim_grace_secs() -> u64 {
     30
 }
 
+fn default_reclaim_reserve_percent() -> u64 {
+    5
+}
+
 fn default_true() -> bool {
     true
 }
@@ -643,6 +653,7 @@ impl Default for Config {
             s3_session_token: default_s3_session_token(),
             s3_multipart_threshold_bytes: default_s3_multipart_threshold_bytes(),
             reclaim_grace_secs: default_reclaim_grace_secs(),
+            reclaim_reserve_percent: default_reclaim_reserve_percent(),
             allow_local_admin_bypass: true,
             node_gc_secs: default_node_gc_secs(),
             client_gid: None,

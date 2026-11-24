@@ -116,8 +116,15 @@ nfs_read_buffer_bytes = 4194304 # 4 MiB
 # client_gid = 2000
 
 # Freed blocks are held for this many seconds before reuse, so a reader that resolved a layout
-# just before an eviction or re-ingest never reads another object's bytes.
+# just before an eviction or re-ingest never reads another object's bytes. This also applies when a
+# drive is full: a write evicts the least recently used clean objects, waits up to this long for
+# their space, then fails.
 reclaim_grace_secs = 30
+
+# Percent of each NVMe drive kept free ahead of need (0 = off, at most 50). When free space drops
+# below it, the least recently used clean, unpinned objects are evicted early, so their blocks have
+# finished the grace period before a write needs them and writes to a full drive rarely wait.
+reclaim_reserve_percent = 5
 
 # Write-Through vs. Write-Back Caching Mode
 # Disabled by default (false = asynchronous Write-Back for ultra-fast non-blocking checkpoint saves).

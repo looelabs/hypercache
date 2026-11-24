@@ -3,6 +3,26 @@
 ## Unreleased
 
 ### Fixed
+- A full drive no longer reuses freed blocks before `reclaim_grace_secs` (issue #10). Objects evicted
+  to make room were freed at once, and with nothing left to evict the daemon also released space
+  still in its grace period. A client that had looked up an old layout could then read another
+  object's bytes; the LMCache connector's checksum turned that into a miss, but the Python client
+  only checks CRCs when `HYPERCACHE_VERIFY_CHECKSUMS` is set. Now evicted space goes through the
+  grace period, and a write to a full drive waits for it, at most one grace period, then fails.
+- A full drive now evicts the least recently used objects, not the oldest created, so a model in
+  steady use stays cached. New key `reclaim_reserve_percent` (default 5, 0 turns it off) keeps that
+  share of each drive free by evicting ahead of need, so writes rarely wait for the grace period.
+- Pins now stick: re-ingesting, overwriting or `refresh`ing a pinned object kept the cache but
+  dropped the pin. Only an explicit unpin clears it now.
+
+### Added
+- `hypercache pin <uri>...` and `hypercache unpin <uri>...` for objects already cached.
+- `purge --include-pinned` (also on `hypercache-admin purge`, the fleet API's `include_pinned` and
+  the Python client's `purge(include_pinned=True)`).
+
+### Changed
+- `purge` keeps pinned objects by default. It resets the block allocators only when nothing is
+  kept. Use `--include-pinned` for the old full wipe.
 - The daemon now listens on the `socket_path` from its config file. It used to ignore that key and
   use the default path unless `HYPERCACHE_SOCKET_PATH` was set (issue #10). `HYPERCACHE_SOCKET_PATH`
   still wins over the file. CLI commands given `-c` connect to that config's socket. The host lock
