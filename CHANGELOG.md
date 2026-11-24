@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
+
+Safe reuse of space on a full drive, and protection for models you pin. A full drive no longer reuses
+freed blocks early, evicts the least recently used objects and keeps a free reserve; pins stick and
+`purge` keeps pinned objects. The LMCache connector warns on untested LMCache versions. Minor release
+because of the new commands and the change to `purge`'s default (see Changed).
 
 ### Fixed
 - A full drive no longer reuses freed blocks before `reclaim_grace_secs` (issue #10). Objects evicted
@@ -14,6 +19,10 @@
   share of each drive free by evicting ahead of need, so writes rarely wait for the grace period.
 - Pins now stick: re-ingesting, overwriting or `refresh`ing a pinned object kept the cache but
   dropped the pin. Only an explicit unpin clears it now.
+- The daemon now listens on the `socket_path` from its config file. It used to ignore that key and
+  use the default path unless `HYPERCACHE_SOCKET_PATH` was set (issue #10). `HYPERCACHE_SOCKET_PATH`
+  still wins over the file. CLI commands given `-c` connect to that config's socket. The host lock
+  file doesn't move with `socket_path`, so a second daemon on the same host is still refused.
 
 ### Added
 - LMCache connector: warns at startup when the installed LMCache is not a tested version (0.5.5,
@@ -25,11 +34,9 @@
 
 ### Changed
 - `purge` keeps pinned objects by default. It resets the block allocators only when nothing is
-  kept. Use `--include-pinned` for the old full wipe.
-- The daemon now listens on the `socket_path` from its config file. It used to ignore that key and
-  use the default path unless `HYPERCACHE_SOCKET_PATH` was set (issue #10). `HYPERCACHE_SOCKET_PATH`
-  still wins over the file. CLI commands given `-c` connect to that config's socket. The host lock
-  file doesn't move with `socket_path`, so a second daemon on the same host is still refused.
+  kept. **Upgrading:** scripts that run `hypercache purge` or `hypercache-admin purge` to wipe a
+  node completely must add `--include-pinned` (fleet API: `"include_pinned": true`; Python:
+  `purge(include_pinned=True)`). Without pinned objects, `purge` behaves as before.
 - Removed the undocumented `HYPERCACHE_SOCKET` variable, which the daemon read and then ignored. Use
   `HYPERCACHE_SOCKET_PATH`.
 
