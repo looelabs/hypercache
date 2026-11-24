@@ -16,6 +16,9 @@
   dropped the pin. Only an explicit unpin clears it now.
 
 ### Added
+- LMCache connector: warns at startup when the installed LMCache is not a tested version (0.5.5,
+  0.5.6, 0.5.7.post1), and `check_lmcache_version()` reports it (issue #10). It never refuses to
+  start.
 - `hypercache pin <uri>...` and `hypercache unpin <uri>...` for objects already cached.
 - `purge --include-pinned` (also on `hypercache-admin purge`, the fleet API's `include_pinned` and
   the Python client's `purge(include_pinned=True)`).

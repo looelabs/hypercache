@@ -3,9 +3,10 @@
 //! `drain_completions`, which runs with the interpreter lock held.
 
 use crate::connector::{Config, Connector, RawBuffer};
+use crate::lmcache_version::{untested_version_problem, TESTED_LMCACHE_VERSIONS};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{ffi, IntoPyObjectExt};
 use std::env;
 use std::mem::MaybeUninit;
@@ -133,6 +134,32 @@ fn warn_on_lmcache_gpu_ops(py: Python<'_>) {
     }
 }
 
+/// The installed LMCache version, from its package metadata, or None when it isn't installed.
+fn installed_lmcache_version(py: Python<'_>) -> PyResult<Option<String>> {
+    let metadata = py.import("importlib.metadata")?;
+    match metadata.getattr("version")?.call1(("lmcache",)) {
+        Ok(version) => Ok(Some(version.extract()?)),
+        Err(error) if error.is_instance(py, &metadata.getattr("PackageNotFoundError")?) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Checks the installed LMCache against the versions this connector was tested with. Returns None
+/// when it is one of them (or LMCache isn't installed), or a description of the problem. The
+/// connector runs this at startup and prints a warning on a problem; it never refuses to start.
+#[pyfunction]
+fn check_lmcache_version(py: Python<'_>) -> PyResult<Option<String>> {
+    Ok(installed_lmcache_version(py)?.and_then(|v| untested_version_problem(&v)))
+}
+
+fn warn_on_lmcache_version(py: Python<'_>) {
+    match check_lmcache_version(py) {
+        Ok(None) => {}
+        Ok(Some(problem)) => eprintln!("hypercache connector: WARNING: {problem}."),
+        Err(error) => eprintln!("hypercache connector: could not read the LMCache version: {error}"),
+    }
+}
+
 /// Stores LMCache objects in HyperCache. Load it through LMCache's `native_plugin` adapter type.
 #[pyclass(module = "hypercache_lmcache_native")]
 struct HyperCacheNativeConnector {
@@ -154,6 +181,7 @@ impl HyperCacheNativeConnector {
         if !(timeout_s.is_finite() && timeout_s > 0.0) {
             return Err(PyValueError::new_err("timeout_s must be above zero"));
         }
+        warn_on_lmcache_version(py);
         warn_on_lmcache_gpu_ops(py);
         let config = Config {
             namespace: namespace.to_string(),
@@ -237,6 +265,11 @@ impl HyperCacheNativeConnector {
 fn hypercache_lmcache_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<HyperCacheNativeConnector>()?;
     module.add_function(wrap_pyfunction!(check_lmcache_gpu_ops, module)?)?;
+    module.add_function(wrap_pyfunction!(check_lmcache_version, module)?)?;
+    module.add(
+        "TESTED_LMCACHE_VERSIONS",
+        PyTuple::new(module.py(), TESTED_LMCACHE_VERSIONS)?,
+    )?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
