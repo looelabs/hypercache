@@ -326,9 +326,10 @@ class HyperCacheClient:
         })
         return resp.get("status") in ("EVICTED", "PONG", "OK")
 
-    def purge(self) -> bool:
-        """Purges all cached objects from the daemon and resets block allocators."""
-        resp = self._send_request({"action": "purge"})
+    def purge(self, include_pinned: bool = False) -> bool:
+        """Purges cached objects from the daemon. Pinned objects are kept unless include_pinned is
+        set; when nothing is kept, the block allocators are reset as well."""
+        resp = self._send_request({"action": "purge", "include_pinned": include_pinned})
         return resp.get("status") in ("PURGED", "PONG", "OK")
 
     def get_status(self) -> dict:

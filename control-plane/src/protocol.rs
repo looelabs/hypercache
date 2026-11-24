@@ -63,7 +63,11 @@ pub enum Request {
     Evict {
         uri: String,
     },
-    Purge,
+    Purge {
+        /// Also remove pinned objects. Without it, pinned objects are kept.
+        #[serde(default)]
+        include_pinned: bool,
+    },
     Ping,
     StageWrite {
         uri: String,
@@ -262,6 +266,9 @@ pub struct Response {
     pub freed_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purged_count: Option<usize>,
+    /// Pinned objects a purge kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_pinned_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,11 +335,12 @@ impl Response {
         }
     }
 
-    pub fn purged(purged_count: usize, freed_bytes: u64) -> Self {
+    pub fn purged(purged_count: usize, freed_bytes: u64, kept_pinned_count: usize) -> Self {
         Self {
             status: ResponseStatus::Purged,
             freed_bytes: Some(freed_bytes),
             purged_count: Some(purged_count),
+            kept_pinned_count: Some(kept_pinned_count),
             ..Default::default()
         }
     }
@@ -406,6 +414,15 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clients older than include_pinned send a bare purge; it keeps pinned objects.
+    #[test]
+    fn purge_without_include_pinned_parses_and_keeps_pins() {
+        let req: Request = serde_json::from_str(r#"{"action":"purge"}"#).unwrap();
+        assert!(matches!(req, Request::Purge { include_pinned: false }));
+        let req: Request = serde_json::from_str(r#"{"action":"purge","include_pinned":true}"#).unwrap();
+        assert!(matches!(req, Request::Purge { include_pinned: true }));
+    }
 
     #[test]
     fn test_protocol_serialization() {

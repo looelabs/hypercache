@@ -50,6 +50,7 @@ pub struct IngestionEngine {
 impl IngestionEngine {
     pub fn new(config: Config, metadata: MetadataStore, ram_pool: Option<Arc<RamMemoryPool>>) -> Self {
         metadata.set_reclaim_grace(std::time::Duration::from_secs(config.reclaim_grace_secs));
+        metadata.set_reclaim_reserve_percent(config.reclaim_reserve_percent);
         let chunk_size = config.chunk_size_bytes;
         let authoritative_backend = config.authoritative_backend.clone();
         let allow_synthetic_globally = config.allow_synthetic_s3_fallback;

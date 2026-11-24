@@ -20,6 +20,11 @@ pub const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_secs(30);
 
 /// Upper bound on objects evicted to satisfy a single allocation under capacity pressure.
 const MAX_PRESSURE_EVICTIONS: usize = 64;
+/// Slack on top of the grace period when an allocation waits for quarantined extents, so an extent
+/// quarantined at the start of the wait is certainly reusable before the wait gives up.
+const PRESSURE_WAIT_MARGIN: Duration = Duration::from_millis(100);
+/// Upper bound for `reclaim_reserve_percent`.
+pub const MAX_RECLAIM_RESERVE_PERCENT: u64 = 50;
 
 /// Coalescing delay for background manifest writes (bursts of mutations become one write).
 const MANIFEST_WRITE_DEBOUNCE: Duration = Duration::from_millis(20);
@@ -185,6 +190,12 @@ struct Inner {
     ram_pool: RwLock<Option<Arc<crate::ram::RamMemoryPool>>>,
     generation: AtomicU64,
     reclaim_grace_ms: AtomicU64,
+    /// Share of each device, in percent, kept free or on its way back through the quarantine, so a
+    /// full device rarely makes a write wait for the grace period (0 = no reserve).
+    reclaim_reserve_percent: AtomicU64,
+    /// When each object was last looked up, in Unix milliseconds. Kept in memory only: after a
+    /// restart an object counts as last used when it was created. Picks pressure-eviction victims.
+    last_access: Mutex<HashMap<String, i64>>,
     metrics: Option<Arc<MetricsState>>,
     persister: Option<Persister>,
     /// True while `LOCAL_ONLY` commits may skip the device flush: always without a manifest (nothing
@@ -238,6 +249,8 @@ impl MetadataStore {
             ram_pool: RwLock::new(None),
             generation: AtomicU64::new(1),
             reclaim_grace_ms: AtomicU64::new(DEFAULT_RECLAIM_GRACE.as_millis() as u64),
+            reclaim_reserve_percent: AtomicU64::new(0),
+            last_access: Mutex::new(HashMap::new()),
             metrics,
             persister: persistence_path.map(|path| Persister {
                 path,
@@ -280,6 +293,7 @@ impl MetadataStore {
                     match mirror.get(key.as_str()) {
                         Some(current) if current.generation == val.generation => {
                             mirror.remove(key.as_str());
+                            inner.last_access.lock().unwrap().remove(key.as_str());
                             true
                         }
                         Some(_) => false,
@@ -325,6 +339,25 @@ impl MetadataStore {
         Duration::from_millis(self.inner.reclaim_grace_ms.load(Ordering::Relaxed))
     }
 
+    /// Sets the share of each device kept free ahead of need, in percent (0 = none, at most 50).
+    pub fn set_reclaim_reserve_percent(&self, percent: u64) {
+        self.inner
+            .reclaim_reserve_percent
+            .store(percent.min(MAX_RECLAIM_RESERVE_PERCENT), Ordering::Relaxed);
+    }
+
+    fn touch(&self, uri: &str) {
+        self.inner
+            .last_access
+            .lock()
+            .unwrap()
+            .insert(uri.to_string(), chrono::Utc::now().timestamp_millis());
+    }
+
+    fn forget_access(&self, uri: &str) {
+        self.inner.last_access.lock().unwrap().remove(uri);
+    }
+
     /// Returns a fresh, process-unique layout generation number.
     pub fn next_generation(&self) -> u64 {
         self.inner.generation.fetch_add(1, Ordering::Relaxed)
@@ -351,7 +384,11 @@ impl MetadataStore {
 
     /// Fast-path in-process metadata lookup (zero network/TCP roundtrip)
     pub async fn get_layout(&self, uri: &str) -> Result<Option<StoredMetadata>> {
-        Ok(self.cache.get(uri).await)
+        let meta = self.cache.get(uri).await;
+        if meta.is_some() {
+            self.touch(uri);
+        }
+        Ok(meta)
     }
 
     /// Inserts or updates physical chunk routing layout in the Moka cache & persistence tier
@@ -392,7 +429,7 @@ impl MetadataStore {
         pinned: bool,
     ) -> Result<u64> {
         let generation = self.next_generation();
-        let meta = StoredMetadata {
+        let mut meta = StoredMetadata {
             object_size,
             chunk_size,
             chunk_layout,
@@ -404,8 +441,13 @@ impl MetadataStore {
 
         let old_meta = {
             let mut mirror = self.inner.entries_mirror.lock().unwrap();
+            // A pin sticks when the object is re-ingested or overwritten: only `set_pinned` clears it.
+            if mirror.get(uri).is_some_and(|prev| prev.pinned) {
+                meta.pinned = true;
+            }
             mirror.insert(uri.to_string(), meta.clone())
         };
+        self.touch(uri);
         self.cache.insert(uri.to_string(), meta).await;
 
         if let Some(prev) = old_meta {
@@ -613,8 +655,9 @@ impl MetadataStore {
 
     fn quarantine_chunks_inner(inner: &Inner, chunks: &[ChunkDescriptor]) {
         Self::delete_ram_chunks(inner, chunks);
-        let now = Instant::now();
         let mut q = inner.quarantine.lock().unwrap();
+        // Taken under the lock so the queue stays in release order, which drain_quarantine relies on.
+        let now = Instant::now();
         for chunk in chunks.iter().filter(|c| c.tier != StorageTier::Ram) {
             q.push_back(QuarantinedExtent {
                 released_at: now,
@@ -729,31 +772,20 @@ impl MetadataStore {
         }
     }
 
-    /// Moves quarantined extents whose grace period expired into the free pools.
-    /// With `force_device`, extents on that device are released regardless of age.
-    fn drain_quarantine(&self, force_device: Option<&str>) -> usize {
+    /// Moves quarantined extents whose grace period expired into the free pools. Extents are never
+    /// released early, even under capacity pressure: readers resolve a layout and then read raw
+    /// offsets with no lock, so early reuse would let them read another object's bytes.
+    fn drain_quarantine(&self) -> usize {
         let grace = self.reclaim_grace();
         let now = Instant::now();
         let mut released = Vec::new();
         {
             let mut q = self.inner.quarantine.lock().unwrap();
-            if let Some(dev) = force_device {
-                let mut keep = VecDeque::with_capacity(q.len());
-                for ext in q.drain(..) {
-                    if ext.device == dev || now.duration_since(ext.released_at) >= grace {
-                        released.push(ext);
-                    } else {
-                        keep.push_back(ext);
-                    }
-                }
-                *q = keep;
-            } else {
-                while let Some(front) = q.front() {
-                    if now.duration_since(front.released_at) >= grace {
-                        released.push(q.pop_front().unwrap());
-                    } else {
-                        break;
-                    }
+            while let Some(front) = q.front() {
+                if now.duration_since(front.released_at) >= grace {
+                    released.push(q.pop_front().unwrap());
+                } else {
+                    break;
                 }
             }
         }
@@ -800,9 +832,15 @@ impl MetadataStore {
             .await
     }
 
-    /// Allocates a block offset, reusing expired quarantined extents first. When the device
-    /// is full, the oldest clean, unpinned objects with data on that device are evicted
-    /// (never `exclude_uri`, which is the object currently being written).
+    /// Allocates a block offset, reusing expired quarantined extents first. When the device is full,
+    /// the least recently used clean, unpinned objects with data on that device are evicted (never
+    /// `exclude_uri`, which is the object currently being written). Their extents go through the
+    /// reclaim quarantine like any other freed extent, so the caller waits until enough of it has
+    /// served its grace period. It waits at most one grace period (plus a small margin): anything
+    /// freed by then is reusable, so waiting longer can't help, and the allocation fails instead.
+    ///
+    /// After a successful allocation the device's reserve (`reclaim_reserve_percent`) is topped up
+    /// by evicting ahead of need, so later writes find space that has already served its grace.
     pub async fn allocate_chunk_offset_for(
         &self,
         exclude_uri: Option<&str>,
@@ -810,70 +848,61 @@ impl MetadataStore {
         length: u64,
         initial_offset: u64,
     ) -> Result<u64> {
+        let offset = self
+            .allocate_or_wait(exclude_uri, device, length, initial_offset)
+            .await?;
+        self.top_up_reserve(exclude_uri, device, initial_offset).await;
+        Ok(offset)
+    }
+
+    async fn allocate_or_wait(
+        &self,
+        exclude_uri: Option<&str>,
+        device: &str,
+        length: u64,
+        initial_offset: u64,
+    ) -> Result<u64> {
         let aligned_len = Self::align_up_4k(length.max(4096));
-        self.drain_quarantine(None);
+        self.drain_quarantine();
 
         let mut last_err = match self.try_allocate(device, aligned_len, initial_offset) {
             Ok(off) => return Ok(off),
             Err(e) => e,
         };
 
-        for _ in 0..MAX_PRESSURE_EVICTIONS {
-            let victim = {
-                let mirror = self.inner.entries_mirror.lock().unwrap();
-                mirror
-                    .iter()
-                    .filter(|(uri, m)| {
-                        Some(uri.as_str()) != exclude_uri
-                            && !m.pinned
-                            && !m.is_dirty()
-                            && m.chunk_layout
-                                .iter()
-                                .any(|c| c.tier != StorageTier::Ram && c.device == device)
-                    })
-                    .min_by_key(|(_, m)| (m.created_at, m.generation))
-                    .map(|(uri, m)| (uri.clone(), m.generation))
-            };
-
-            match victim {
-                Some((uri, generation)) => {
-                    let removed = {
-                        let mut mirror = self.inner.entries_mirror.lock().unwrap();
-                        match mirror.get(&uri) {
-                            Some(m) if m.generation == generation => mirror.remove(&uri),
-                            _ => None,
-                        }
-                    };
-                    if let Some(meta) = removed {
-                        warn!(
-                            "Capacity pressure on '{}': evicting '{}' ({:.2} MiB) to make room",
-                            device,
-                            uri,
-                            meta.object_size as f64 / (1024.0 * 1024.0)
-                        );
-                        self.cache.invalidate(&uri).await;
-                        if let Some(ref m) = self.inner.metrics {
-                            m.evictions_total.fetch_add(1, Ordering::Relaxed);
-                            m.evicted_bytes_total.fetch_add(meta.object_size, Ordering::Relaxed);
-                        }
-                        // Under pressure the evicted extents are released without a grace
-                        // period; the oldest object is the least likely to have readers.
-                        self.release_unpublished(&meta.chunk_layout).await;
-                        self.update_metrics_counters();
-                        self.mark_dirty();
-                    }
-                }
-                None => {
-                    if self.drain_quarantine(Some(device)) == 0 {
-                        break;
-                    }
-                    warn!(
-                        "Capacity pressure on '{}': releasing quarantined extents before grace period expiry",
-                        device
-                    );
+        // A wait costs a whole grace period, so make it count: bring back the full reserve, not
+        // just this one chunk.
+        let target = aligned_len.max(self.reserve_bytes(device));
+        let deadline = Instant::now() + self.reclaim_grace() + PRESSURE_WAIT_MARGIN;
+        let mut evictions = 0;
+        let mut waited = false;
+        loop {
+            // Make sure enough space is on its way back on this device before waiting for it.
+            while self.quarantined_bytes_on(device) < target && evictions < MAX_PRESSURE_EVICTIONS {
+                evictions += 1;
+                if self
+                    .evict_least_recent_for_pressure(exclude_uri, device)
+                    .await
+                    .is_none()
+                {
+                    break;
                 }
             }
 
+            let expiry = match self.next_quarantine_expiry_on(device) {
+                Some(t) if t <= deadline => t,
+                _ => break,
+            };
+            if !waited {
+                waited = true;
+                warn!(
+                    "Capacity pressure on '{}': waiting up to {:.1} s for freed blocks to finish their reclaim grace period",
+                    device,
+                    deadline.saturating_duration_since(Instant::now()).as_secs_f64()
+                );
+            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(expiry)).await;
+            self.drain_quarantine();
             match self.try_allocate(device, aligned_len, initial_offset) {
                 Ok(off) => return Ok(off),
                 Err(e) => last_err = e,
@@ -881,6 +910,144 @@ impl MetadataStore {
         }
 
         Err(last_err)
+    }
+
+    /// The reserve for `device` in bytes: `reclaim_reserve_percent` of its capacity (0 when the
+    /// capacity is unknown).
+    fn reserve_bytes(&self, device: &str) -> u64 {
+        let percent = self.inner.reclaim_reserve_percent.load(Ordering::Relaxed);
+        let capacity = self
+            .inner
+            .free_pools
+            .lock()
+            .unwrap()
+            .get(device)
+            .map_or(0, |p| p.capacity_bytes);
+        capacity / 100 * percent
+    }
+
+    /// Bytes on `device` that can be allocated now: free extents plus the untouched space past the
+    /// allocation frontier.
+    fn free_bytes_on(&self, device: &str, initial_offset: u64) -> u64 {
+        let pools = self.inner.free_pools.lock().unwrap();
+        let Some(pool) = pools.get(device) else {
+            return 0;
+        };
+        let in_extents: u64 = pool.free_extents.iter().map(|(_, len)| *len).sum();
+        let frontier = self
+            .inner
+            .local_alloc
+            .lock()
+            .unwrap()
+            .get(device)
+            .copied()
+            .unwrap_or(initial_offset);
+        let frontier = Self::align_up_4k(frontier.max(initial_offset));
+        in_extents + pool.capacity_bytes.saturating_sub(frontier)
+    }
+
+    /// Evicts least recently used objects from `device` until its free and quarantined space covers
+    /// the reserve. Never waits: evicted space becomes reusable after the grace period.
+    async fn top_up_reserve(&self, exclude_uri: Option<&str>, device: &str, initial_offset: u64) {
+        let reserve = self.reserve_bytes(device);
+        if reserve == 0 {
+            return;
+        }
+        for _ in 0..MAX_PRESSURE_EVICTIONS {
+            if self.free_bytes_on(device, initial_offset) + self.quarantined_bytes_on(device) >= reserve {
+                return;
+            }
+            if self
+                .evict_least_recent_for_pressure(exclude_uri, device)
+                .await
+                .is_none()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Bytes on `device` waiting in the reclaim quarantine.
+    fn quarantined_bytes_on(&self, device: &str) -> u64 {
+        self.inner
+            .quarantine
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.device == device)
+            .map(|e| e.length)
+            .sum()
+    }
+
+    /// When the oldest quarantined extent on `device` becomes reusable.
+    fn next_quarantine_expiry_on(&self, device: &str) -> Option<Instant> {
+        let grace = self.reclaim_grace();
+        self.inner
+            .quarantine
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.device == device)
+            .map(|e| e.released_at + grace)
+            .min()
+    }
+
+    /// Evicts the least recently used clean, unpinned object with data on `device` (by last lookup,
+    /// or creation time if it hasn't been looked up since the daemon started) and quarantines its
+    /// extents. Returns `None` when no such object exists, and `Some(false)` when the chosen object
+    /// changed before it could be removed.
+    async fn evict_least_recent_for_pressure(&self, exclude_uri: Option<&str>, device: &str) -> Option<bool> {
+        let (uri, generation) = {
+            let mirror = self.inner.entries_mirror.lock().unwrap();
+            let last_access = self.inner.last_access.lock().unwrap();
+            mirror
+                .iter()
+                .filter(|(uri, m)| {
+                    Some(uri.as_str()) != exclude_uri
+                        && !m.pinned
+                        && !m.is_dirty()
+                        && m.chunk_layout
+                            .iter()
+                            .any(|c| c.tier != StorageTier::Ram && c.device == device)
+                })
+                .min_by_key(|(uri, m)| {
+                    let used = last_access
+                        .get(uri.as_str())
+                        .copied()
+                        .unwrap_or(m.created_at.saturating_mul(1000));
+                    (used, m.generation)
+                })
+                .map(|(uri, m)| (uri.clone(), m.generation))?
+        };
+        let removed = {
+            let mut mirror = self.inner.entries_mirror.lock().unwrap();
+            match mirror.get(&uri) {
+                Some(m) if m.generation == generation => mirror.remove(&uri),
+                _ => None,
+            }
+        };
+        let meta = match removed {
+            Some(meta) => meta,
+            None => return Some(false),
+        };
+        info!(
+            "Space on '{}': evicting least recently used '{}' ({:.2} MiB)",
+            device,
+            uri,
+            meta.object_size as f64 / (1024.0 * 1024.0)
+        );
+        self.cache.invalidate(&uri).await;
+        self.forget_access(&uri);
+        if let Some(ref m) = self.inner.metrics {
+            m.evictions_total.fetch_add(1, Ordering::Relaxed);
+            m.evicted_bytes_total.fetch_add(meta.object_size, Ordering::Relaxed);
+        }
+        // A reader may have resolved this layout just before the eviction, so its extents serve
+        // the grace period like any other freed extent.
+        self.quarantine_chunks(&meta.chunk_layout);
+        self.update_metrics_counters();
+        self.mark_dirty();
+        Some(true)
     }
 
     /// Atomically persists the metadata manifest and allocation pointers to disk
@@ -1143,6 +1310,7 @@ impl MetadataStore {
 
         if let Some(meta) = removed_meta {
             self.cache.invalidate(uri).await;
+            self.forget_access(uri);
             self.quarantine_chunks(&meta.chunk_layout);
 
             if let Some(ref m) = self.inner.metrics {
@@ -1159,13 +1327,35 @@ impl MetadataStore {
 
     /// Purges all cached items and resets allocation. Allocation restarts at each caller's
     /// configured `device_start_offset_bytes` (the frontier map is cleared, not reset to a constant).
-    pub async fn purge_all(&self) -> Result<(usize, u64)> {
+    /// Removes cached objects. Pinned objects are kept unless `include_pinned` is set. Returns the
+    /// number of objects removed, their bytes, and the number of pinned objects kept.
+    ///
+    /// When nothing is kept, the allocator is reset as well (a full wipe). When pinned objects are
+    /// kept their data stays where it is, so the removed objects' blocks go through the reclaim
+    /// quarantine like any other eviction.
+    pub async fn purge_all(&self, include_pinned: bool) -> Result<(usize, u64, usize)> {
+        let kept_pinned = if include_pinned {
+            0
+        } else {
+            self.inner
+                .entries_mirror
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|m| m.pinned)
+                .count()
+        };
+        if kept_pinned > 0 {
+            return self.purge_unpinned(kept_pinned).await;
+        }
+
         let (count, total_bytes, all_chunks) = {
             let mut mirror = self.inner.entries_mirror.lock().unwrap();
             let count = mirror.len();
             let total_bytes: u64 = mirror.values().map(|m| m.object_size).sum();
             let chunks: Vec<ChunkDescriptor> = mirror.values().flat_map(|m| m.chunk_layout.iter().cloned()).collect();
             mirror.clear();
+            self.inner.last_access.lock().unwrap().clear();
             (count, total_bytes, chunks)
         };
 
@@ -1190,7 +1380,31 @@ impl MetadataStore {
         }
 
         self.flush_to_disk().await?;
-        Ok((count, total_bytes))
+        Ok((count, total_bytes, 0))
+    }
+
+    async fn purge_unpinned(&self, kept_pinned: usize) -> Result<(usize, u64, usize)> {
+        let removed: Vec<(String, StoredMetadata)> = {
+            let mut mirror = self.inner.entries_mirror.lock().unwrap();
+            let uris: Vec<String> = mirror
+                .iter()
+                .filter(|(_, m)| !m.pinned)
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            uris.into_iter()
+                .filter_map(|uri| mirror.remove(&uri).map(|m| (uri, m)))
+                .collect()
+        };
+        let mut total_bytes = 0u64;
+        for (uri, meta) in &removed {
+            total_bytes += meta.object_size;
+            self.cache.invalidate(uri).await;
+            self.forget_access(uri);
+            self.quarantine_chunks(&meta.chunk_layout);
+        }
+        self.update_metrics_counters();
+        self.flush_to_disk().await?;
+        Ok((removed.len(), total_bytes, kept_pinned))
     }
 
     /// Returns live cache statistics for diagnostics & monitoring
@@ -1463,6 +1677,8 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_pressure_evicts_oldest_clean_object() {
         let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let grace = Duration::from_millis(300);
+        store.set_reclaim_grace(grace);
         store
             .register_device_capacities(&[test_device("/dev/p0", 4096 + 2 * 4194304)])
             .await;
@@ -1490,12 +1706,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Device is full: allocating must evict the clean, unpinned object and reuse its blocks
+        // Device is full: allocating must evict the clean, unpinned object and reuse its blocks,
+        // but only after they have served the grace period (a reader may still hold the layout).
+        let started = Instant::now();
         let off3 = store
             .allocate_chunk_offset_for(Some("hypercache://new.bin"), "/dev/p0", 4194304, 4096)
             .await
             .unwrap();
         assert_eq!(off3, off1);
+        assert!(
+            started.elapsed() >= grace,
+            "evicted extent reused after {:?}, before the {:?} grace period",
+            started.elapsed(),
+            grace
+        );
         assert!(store.get_layout("hypercache://old.bin").await.unwrap().is_none());
         assert!(store.get_layout("hypercache://pinned.bin").await.unwrap().is_some());
 
@@ -1505,6 +1729,287 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("capacity exhausted"));
+    }
+
+    /// Space that is still in quarantine is never handed out early, even when the device is full
+    /// and nothing else can be evicted (issue #10).
+    #[tokio::test]
+    async fn test_capacity_pressure_waits_for_quarantined_extents() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let grace = Duration::from_millis(300);
+        store.set_reclaim_grace(grace);
+        store
+            .register_device_capacities(&[test_device("/dev/w0", 4096 + 4194304)])
+            .await;
+        let off = store.allocate_chunk_offset("/dev/w0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout(
+                "hypercache://a.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/w0", off, 4194304)],
+            )
+            .await
+            .unwrap();
+        store.evict_entry("hypercache://a.bin").await.unwrap();
+
+        // The only space is quarantined: the writer waits for it instead of reusing it at once.
+        let started = Instant::now();
+        let again = store.allocate_chunk_offset("/dev/w0", 4194304, 4096).await.unwrap();
+        assert_eq!(again, off);
+        assert!(started.elapsed() >= grace, "reused after {:?}", started.elapsed());
+    }
+
+    /// When even the space that frees up within the grace period can't fit the request, the
+    /// allocation fails after at most about one grace period instead of reusing it early or hanging.
+    #[tokio::test]
+    async fn test_capacity_pressure_gives_up_after_one_grace_period() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let grace = Duration::from_millis(300);
+        store.set_reclaim_grace(grace);
+        store
+            .register_device_capacities(&[test_device("/dev/g0", 4096 + 2 * 4194304)])
+            .await;
+        let off1 = store.allocate_chunk_offset("/dev/g0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout(
+                "hypercache://old.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/g0", off1, 4194304)],
+            )
+            .await
+            .unwrap();
+        let off2 = store.allocate_chunk_offset("/dev/g0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout_full(
+                "hypercache://pinned.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/g0", off2, 4194304)],
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // 8 MiB can't fit next to the pinned object, even after old.bin's 4 MiB comes back.
+        let started = Instant::now();
+        let err = store
+            .allocate_chunk_offset_for(Some("hypercache://big.bin"), "/dev/g0", 2 * 4194304, 4096)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("capacity exhausted"));
+        let took = started.elapsed();
+        assert!(
+            took >= grace,
+            "gave up after {:?}, before waiting for the quarantine",
+            took
+        );
+        assert!(took < grace * 3, "waited {:?}, far past the grace period", took);
+        assert!(store.get_layout("hypercache://pinned.bin").await.unwrap().is_some());
+    }
+
+    /// Pressure eviction picks the object used longest ago, not the one created first.
+    #[tokio::test]
+    async fn test_capacity_pressure_evicts_least_recently_used() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        store.set_reclaim_grace(Duration::ZERO);
+        store
+            .register_device_capacities(&[test_device("/dev/l0", 4096 + 2 * 4194304)])
+            .await;
+        let off_old = store.allocate_chunk_offset("/dev/l0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout(
+                "hypercache://busy-old.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/l0", off_old, 4194304)],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let off_new = store.allocate_chunk_offset("/dev/l0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout(
+                "hypercache://idle-new.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/l0", off_new, 4194304)],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // The older object is in use: it was looked up after the newer one was written.
+        assert!(store.get_layout("hypercache://busy-old.bin").await.unwrap().is_some());
+
+        let off = store
+            .allocate_chunk_offset_for(Some("hypercache://x.bin"), "/dev/l0", 4194304, 4096)
+            .await
+            .unwrap();
+        assert_eq!(off, off_new);
+        assert!(store.get_layout("hypercache://idle-new.bin").await.unwrap().is_none());
+        assert!(store.get_layout("hypercache://busy-old.bin").await.unwrap().is_some());
+    }
+
+    /// With a reserve, space is evicted ahead of need, so the write that fills the device returns
+    /// at once and the next one finds space that has already served its grace period.
+    #[tokio::test]
+    async fn test_reserve_evicts_ahead_without_waiting() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let grace = Duration::from_millis(300);
+        store.set_reclaim_grace(grace);
+        store.set_reclaim_reserve_percent(20);
+        let cap = 4096 + 4 * 4194304;
+        store.register_device_capacities(&[test_device("/dev/v0", cap)]).await;
+        for i in 0..3 {
+            let off = store.allocate_chunk_offset("/dev/v0", 4194304, 4096).await.unwrap();
+            store
+                .save_layout(
+                    &format!("hypercache://o{}.bin", i),
+                    4194304,
+                    4194304,
+                    vec![nvme("/dev/v0", off, 4194304)],
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(store.get_layout("hypercache://o0.bin").await.unwrap().is_some());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(store.get_layout("hypercache://o2.bin").await.unwrap().is_some());
+
+        // This allocation fills the device: it returns at once, and the least recently used object
+        // (o1) is evicted into quarantine to restore the reserve.
+        let started = Instant::now();
+        let off = store
+            .allocate_chunk_offset_for(Some("hypercache://o3.bin"), "/dev/v0", 4194304, 4096)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < grace, "the reserve top-up must not wait");
+        store
+            .save_layout(
+                "hypercache://o3.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/v0", off, 4194304)],
+            )
+            .await
+            .unwrap();
+        assert!(store.get_layout("hypercache://o1.bin").await.unwrap().is_none());
+        assert!(store.get_layout("hypercache://o0.bin").await.unwrap().is_some());
+        assert!(store.get_layout("hypercache://o2.bin").await.unwrap().is_some());
+
+        // Once that space has served its grace period, the next write gets it without waiting.
+        tokio::time::sleep(grace + Duration::from_millis(50)).await;
+        let started = Instant::now();
+        store
+            .allocate_chunk_offset_for(Some("hypercache://o4.bin"), "/dev/v0", 4194304, 4096)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn test_reserve_never_evicts_pinned_or_dirty_objects() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        store.set_reclaim_reserve_percent(50);
+        store
+            .register_device_capacities(&[test_device("/dev/k0", 4096 + 2 * 4194304)])
+            .await;
+        let a = store.allocate_chunk_offset("/dev/k0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout_full(
+                "hypercache://pinned.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/k0", a, 4194304)],
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let b = store.allocate_chunk_offset("/dev/k0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout_full(
+                "file:///ckpt/dirty.pt",
+                4194304,
+                4194304,
+                vec![nvme("/dev/k0", b, 4194304)],
+                Some(SyncStatus::Committed),
+                false,
+            )
+            .await
+            .unwrap();
+        // The device is full and below its reserve, but nothing may be evicted.
+        let _ = store.allocate_chunk_offset("/dev/k0", 4096, 4096).await;
+        assert!(store.get_layout("hypercache://pinned.bin").await.unwrap().is_some());
+        assert!(store.get_layout("file:///ckpt/dirty.pt").await.unwrap().is_some());
+    }
+
+    /// Purge keeps pinned objects (and their blocks) unless asked to include them.
+    #[tokio::test]
+    async fn test_purge_keeps_pinned_unless_included() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let p = store.allocate_chunk_offset("/dev/u0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout_full(
+                "hypercache://keep.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/u0", p, 4194304)],
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let o = store.allocate_chunk_offset("/dev/u0", 4194304, 4096).await.unwrap();
+        store
+            .save_layout(
+                "hypercache://drop.bin",
+                4194304,
+                4194304,
+                vec![nvme("/dev/u0", o, 4194304)],
+            )
+            .await
+            .unwrap();
+
+        let (removed, bytes, kept) = store.purge_all(false).await.unwrap();
+        assert_eq!((removed, bytes, kept), (1, 4194304, 1));
+        assert!(store.get_layout("hypercache://keep.bin").await.unwrap().is_some());
+        assert!(store.get_layout("hypercache://drop.bin").await.unwrap().is_none());
+        // The pinned object's blocks are never handed out, and the removed object's blocks wait
+        // out the grace period (default 30 s) instead of being reused at once.
+        let next = store.allocate_chunk_offset("/dev/u0", 4194304, 4096).await.unwrap();
+        assert_ne!(next, p);
+        assert_ne!(next, o);
+
+        let (removed, _, kept) = store.purge_all(true).await.unwrap();
+        assert_eq!((removed, kept), (1, 0));
+        assert!(store.get_layout("hypercache://keep.bin").await.unwrap().is_none());
+    }
+
+    /// A pin survives re-ingest and overwrite; only an explicit unpin clears it.
+    #[tokio::test]
+    async fn test_pin_sticks_across_reingest() {
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let uri = "hypercache://models/keep.bin";
+        let a = store.allocate_chunk_offset("/dev/s0", 4096, 4096).await.unwrap();
+        store
+            .save_layout_full(uri, 4096, 4194304, vec![nvme("/dev/s0", a, 4096)], None, true)
+            .await
+            .unwrap();
+        let b = store.allocate_chunk_offset("/dev/s0", 4096, 4096).await.unwrap();
+        store
+            .save_layout_full(uri, 4096, 4194304, vec![nvme("/dev/s0", b, 4096)], None, false)
+            .await
+            .unwrap();
+        assert!(
+            store.get_layout(uri).await.unwrap().unwrap().pinned,
+            "re-ingest dropped the pin"
+        );
+        assert!(store.set_pinned(uri, false).await.unwrap());
+        assert!(!store.get_layout(uri).await.unwrap().unwrap().pinned);
     }
 
     #[tokio::test]
@@ -1706,7 +2211,8 @@ mod tests {
         assert_eq!(list2.len(), 1);
         assert_eq!(total2, 8388608);
 
-        let (purged_count, purged_freed) = store.purge_all().await.unwrap();
+        let (purged_count, purged_freed, kept) = store.purge_all(false).await.unwrap();
+        assert_eq!(kept, 0);
         assert_eq!(purged_count, 1);
         assert_eq!(purged_freed, 8388608);
 
@@ -1729,7 +2235,7 @@ mod tests {
             .await
             .unwrap();
 
-        store.purge_all().await.unwrap();
+        store.purge_all(false).await.unwrap();
 
         // After purge allocation must restart at the configured offset, never below it
         let after = store

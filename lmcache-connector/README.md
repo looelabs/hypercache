@@ -171,6 +171,7 @@ It prints `None` when the kernels load, and the reason when they don't. The conn
 - Two stores of the same block in one process run one after the other, and each reports its real outcome. A block already stored counts only if its size and layout match.
 - In a process forked from the one that opened the connector, closing it does nothing: the workers belong to the parent.
 - A block that fails its checksum is evicted, unless it was replaced during the read.
+- When a drive is full, the daemon evicts older blocks to make room, but their space only becomes reusable after `reclaim_grace_secs` (default 30), so a store can wait that long. The daemon keeps `reclaim_reserve_percent` (default 5) of each drive free ahead of need, so this is rare. When it does happen with the default `timeout_s` of 30 the store may time out and fail; that costs a recompute, never wrong data.
 - On raw block devices, writes use O_DIRECT. Page-aligned L1 buffers (`--l1-align-bytes 4096`) go to and from the drive with no copy. A partial last block goes through the page cache on writes and an aligned copy on reads.
 
 ## LMCache's wrapper

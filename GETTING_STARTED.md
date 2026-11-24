@@ -238,7 +238,8 @@ Run directly on any individual GPU worker node:
 | **Batch Pre-load from File** | `./hypercache preload --file checkpoints.txt` |
 | **Evict Model Locally** | `./hypercache rm hypercache://s3/models/llama-3/weights.safetensors` |
 | **Refresh Model from Source**| `./hypercache refresh hypercache://s3/models/llama-3/weights.safetensors` |
-| **Purge Local Cache** | `./hypercache purge` |
+| **Pin / Unpin a Model** | `./hypercache pin <uri>` / `./hypercache unpin <uri>` |
+| **Purge Local Cache** (keeps pinned) | `./hypercache purge` (add `--include-pinned` to remove everything) |
 | **Inspect Local SSDs** | `./hypercache inspect` |
 | **Check Local Health** | `./hypercache status` |
 | **Run DMA Benchmark** | `./hypercache bench --size-mb 5000` |

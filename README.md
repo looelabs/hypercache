@@ -490,7 +490,8 @@ Every critical setting in `hypercache-agent.toml` and `hypercache-controller.tom
 | `s3_multipart_threshold_bytes` | -- | `67108864` (64 MiB) | Write-back/write-through uploads above this size use S3 multipart upload. |
 | `nfs_mount_path` | -- | `"/mnt/nfs"` | Root mount path for NFS / POSIX shared filesystem backend. |
 | `nfs_allowed_paths` | -- | `[]` | Extra directories `file://` / `nfs://` URIs may access. Anything outside `nfs_mount_path` and these roots is rejected. |
-| `reclaim_grace_secs` | -- | `30` | Seconds freed blocks are held before reuse, so readers holding an old layout never see another object's bytes. |
+| `reclaim_grace_secs` | -- | `30` | Seconds freed blocks are held before reuse, so readers holding an old layout never see another object's bytes. This also applies when a drive is full: a write waits up to this long for space freed by eviction, then fails. |
+| `reclaim_reserve_percent` | -- | `5` | Percent of each NVMe drive kept free ahead of need (0 = off, max 50). The least recently used clean, unpinned objects are evicted early, so writes to a full drive rarely wait for the grace period. |
 | `write_through_enabled` | -- | `false` | `false` = async Write-Back; `true` = synchronous Write-Through to S3/NFS. |
 | `peer_replication_factor` | -- | `1` | Set to `2` to enable $k=2$ peer checkpoint replication on `CommitWrite`. |
 | `controller_url` | `HYPERCACHE_CONTROLLER_URL`| `None` | URL of Central Controller (e.g. `"http://10.0.0.10:9120"`). |
@@ -559,8 +560,12 @@ On any worker node, use `./hypercache` to inspect drives, preload weights, or be
 # Inspect auto-discovered NVMe drives and NUMA topology
 ./hypercache inspect
 
-# Pre-load a model into cache and pin it so it is never evicted
+# Pre-load a model into cache and pin it so it is never evicted automatically
 ./hypercache preload hypercache://s3/my-bucket/models/llama-3-8b/weights.pt --pin
+
+# Pin or unpin objects that are already cached
+./hypercache pin hypercache://s3/my-bucket/models/llama-3-8b/weights.pt
+./hypercache unpin hypercache://s3/my-bucket/models/llama-3-8b/weights.pt
 
 # List all cached objects, their storage tier, sync status, and pin state
 ./hypercache ls
@@ -897,8 +902,9 @@ Runs locally on each GPU or CPU compute node:
 | `./hypercache preload <uri> [--tier ram\|nvme] [--pin]` | Pre-loads a model from S3/NFS and optionally pins it against eviction. |
 | `./hypercache preload --file <path> [--pin]` | Batch pre-loads multiple checkpoints listed in a text file. |
 | `./hypercache rm <uri>` | Evicts a specific object and reclaims its 4 MiB RAM/NVMe blocks into the free pool. |
-| `./hypercache refresh <uri>` | Evicts and re-ingests fresh weights from authoritative S3 or NFS. |
-| `./hypercache purge` | Clears all cached models from RAM & NVMe and resets block allocators. |
+| `./hypercache pin <uri>...` / `unpin <uri>...` | Pins cached objects so they are never evicted automatically, or unpins them. A pin sticks through re-ingest and `refresh`. |
+| `./hypercache refresh <uri>` | Evicts and re-ingests fresh weights from authoritative S3 or NFS. Keeps the pin. |
+| `./hypercache purge [--include-pinned]` | Clears cached models from RAM & NVMe, keeping pinned ones unless `--include-pinned` is given. With nothing kept it also resets the block allocators. |
 | `./hypercache bench --tier ram --size-mb 1000` | Benchmarks Tier 1 (Host RAM) read throughput over memory bus. |
 | `./hypercache bench --tier nvme --size-mb 5000` | Benchmarks Tier 2 (NVMe) parallel DMA read throughput and verifies SHA-256 parity. |
 | `./hypercache inspect` | Scans and displays discovered physical/virtual SSDs and NUMA node mappings. |
@@ -917,7 +923,7 @@ Runs on the Controller host (zero configuration required on `127.0.0.1` loopback
 | `./hypercache-admin preload <uri> --selector "gpu=h100"` | Dispatches pre-load targeting specific node labels. |
 | `./hypercache-admin preload-batch --prefix <PREFIX> --nodes all --sharded` | Partitions and pre-loads a sharded dataset across cluster nodes using consistent hashing. |
 | `./hypercache-admin evict <uri> --nodes all` | Dispatches parallel model eviction across all nodes. |
-| `./hypercache-admin purge --nodes all` | Dispatches cache purge and block allocator reset across all nodes. |
+| `./hypercache-admin purge --nodes all [--include-pinned]` | Dispatches a cache purge across all nodes, keeping pinned objects unless `--include-pinned` is given. |
 | `./hypercache-admin status` | Shows aggregate fleet metrics (nodes online, total NVMe pool, cache utilization). |
 
 ---

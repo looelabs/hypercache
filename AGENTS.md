@@ -237,13 +237,14 @@ kill $DAEMON_PID
 ## 7. Working on the Codebase: Invariants, Pitfalls & Workflows
 
 ### A. Data-Path Invariants (do not break these)
-- **Never return freed extents straight to the free pool.** Evicted or replaced chunks go to the quarantine in `metadata.rs` and are reusable only after `reclaim_grace_secs`. Readers resolve a layout over IPC and then read raw offsets with no lock, so early reuse makes them silently read another object's bytes.
+- **Never return freed extents straight to the free pool.** Evicted or replaced chunks go to the quarantine in `metadata.rs` and are reusable only after `reclaim_grace_secs`. Readers resolve a layout over IPC and then read raw offsets with no lock, so early reuse makes them silently read another object's bytes. This holds under capacity pressure too: a full device evicts the least recently used clean, unpinned objects into the quarantine and the allocation waits for it, at most one grace period, then fails. `reclaim_reserve_percent` evicts ahead of need so that wait is rare. Never release quarantined extents early to make room; `release_unpublished` is only for chunks no client has seen.
 - **Every layout mutation bumps `generation`.** `locate` returns it. Write-back status updates must go through `update_sync_status_if_generation` with the generation they were started for, so an old flush cannot mark a newer commit as synced.
 - **Go through single-flight ingest.** Any code path that may ingest a URI (UDS `locate`/`ingest`/`preload`, agent preload, batch) must call `IngestionEngine::get_or_ingest` / `ingest_object_full`, never a backend fetch directly.
 - **Durable before visible.** Chunk data is `fdatasync`ed and its CRC32 recorded before `save_layout` publishes it. Do not publish a layout that points at unsynced data. The one exception is `LOCAL_ONLY` commits (KV cache), which skip the flush only while the unflushed marker is armed (`metadata::unflushed_marker_path`); a start that finds the marker drops every local-only entry. Never let a local-only commit skip the flush unless the marker is durably in place, and never remove the marker before every device has been flushed.
 - **Device flushes go through the flush gate.** `Striper::sync_chunks` and `sync_devices` share flushes per device (`ingestion/flush_gate.rs`); a caller only accepts a flush that started after it arrived. Do not call `sync_data` on a device directly.
 - **One manifest writer.** Mutations signal the coalescing writer in `metadata.rs`. Do not write `metadata.json` from anywhere else. `atomic_write` (unique tmp, fsync, rename, dir fsync) is the only correct way to replace it.
 - **Dirty objects are never evictable.** `COMMITTED`, `SYNCING_BACKEND` and `SYNC_FAILED` weigh 0 for eviction. `resume_pending_writebacks` re-queues them at boot. A new `SyncStatus` variant must be classified in `SyncStatus::is_dirty` (`protocol.rs`).
+- **Pinned and dirty objects are never evicted automatically.** Not by Moka, capacity pressure or the reserve. A pin sticks through re-ingest, overwrite and `refresh`; only `unpin` (`Request::Pin { pinned: false }`) clears it. `purge` keeps pinned objects unless `include_pinned` is set, and resets the allocators only when nothing is kept. `rm` still removes a pinned object, since it names it.
 - **Allocations roll back on failure.** If striping fails partway, every extent allocated in that call is returned.
 
 ### B. Compatibility Rules in Practice
@@ -362,7 +363,8 @@ Leave committing, merging, tagging and pushing to the maintainer unless they exp
 | `peer_replication_factor` | integer | `1` | Peer checkpoint replication factor (`2` enables $k=2$ peer replica on `CommitWrite`) |
 | `p2p_preload_enabled` | bool | `false` | Enable P2P fleet pre-warming (1 origin pull + peer chunk distribution) |
 | `nfs_allowed_paths` | list | `[]` | Extra roots `file://` / `nfs://` URIs may access (besides `nfs_mount_path`) |
-| `reclaim_grace_secs` | integer | `30` | Grace period before freed extents are reused (protects in-flight readers) |
+| `reclaim_grace_secs` | integer | `30` | Grace period before freed extents are reused, also when a device is full (protects in-flight readers). A write to a full device waits up to this long for evicted space, then fails |
+| `reclaim_reserve_percent` | integer | `5` | Percent of each NVMe device kept free ahead of need (0 = off, max 50). Least recently used clean, unpinned objects are evicted early so their space has served the grace period before a write needs it |
 | `s3_parallel_streams` | integer | `8` | Parallel ranged GETs per object during S3 ingest |
 | `s3_read_timeout_secs` | integer | `60` | Per-read idle timeout for S3 transfers (no total-time cap) |
 | `s3_session_token` | string | `$AWS_SESSION_TOKEN` | Session token for temporary S3 credentials |

@@ -114,6 +114,9 @@ pub struct FleetEvictRequest {
 pub struct FleetPurgeRequest {
     pub nodes: Option<String>,
     pub selector: Option<String>,
+    /// Also remove pinned objects on each node. Without it, pinned objects are kept.
+    #[serde(default)]
+    pub include_pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -831,8 +834,12 @@ async fn handle_fleet_purge(
             targets,
             "/api/v1/agent/purge",
             Some(SHORT_DIRECTIVE_TIMEOUT),
-            |_| None,
-            "Purged all cached models & reset drives",
+            |_| Some(serde_json::json!({ "include_pinned": payload.include_pinned })),
+            if payload.include_pinned {
+                "Purged all cached models & reset drives"
+            } else {
+                "Purged cached models (pinned kept)"
+            },
             "size_bytes",
         )
         .await;

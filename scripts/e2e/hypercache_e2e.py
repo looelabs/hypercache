@@ -558,6 +558,33 @@ def scenario_daemon(ctx: Ctx, rep: Report) -> None:
 
     rep.check("purge clears the catalog and restarts allocation at device_start_offset_bytes", purge_resets_to_configured_offset)
 
+    def pins_survive_refresh_and_purge():
+        def pinned(u):
+            objs = json.loads(node.cli("ls", "--json").stdout)
+            objs = objs.get("objects", objs) if isinstance(objs, dict) else objs
+            return [o.get("pinned") for o in objs if o.get("uri") == u]
+        data = random_bytes(2 * MIB + 3)
+        uri = ctx.nfs_file("models/pinned.bin", data)
+        other = ctx.nfs_file("models/unpinned.bin", random_bytes(MIB))
+        node.cli("preload", uri)
+        node.cli("preload", other)
+        node.cli("pin", uri)
+        expect(pinned(uri) == [True], f"pin did not take: {pinned(uri)}")
+        node.cli("refresh", uri)
+        expect(pinned(uri) == [True], f"refresh dropped the pin: {pinned(uri)}")
+        node.cli("purge")
+        expect(pinned(uri) == [True], "purge removed a pinned object")
+        expect(pinned(other) == [], "purge kept an unpinned object")
+        expect(sha256(node.read_object(uri)) == sha256(data), "pinned object corrupt after purge")
+        node.cli("unpin", uri)
+        expect(pinned(uri) == [False], f"unpin did not take: {pinned(uri)}")
+        node.cli("pin", uri)
+        node.cli("purge", "--include-pinned")
+        expect(pinned(uri) == [], "purge --include-pinned kept the pinned object")
+        expect(node.cli("pin", uri, check=False).returncode != 0, "pinning an uncached object succeeded")
+
+    rep.check("pins survive refresh and purge; purge --include-pinned removes them", pins_survive_refresh_and_purge)
+
     rep.check("bench runs end-to-end with explicit synthetic opt-in", lambda: node.cli(
         "bench", "--size-mb", "16", "--iterations", "1", timeout=300))
 

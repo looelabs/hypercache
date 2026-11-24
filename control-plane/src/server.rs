@@ -240,15 +240,24 @@ impl Server {
                     Response::error(format!("Eviction failed: {}", e))
                 }
             },
-            Ok(Request::Purge) => match self.metadata.purge_all().await {
-                Ok((count, freed)) => {
-                    info!(
-                        "Cache PURGE/CLEAN executed: cleared {} cached model(s) ({:.2} GiB freed). Allocation restarts at offset {}.",
-                        count,
-                        freed as f64 / (1024.0 * 1024.0 * 1024.0),
-                        self.config.device_start_offset_bytes
-                    );
-                    Response::purged(count, freed)
+            Ok(Request::Purge { include_pinned }) => match self.metadata.purge_all(include_pinned).await {
+                Ok((count, freed, kept)) => {
+                    if kept > 0 {
+                        info!(
+                            "Cache PURGE executed: cleared {} cached object(s) ({:.2} GiB), kept {} pinned object(s).",
+                            count,
+                            freed as f64 / (1024.0 * 1024.0 * 1024.0),
+                            kept
+                        );
+                    } else {
+                        info!(
+                            "Cache PURGE/CLEAN executed: cleared {} cached model(s) ({:.2} GiB freed). Allocation restarts at offset {}.",
+                            count,
+                            freed as f64 / (1024.0 * 1024.0 * 1024.0),
+                            self.config.device_start_offset_bytes
+                        );
+                    }
+                    Response::purged(count, freed, kept)
                 }
                 Err(e) => {
                     error!("Purge failed: {}", e);
