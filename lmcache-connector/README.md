@@ -59,6 +59,7 @@ sudo hypercache -c kv.toml start      # socket: /run/hypercache/hypercache.sock
 pip install "lmcache==0.5.7.post1"
 pip install hypercache-lmcache-native
 python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_gpu_ops())"   # must print None
+python3 -c "import hypercache_lmcache_native as h; print(h.check_lmcache_version())"   # None on a tested LMCache
 ```
 
 **3. Start the LMCache server with the connector as its L2.** Pick a `namespace` that names the model and its revision (see [Use](#use)):
@@ -158,7 +159,7 @@ It prints `None` when the kernels load, and the reason when they don't. The conn
 ## What isn't supported
 
 - `list_l2_keys` and LMCache's IsolatedLRU quotas.
-- Versions other than LMCache 0.5.5, 0.5.6 and 0.5.7.post1, which are the ones tested. Nothing in the connector enforces that yet.
+- Versions other than LMCache 0.5.5, 0.5.6 and 0.5.7.post1, which are the ones tested (`hypercache_lmcache_native.TESTED_LMCACHE_VERSIONS`). On any other version, including dev, rc and later post releases, the connector prints a warning to stderr at startup and `check_lmcache_version()` returns the reason. It still starts, since LMCache's plugin interface may or may not have changed. A local build tag such as `0.5.7.post1+cu128` counts as its release.
 - A daemon without `local_only` commits. Stores fail before writing any data, and lookups miss.
 
 ## Behaviour

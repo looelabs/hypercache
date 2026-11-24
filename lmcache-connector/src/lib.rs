@@ -8,6 +8,7 @@ pub mod connector;
 pub mod daemon;
 pub mod io;
 pub mod key;
+pub mod lmcache_version;
 
 #[cfg(feature = "python")]
 mod python;
