@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+- The daemon now listens on the `socket_path` from its config file. It used to ignore that key and
+  use the default path unless `HYPERCACHE_SOCKET_PATH` was set (issue #10). `HYPERCACHE_SOCKET_PATH`
+  still wins over the file. CLI commands given `-c` connect to that config's socket. The host lock
+  file doesn't move with `socket_path`, so a second daemon on the same host is still refused.
+- Removed the undocumented `HYPERCACHE_SOCKET` variable, which the daemon read and then ignored. Use
+  `HYPERCACHE_SOCKET_PATH`.
+
 ### Docs
 - vLLM first-token time with the connector at 4 workers on a DRAM-less drive: a 14k-token prompt
   loaded from the drive reached its first token in 0.41 s against 0.65 s at the default 32.

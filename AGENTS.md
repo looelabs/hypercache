@@ -352,6 +352,7 @@ Leave committing, merging, tagging and pushing to the maintainer unless they exp
 | `controller_bind_address`| string | `"0.0.0.0"` | IP to bind Central Controller service on |
 | `controller_port` | integer | `9120` | Port for Central Controller service |
 | `cluster_auth_token` | string | `None` | Shared secret Bearer token for cluster security |
+| `socket_path` | string | `"/run/hypercache/hypercache.sock"` | Daemon socket (falls back to `/tmp/hypercache/`). `HYPERCACHE_SOCKET_PATH` wins over it. Does not move the host lock file |
 | `node_id` | string | `"$HOSTNAME"` | Unique identifier for the worker node |
 | `node_labels` | map | `{}` | Key-value labels for selective targeting |
 | `storage_backing_mode` | string | `"auto"` | `"auto"`, `"raw_block"`, or `"filesystem"` (`O_DIRECT` arena files for K8s/GDS) |
