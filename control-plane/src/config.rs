@@ -393,6 +393,37 @@ fn default_socket_path() -> String {
     get_socket_path().to_string_lossy().to_string()
 }
 
+/// The socket the daemon listens on for this config: `HYPERCACHE_SOCKET_PATH` if set, otherwise the
+/// config's `socket_path`, which defaults to `/run/hypercache/hypercache.sock` (or
+/// `/tmp/hypercache/hypercache.sock` when `/run/hypercache` isn't writable).
+///
+/// The daemon's lock file is not moved by `socket_path`: it is the host-wide guard against two
+/// daemons sharing the drives, so only `HYPERCACHE_SOCKET_PATH` (isolated test instances) moves it.
+pub fn resolve_socket_path(config: &Config) -> std::path::PathBuf {
+    pick_socket_path(socket_path_override(), &config.socket_path)
+}
+
+fn pick_socket_path(env_override: Option<std::path::PathBuf>, configured: &str) -> std::path::PathBuf {
+    if let Some(p) = env_override {
+        return p;
+    }
+    let configured = configured.trim();
+    if configured.is_empty() {
+        get_socket_path()
+    } else {
+        std::path::PathBuf::from(configured)
+    }
+}
+
+/// The socket for CLI client commands. With `-c`, the socket the daemon uses for that config;
+/// otherwise the first default socket that exists.
+pub fn client_socket_path(config_path: Option<&Path>) -> Result<std::path::PathBuf> {
+    match config_path {
+        Some(p) => Ok(resolve_socket_path(&Config::load_from_file(p)?)),
+        None => Ok(probe_active_socket_path()),
+    }
+}
+
 fn default_block_devices() -> Vec<String> {
     Vec::new()
 }
@@ -721,11 +752,6 @@ impl Config {
                 }
             }
         }
-        if let Ok(val) = std::env::var("HYPERCACHE_SOCKET") {
-            if !val.trim().is_empty() {
-                self.socket_path = val;
-            }
-        }
         if self.controller_url.is_none() {
             if let Ok(val) = std::env::var("HYPERCACHE_CONTROLLER_URL") {
                 if !val.trim().is_empty() {
@@ -858,6 +884,30 @@ fn expand_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config file's socket_path used to be overwritten by the default path (issue #10).
+    #[test]
+    fn socket_path_from_config_file_is_used() {
+        let cfg = Config::from_toml_str("socket_path = \"/srv/hc-a/hypercache.sock\"\n").unwrap();
+        assert_eq!(
+            pick_socket_path(None, &cfg.socket_path),
+            std::path::PathBuf::from("/srv/hc-a/hypercache.sock")
+        );
+    }
+
+    #[test]
+    fn socket_path_env_override_wins_over_config_file() {
+        let env = Some(std::path::PathBuf::from("/tmp/test-hc/hc.sock"));
+        assert_eq!(
+            pick_socket_path(env, "/srv/hc-a/hypercache.sock"),
+            std::path::PathBuf::from("/tmp/test-hc/hc.sock")
+        );
+    }
+
+    #[test]
+    fn empty_socket_path_falls_back_to_the_default() {
+        assert_eq!(pick_socket_path(None, "  "), get_socket_path());
+    }
 
     #[test]
     fn test_toml_unquoted_and_quoted_env_var_expansion() {

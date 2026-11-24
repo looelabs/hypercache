@@ -466,7 +466,7 @@ Every critical setting in `hypercache-agent.toml` and `hypercache-controller.tom
 
 | Config Key | Env Variable Override | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `socket_path` | `HYPERCACHE_SOCKET_PATH` | `"/run/hypercache/hypercache.sock"` | Local Unix Domain Socket path (falls back to `/tmp/hypercache/hypercache.sock`). The env var is honored by the daemon, CLI and Python client. |
+| `socket_path` | `HYPERCACHE_SOCKET_PATH` | `"/run/hypercache/hypercache.sock"` | Local Unix Domain Socket path (falls back to `/tmp/hypercache/hypercache.sock`). The env var wins over the config file and is honored by the daemon, CLI and Python client. The CLI reads `socket_path` from the file given with `-c`; other clients need the env var or their own setting. |
 | `storage_backing_mode` | -- | `"auto"` | `"auto"`, `"raw_block"`, or `"filesystem"` (`O_DIRECT` arena files). |
 | `filesystem_cache_paths` | -- | `[]` | List of mounted ext4/XFS directories for `O_DIRECT` arena files. |
 | `filesystem_arena_size_bytes`| -- | `10737418240` (10 GiB) | Pre-allocated size per filesystem arena file in bytes. |

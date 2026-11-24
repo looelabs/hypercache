@@ -222,7 +222,9 @@ async fn main() -> Result<()> {
             region,
             tier,
         } => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             let s3_config = s3_endpoint.map(|ep| S3BenchConfig {
                 endpoint: ep,
                 bucket,
@@ -240,19 +242,27 @@ async fn main() -> Result<()> {
         Commands::Inspect => run_inspect(cli.config, cli.devices).await,
         Commands::Check { json, ram } => run_check(cli.config, cli.devices, json, ram).await,
         Commands::Ls { json } => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             run_ls(&sock, json).await
         }
         Commands::Rm { uri } => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             run_rm(&sock, &uri).await
         }
         Commands::Refresh { uri } => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             run_refresh(&sock, &uri).await
         }
         Commands::Preload { uri, file, tier, pin } => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             let target_tier = match tier.to_lowercase().as_str() {
                 "ram" | "shm" => Some(protocol::StorageTier::Ram),
                 "nvme" | "ssd" | "disk" => Some(protocol::StorageTier::Nvme),
@@ -261,11 +271,15 @@ async fn main() -> Result<()> {
             run_preload(&sock, uri, file, target_tier, pin).await
         }
         Commands::Purge => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             run_purge(&sock).await
         }
         Commands::Status => {
-            let sock = config::probe_active_socket_path().to_string_lossy().to_string();
+            let sock = config::client_socket_path(cli.config.as_deref())?
+                .to_string_lossy()
+                .to_string();
             run_status(&sock).await
         }
     }
@@ -315,7 +329,8 @@ async fn run_daemon(
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
     info!("Loaded configuration from: {}", canonical_path.display());
 
-    let socket_path = config::get_socket_path();
+    let mut config = Config::load_from_file(&path)?;
+    let socket_path = config::resolve_socket_path(&config);
     let lock_path = config::get_lock_path();
 
     if let Some(parent) = lock_path.parent() {
@@ -324,8 +339,6 @@ async fn run_daemon(
     if let Some(parent) = socket_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-
-    let mut config = Config::load_from_file(&path)?;
     config.socket_path = socket_path.to_string_lossy().to_string();
 
     // Apply CLI overrides for RAM caching if provided

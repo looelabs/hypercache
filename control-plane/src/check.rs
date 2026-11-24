@@ -270,7 +270,7 @@ pub fn evaluate_host(
     }
 
     // 3. IPC Socket, Host Lockfile & Metadata Persistence Paths
-    let socket_path = config::get_socket_path();
+    let socket_path = config::resolve_socket_path(&config);
     let lock_path = config::get_lock_path();
     let ipc_dir = socket_path.parent().unwrap_or_else(|| Path::new("/tmp/hypercache"));
 
