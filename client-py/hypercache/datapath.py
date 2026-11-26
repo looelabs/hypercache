@@ -53,6 +53,20 @@ class ChecksumMismatchError(IOError):
     """Raised when chunk data does not match the CRC32 recorded at ingest time."""
 
 
+def _buffer_address(view: memoryview) -> Optional[int]:
+    """Address of a writable buffer's first byte, or None if it can't be had."""
+    if len(view) == 0:
+        return None
+    try:
+        c = ctypes.c_char.from_buffer(view)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return ctypes.addressof(c)
+    finally:
+        del c
+
+
 def logical_block_size(device_path: str) -> int:
     """Returns the O_DIRECT alignment for a device (sysfs logical_block_size), or 4096."""
     try:
@@ -151,16 +165,25 @@ class DirectBlockReader(DataReader):
         self._pid = os.getpid()
         self._local = threading.local()
         self.verify_checksums = _env_flag(VERIFY_CHECKSUMS_ENV) if verify_checksums is None else verify_checksums
-        self._stats = {"direct_reads": 0, "direct_fallbacks": 0, "buffered_reads": 0, "shm_reads": 0}
+        self._stats = {
+            "direct_reads": 0,
+            "direct_fallbacks": 0,
+            "buffered_reads": 0,
+            "shm_reads": 0,
+            # Bytes O_DIRECT put straight into the caller's buffer, and bytes that went through
+            # the bounce buffer (a copy made while holding the GIL)
+            "direct_bytes_in_place": 0,
+            "direct_bytes_bounced": 0,
+        }
         self._stats_lock = threading.Lock()
         if max_workers is None:
             max_workers = min(64, max(16, (os.cpu_count() or 4) * 4))
         self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    def _count(self, key: str) -> None:
+    def _count(self, key: str, n: int = 1) -> None:
         with self._stats_lock:
-            self._stats[key] += 1
+            self._stats[key] += n
 
     def get_stats(self) -> Dict[str, int]:
         """Read path counters. A growing `direct_fallbacks` means O_DIRECT is not engaging."""
@@ -186,7 +209,41 @@ class DirectBlockReader(DataReader):
         return bs
 
     def _read_direct(self, fd_direct: int, dev_path: str, target_slice: memoryview, phys_offset: int) -> bool:
-        """O_DIRECT read via an aligned bounce buffer. Returns False if the caller must fall back."""
+        """O_DIRECT read of `len(target_slice)` bytes at `phys_offset`. Returns False if the caller
+        must fall back.
+
+        When the destination and the device offset share the same alignment, the block-aligned
+        middle is read straight into the destination: the kernel DMAs into it with the GIL
+        released, so parallel chunk reads run in parallel. Only the unaligned head and tail (less
+        than one block each) go through the bounce buffer. Otherwise the whole range is bounced.
+        """
+        length = len(target_slice)
+        bs = self._block_size(dev_path)
+        addr = _buffer_address(target_slice)
+        if addr is not None and (addr - phys_offset) % bs == 0:
+            head = min((-phys_offset) % bs, length)
+            mid = (length - head) // bs * bs
+            tail = length - head - mid
+            if mid:
+                try:
+                    n = os.preadv(fd_direct, [target_slice[head : head + mid]], phys_offset + head)
+                except OSError as e:
+                    logger.debug(f"O_DIRECT read failed on {dev_path} at {phys_offset + head}: {e}")
+                    return False
+                if n != mid:
+                    return False
+                self._count("direct_bytes_in_place", mid)
+            if head and not self._read_bounced(fd_direct, dev_path, target_slice[:head], phys_offset):
+                return False
+            if tail and not self._read_bounced(
+                fd_direct, dev_path, target_slice[head + mid :], phys_offset + head + mid
+            ):
+                return False
+            return True
+        return self._read_bounced(fd_direct, dev_path, target_slice, phys_offset)
+
+    def _read_bounced(self, fd_direct: int, dev_path: str, target_slice: memoryview, phys_offset: int) -> bool:
+        """O_DIRECT read via an aligned bounce buffer, then a copy into the destination."""
         length = len(target_slice)
         bs = self._block_size(dev_path)
         aligned_start = phys_offset - (phys_offset % bs)
@@ -202,6 +259,7 @@ class DirectBlockReader(DataReader):
         if n < head + length:
             return False
         target_slice[:] = memoryview(buf)[head : head + length]
+        self._count("direct_bytes_bounced", length)
         return True
 
     def _get_fds(self, device_path: str) -> Tuple[Optional[int], int]:
@@ -345,7 +403,7 @@ class DirectBlockReader(DataReader):
         if length <= 0 or not chunk_layout:
             return b""
 
-        # Allocate page-aligned zero-copy buffer for multi-megabyte reads
+        # Page-aligned buffer for multi-megabyte reads, so O_DIRECT can read straight into it
         if length >= 1024 * 1024:
             result = mmap.mmap(-1, length)
         else:

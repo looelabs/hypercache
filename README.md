@@ -614,9 +614,11 @@ with fsspec.open(checkpoint_uri, "rb") as f:
 model.load_state_dict(state_dict)
 ```
 
-### 2. Native Safetensors & vLLM Zero-Copy Weight Loader
+### 2. Native Safetensors & vLLM Weight Loader
 
 Stream `.safetensors` files directly into GPU or host tensors with optional selective tensor filtering and cache pinning (`pinned=True`):
+
+CPU tensors from a full load are views of one buffer per shard, so the load needs no extra copy. Keeping any of them keeps that whole buffer in memory: to keep only a few tensors, `.clone()` them, or load just those with `tensor_names=[...]`. Tensors loaded to a GPU don't hold the buffer.
 
 ```python
 from hypercache import (

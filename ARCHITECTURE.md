@@ -152,10 +152,9 @@ The Python Data Plane (`client-py/hypercache/datapath.py`) implements zero-copy 
 1. **Direct DMA Handle (`fd_direct` with `O_DIRECT`)**:
    - Opens block device or filesystem arena with `os.O_DIRECT`.
    - Requires page/sector alignment (512 or 4096 bytes) for both the physical disk offset and user memory address.
-   - Executes multi-threaded `os.preadv` directly into a pre-allocated anonymous `mmap` buffer (`mmap.mmap(-1, length)`), saturating local PCIe NVMe lanes (~7 GB/s per Gen 4 drive, ~14 GB/s per Gen 5 drive).
+   - Reads chunks in parallel threads with `os.preadv`. Where the destination buffer and the device offset share the same alignment (reads of 1 MiB and more get a page-aligned `mmap` buffer), the block-aligned part of each chunk is read straight into the destination, with the GIL released. Only an unaligned head or tail, or a whole read whose alignments don't match, goes through a per-thread aligned bounce buffer and is then copied. `get_stats()` reports the split (`direct_bytes_in_place`, `direct_bytes_bounced`).
 2. **Buffered Handle (`fd_buffered` with `O_RDONLY`)**:
-   - Transparently handles arbitrary, unaligned byte slices (e.g. PyTorch header probing `f.read(16)` or Safetensors metadata JSON slices).
-   - If an unaligned read or non-sector offset is encountered, the datapath automatically routes through `fd_buffered` without raising `EINVAL (Errno 22)` to the caller.
+   - Used when O_DIRECT isn't available (for example on tmpfs) or a direct read fails, so the caller never sees `EINVAL (Errno 22)`.
 
 ---
 

@@ -195,6 +195,38 @@ class TestIntegrationsAndKVStore(unittest.TestCase):
         pairs = list(vllm_loader.iter_shard_tensors([uri]))
         self.assertEqual(len(pairs), 2)
 
+    def test_safetensors_full_load_unaligned_header_and_no_copy(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("needs torch")
+        uri = "hypercache://models/aligned-check/shard.safetensors"
+        g = torch.Generator().manual_seed(7)
+        state_in = {
+            "a.f32": torch.randn(300, 1001, generator=g),
+            "b.bf16": torch.randn(777, 513, generator=g).to(torch.bfloat16),
+            "c.i64": torch.arange(12345, dtype=torch.int64),
+            "d.u8": torch.randint(0, 255, (65537,), dtype=torch.uint8, generator=g),
+            "e.empty": torch.empty(0, dtype=torch.float32),
+        }
+        # Metadata of an odd length puts the tensor data at an unaligned file offset
+        save_safetensors_state_dict(state_in, uri, metadata={"pad": "x" * 1237}, socket_path=self.SOCKET_PATH)
+        loaded = load_safetensors_state_dict(uri, socket_path=self.SOCKET_PATH, prefer_gds=False)
+        self.assertEqual(set(loaded), set(state_in))
+        for k, v in state_in.items():
+            self.assertEqual(loaded[k].dtype, v.dtype, k)
+            self.assertTrue(torch.equal(loaded[k], v), k)
+        # CPU tensors are views of one read buffer, packed back to back as in the file, not copies
+        spans = sorted(
+            (t.untyped_storage().data_ptr(), t.numel() * t.element_size()) for t in loaded.values() if t.numel()
+        )
+        for (p0, n0), (p1, _) in zip(spans, spans[1:]):
+            self.assertEqual(p0 + n0, p1)
+        # The selective path gives the same tensors
+        sub = load_safetensors_state_dict(uri, socket_path=self.SOCKET_PATH, prefer_gds=False, tensor_names=["b.bf16", "d.u8"])
+        self.assertTrue(torch.equal(sub["b.bf16"], state_in["b.bf16"]))
+        self.assertTrue(torch.equal(sub["d.u8"], state_in["d.u8"]))
+
     def test_dcp_storage_writer_and_reader(self):
         base_uri = "hypercache://checkpoints/fsdp_step_100"
         writer = HyperCacheDCPStorageWriter(

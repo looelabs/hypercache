@@ -4,6 +4,7 @@ bounce buffers, tier-based SHM detection, and opt-in CRC32 verification.
 """
 
 import json
+import mmap
 import os
 import shutil
 import socket
@@ -281,6 +282,65 @@ class TestDatapathReads(unittest.TestCase):
                     self.assertEqual(stats["direct_fallbacks"], 0)
             else:
                 self.assertGreater(stats["buffered_reads"], 0)
+        finally:
+            reader.close()
+
+    def _direct_engaged(self, reader):
+        stats = reader.get_stats()
+        return stats["direct_reads"] > 0 and stats["direct_fallbacks"] == 0
+
+    def test_aligned_reads_go_straight_into_the_buffer(self):
+        # Device offsets and the destination (page-aligned, like the buffer read_range allocates
+        # for reads of 1 MiB and more) are both block aligned, so everything except the unaligned
+        # end of the last chunk is read in place, not copied through a bounce buffer
+        reader = DirectBlockReader()
+        dest = mmap.mmap(-1, len(self.payload))
+        try:
+            self.assertEqual(reader.read_range_into(self._layout(), 0, len(self.payload), dest, 0), len(self.payload))
+            self.assertEqual(bytes(dest), self.payload)
+            stats = reader.get_stats()
+            if not self._direct_engaged(reader):
+                self.skipTest("O_DIRECT not available on this filesystem")
+            self.assertGreaterEqual(stats["direct_bytes_in_place"], 3 * 65536)
+            self.assertLess(stats["direct_bytes_bounced"], 4096)
+            self.assertEqual(stats["direct_bytes_in_place"] + stats["direct_bytes_bounced"], len(self.payload))
+        finally:
+            dest.close()
+            reader.close()
+
+    def test_every_alignment_gives_the_same_bytes(self):
+        # Same data at a block-aligned and at an unaligned device offset, read into destinations
+        # at several alignments: in-place, part in-place and fully bounced paths must all agree
+        shifted = os.path.join(self.dir, "dev1.raw")
+        with open(shifted, "wb") as f:
+            f.write(b"\0" * (4096 + 100))
+            f.write(self.payload)
+            f.write(b"\0" * 8192)
+
+        def layout(dev, base, chunk):
+            out, pos = [], 0
+            while pos < len(self.payload):
+                n = min(chunk, len(self.payload) - pos)
+                out.append(ChunkLocation(device=dev, offset=base + pos, length=n, checksum=None))
+                pos += n
+            return out
+
+        reader = DirectBlockReader()
+        try:
+            for lay in (layout(self.dev, 4096, 65536), layout(shifted, 4196, 65536), layout(self.dev, 4096, 4096 * 3 + 1)):
+                for start, length in [(0, len(self.payload)), (1, 70000), (4095, 4097), (65536, 65536), (512, 1000), (len(self.payload) - 900, 900)]:
+                    for target_offset in (0, 1, 511, 512, 4096):
+                        buf = bytearray(target_offset + length)
+                        mm = mmap.mmap(-1, target_offset + length)
+                        for dest in (buf, mm):
+                            n = reader.read_range_into(lay, start, length, dest, target_offset)
+                            self.assertEqual(n, length)
+                            self.assertEqual(
+                                bytes(dest[target_offset : target_offset + length]),
+                                self.payload[start : start + length],
+                                (lay[0].device, lay[0].length, start, length, target_offset, type(dest).__name__),
+                            )
+                        mm.close()
         finally:
             reader.close()
 
