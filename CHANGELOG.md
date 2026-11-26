@@ -3,6 +3,17 @@
 ## Unreleased
 
 ### Fixed
+- Python client: large reads from raw NVMe are now read straight into the destination buffer.
+  Each 4 MiB chunk used to be read into a bounce buffer and then copied while holding Python's
+  GIL, so parallel chunk reads were copied one at a time; a warm 5.6 GB model load ran at about
+  0.6 GB/s. `DirectBlockReader` now reads the block-aligned part of each chunk in place with
+  O_DIRECT (only an unaligned head and tail go through the bounce buffer), and reports the split
+  in `get_stats()` (`direct_bytes_in_place`, `direct_bytes_bounced`).
+- `load_safetensors_state_dict` no longer copies every tensor after reading: CPU tensors are views
+  of the one read buffer, and the read starts on an aligned offset so the fast path applies. Its
+  docs no longer claim zero-copy DMA. Behaviour change: keeping any CPU tensor from a full load now
+  keeps that shard's whole buffer in memory; `.clone()` the ones you keep, or load them with
+  `tensor_names`, to free the rest. GPU loads are unaffected.
 - The daemon's per-object ingest lock could leave its entry in an internal map after concurrent
   requests for the same object, a small memory leak (no effect on data). It now keeps an exact count
   of holders and waiters, including waits that are cancelled.

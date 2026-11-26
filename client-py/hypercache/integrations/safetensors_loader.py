@@ -1,9 +1,10 @@
 """
-Native Safetensors, Hugging Face, and vLLM Zero-Copy Loader for HyperCache.
+Native Safetensors, Hugging Face, and vLLM Loader for HyperCache.
 
 Parses the Safetensors binary header directly from HyperCache's striped NVMe or
-POSIX shared memory blocks and reconstructs PyTorch tensors with zero intermediate
-serialization overhead.
+POSIX shared memory blocks. A full load reads the tensor data in one parallel read into one
+host buffer, and each CPU tensor is a view of that buffer (no per-tensor copy); tensors for a
+GPU are copied from it once.
 """
 
 from __future__ import annotations
@@ -13,6 +14,10 @@ import struct
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from hypercache.fsspec_fs import HyperCacheFileSystem
+
+# Reads start on this boundary so the destination buffer and the device offsets share the same
+# alignment, which lets the reader DMA straight into the buffer (O_DIRECT needs both aligned)
+_READ_ALIGN = 4096
 
 _DTYPE_MAP = {
     "F64": ("float64", 8),
@@ -40,6 +45,18 @@ def parse_safetensors_header(raw_header_and_len: bytes) -> Tuple[int, Dict[str, 
     return 8 + header_len, json.loads(header_json)
 
 
+def _tensor_from(torch: Any, raw: memoryview, meta: Dict[str, Any], device: str) -> Any:
+    """A tensor over `raw` (no copy on the CPU), moved to `device` if it isn't the CPU."""
+    torch_dtype = getattr(torch, _DTYPE_MAP.get(meta["dtype"], ("uint8", 1))[0])
+    shape = meta["shape"]
+    if len(raw) == 0:
+        return torch.empty(shape, dtype=torch_dtype, device=device)
+    if raw.readonly:
+        raw = memoryview(bytearray(raw))
+    t = torch.frombuffer(raw, dtype=torch_dtype).reshape(shape)
+    return t.to(device) if device != "cpu" else t
+
+
 def load_safetensors_state_dict(
     uri: str,
     device: str = "cpu",
@@ -50,7 +67,11 @@ def load_safetensors_state_dict(
 ) -> Dict[str, Any]:
     """
     Loads a `.safetensors` checkpoint from `hypercache://` into a dictionary of PyTorch tensors
-    (or raw memoryviews if PyTorch is not installed) using zero-copy DMA reads.
+    (or raw bytes if PyTorch is not installed).
+
+    On a full load, CPU tensors are views of one read buffer for the shard (no per-tensor copy).
+    Keeping any of them keeps the whole buffer alive: to keep only a few, `.clone()` them or load
+    just those with `tensor_names`. Tensors moved to a GPU don't hold the buffer.
 
     If `tensor_names` is specified, only the requested tensors are read from the striped
     NVMe/RAM pool (selective tensor slicing for tensor-parallel / pipeline-parallel workers).
@@ -79,37 +100,27 @@ def load_safetensors_state_dict(
             if k != "__metadata__" and (tensor_names is None or k in tensor_names)
         ]
 
-        # If loading all tensors, perform a single contiguous high-queue-depth DMA read
+        # If loading all tensors, read all tensor data in one parallel read. It starts on an
+        # aligned offset (a few header bytes early) so the reader can DMA straight into the buffer.
         if tensor_names is None:
-            f.seek(data_base_offset)
+            read_start = data_base_offset - data_base_offset % _READ_ALIGN
+            f.seek(read_start)
             payload_buf = f.read()
-            payload_view = memoryview(payload_buf)
+            payload_view = memoryview(payload_buf)[data_base_offset - read_start :]
 
             for name in selected_keys:
                 meta = header[name]
-                dtype_code = meta["dtype"]
-                shape = meta["shape"]
                 start_rel, end_rel = meta["data_offsets"]
                 tensor_slice = payload_view[start_rel:end_rel]
 
                 if has_torch:
-                    torch_dtype_name, _ = _DTYPE_MAP.get(dtype_code, ("uint8", 1))
-                    torch_dtype = getattr(torch, torch_dtype_name)
-                    if len(tensor_slice) == 0:
-                        t = torch.empty(shape, dtype=torch_dtype, device=device)
-                    else:
-                        t = torch.frombuffer(bytearray(tensor_slice), dtype=torch_dtype).reshape(shape)
-                        if device != "cpu":
-                            t = t.to(device)
-                    state_dict[name] = t
+                    state_dict[name] = _tensor_from(torch, tensor_slice, meta, device)
                 else:
                     state_dict[name] = bytes(tensor_slice)
         else:
             # Selective byte-range read for only the requested tensors
             for name in selected_keys:
                 meta = header[name]
-                dtype_code = meta["dtype"]
-                shape = meta["shape"]
                 start_rel, end_rel = meta["data_offsets"]
                 byte_len = end_rel - start_rel
 
@@ -117,15 +128,7 @@ def load_safetensors_state_dict(
                 raw_slice = f.read(byte_len)
 
                 if has_torch:
-                    torch_dtype_name, _ = _DTYPE_MAP.get(dtype_code, ("uint8", 1))
-                    torch_dtype = getattr(torch, torch_dtype_name)
-                    if byte_len == 0:
-                        t = torch.empty(shape, dtype=torch_dtype, device=device)
-                    else:
-                        t = torch.frombuffer(bytearray(raw_slice), dtype=torch_dtype).reshape(shape)
-                        if device != "cpu":
-                            t = t.to(device)
-                    state_dict[name] = t
+                    state_dict[name] = _tensor_from(torch, memoryview(raw_slice), meta, device)
                 else:
                     state_dict[name] = bytes(raw_slice)
 
