@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.11.1
+
+Faster warm model loads from the Python client, and a fix for a small daemon memory leak. A warm
+load of a cached model from raw NVMe was copied one chunk at a time and is now read in place: 3.5x
+faster in our test, on par with reading the same files from a local filesystem. Patch release.
+Upgrade note: CPU tensors from `load_safetensors_state_dict` now share one buffer per shard (see
+below).
 
 ### Fixed
 - Python client: large reads from raw NVMe are now read straight into the destination buffer.
