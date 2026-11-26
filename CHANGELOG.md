@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The daemon's per-object ingest lock could leave its entry in an internal map after concurrent
+  requests for the same object, a small memory leak (no effect on data). It now keeps an exact count
+  of holders and waiters, including waits that are cancelled.
+- Two tests that failed intermittently under load: `test_concurrent_locates_trigger_single_ingest`
+  (the leak above) and `test_background_writer_persists_without_explicit_flush` (its 2 s limit was
+  shorter than a disk sync can take on a busy machine).
+
 ## 0.11.0
 
 Safe reuse of space on a full drive, and protection for models you pin. A full drive no longer reuses

@@ -44,7 +44,7 @@ pub struct IngestionEngine {
     allow_synthetic_globally: bool,
     multipart_threshold: u64,
     // Per-URI ingest locks: concurrent requests for the same object wait for one download
-    inflight: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    inflight: InflightMap,
 }
 
 impl IngestionEngine {
@@ -98,19 +98,23 @@ impl IngestionEngine {
         self.allow_synthetic_globally || (requested && uri.starts_with(synthetic::SYNTHETIC_URI_PREFIX))
     }
 
-    /// Acquires the per-URI ingest lock. The map entry is removed when the last holder finishes.
+    /// Acquires the per-URI ingest lock. The map entry is removed when the last holder or waiter
+    /// finishes, including one whose wait is cancelled.
     async fn lock_uri(&self, uri: &str) -> UriGuard {
         let lock = {
             let mut map = self.inflight.lock().unwrap();
-            Arc::clone(map.entry(uri.to_string()).or_default())
+            let entry = map.entry(uri.to_string()).or_default();
+            entry.holders += 1;
+            Arc::clone(&entry.lock)
         };
-        let guard = Arc::clone(&lock).lock_owned().await;
-        UriGuard {
-            _guard: guard,
-            lock,
+        // Registered before waiting, so a cancelled wait still releases its place in the map
+        let mut guard = UriGuard {
+            guard: None,
             uri: uri.to_string(),
             map: Arc::clone(&self.inflight),
-        }
+        };
+        guard.guard = Some(lock.lock_owned().await);
+        guard
     }
 
     /// Returns the cached layout if present; otherwise ingests it. Concurrent callers for the
@@ -390,22 +394,33 @@ impl IngestionEngine {
     }
 }
 
-struct UriGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+/// Per-URI ingest locks, each with the number of callers holding or waiting for it.
+type InflightMap = Arc<std::sync::Mutex<HashMap<String, InflightEntry>>>;
+
+#[derive(Default)]
+struct InflightEntry {
     lock: Arc<tokio::sync::Mutex<()>>,
+    /// Callers holding or waiting for `lock`. Changed only under the map's mutex, so the last one
+    /// out removes the entry. (Counting `Arc` handles instead raced: a waiter could take the lock
+    /// and finish before the previous holder had dropped its handle, and the entry leaked.)
+    holders: usize,
+}
+
+struct UriGuard {
+    /// None only while waiting for the lock
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     uri: String,
-    map: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    map: InflightMap,
 }
 
 impl Drop for UriGuard {
     fn drop(&mut self) {
+        drop(self.guard.take());
         let mut map = self.map.lock().unwrap();
-        // Map + this guard's handle (+ the owned guard's internal handle) = no other waiters
-        if Arc::strong_count(&self.lock) <= 3 {
-            if let Some(existing) = map.get(&self.uri) {
-                if Arc::ptr_eq(existing, &self.lock) {
-                    map.remove(&self.uri);
-                }
+        if let Some(entry) = map.get_mut(&self.uri) {
+            entry.holders -= 1;
+            if entry.holders == 0 {
+                map.remove(&self.uri);
             }
         }
     }
@@ -518,6 +533,39 @@ mod tests {
         assert_eq!(generations.len(), 1);
         assert_eq!(metadata.list_entries().await.0.len(), 1);
         assert!(engine.inflight.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_uri_lock_entry_removed_after_handoff_and_cancelled_wait() {
+        let test_dir = temp_dir("urilock");
+        let (engine, _, _) = engine_for(&test_dir, 1024 * 1024);
+
+        // A waiter whose wait is cancelled must not keep the entry alive
+        let held = engine.lock_uri("hypercache://x").await;
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(20), engine.lock_uri("hypercache://x")).await;
+        assert!(cancelled.is_err());
+        assert_eq!(engine.inflight.lock().unwrap()["hypercache://x"].holders, 1);
+        drop(held);
+        assert!(engine.inflight.lock().unwrap().is_empty());
+
+        // Many short holders handing the lock to each other: the last one out removes the entry
+        for _ in 0..50 {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let e = engine.clone();
+                handles.push(tokio::spawn(async move {
+                    let _g = e.lock_uri("hypercache://y").await;
+                    tokio::task::yield_now().await;
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            assert!(engine.inflight.lock().unwrap().is_empty());
+        }
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }

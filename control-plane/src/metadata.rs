@@ -2155,8 +2155,10 @@ mod tests {
             .await
             .unwrap();
 
+        // Normally ~40 ms, but each write syncs to disk, and under a loaded parallel test run one
+        // took 3.2 s. This checks the write happens, not how fast, so allow 30 s.
         let mut found = false;
-        for _ in 0..100 {
+        for _ in 0..1500 {
             tokio::time::sleep(Duration::from_millis(20)).await;
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(m) = serde_json::from_str::<MetadataManifest>(&content) {
