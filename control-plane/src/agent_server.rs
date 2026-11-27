@@ -129,6 +129,17 @@ async fn handle_agent_preload(
     let t_start = Instant::now();
 
     if let Ok(Some(existing)) = ctx.metadata.get_layout(&payload.uri).await {
+        if existing.sync_status == Some(crate::protocol::SyncStatus::Staged) {
+            // Neither cached nor safe to overwrite: a writer on this node has not committed it yet
+            return Json(AgentPreloadResponse {
+                success: false,
+                message: format!("{} is being written on this node (staged, not committed)", payload.uri),
+                size_bytes: None,
+                duration_ms: Some(t_start.elapsed().as_millis() as u64),
+                bandwidth_mbps: None,
+            })
+            .into_response();
+        }
         return Json(AgentPreloadResponse {
             success: true,
             message: "Already cached (Cache Hit)".to_string(),
@@ -405,7 +416,7 @@ async fn handle_agent_get_layout(
     if !validate_bearer(&headers, ctx.config.cluster_auth_token.as_deref()) {
         return unauthorized();
     }
-    match ctx.metadata.get_layout(&query.uri).await {
+    match ctx.metadata.get_readable_layout(&query.uri).await {
         Ok(Some(meta)) => Json(AgentLayoutResponse {
             uri: query.uri,
             object_size: meta.object_size,
@@ -430,7 +441,7 @@ async fn handle_agent_get_chunk(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let meta = match ctx.metadata.get_layout(&query.uri).await {
+    let meta = match ctx.metadata.get_readable_layout(&query.uri).await {
         Ok(Some(meta)) => meta,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };

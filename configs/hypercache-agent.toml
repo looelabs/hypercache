@@ -126,6 +126,11 @@ reclaim_grace_secs = 30
 # finished the grace period before a write needs them and writes to a full drive rarely wait.
 reclaim_reserve_percent = 5
 
+# A staged write (a checkpoint written with stage_write or append_write) that is not committed within
+# this many seconds of its last stage or append is removed, files included, as a writer that died or
+# gave up. Until it is committed, a staged object is never served to readers. 0 = never remove.
+staged_write_timeout_secs = 1800
+
 # Write-Through vs. Write-Back Caching Mode
 # Disabled by default (false = asynchronous Write-Back for ultra-fast non-blocking checkpoint saves).
 # Set to true to enforce synchronous Write-Through (blocking until authoritative S3/NFS confirms write).

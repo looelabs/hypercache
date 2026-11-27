@@ -197,6 +197,11 @@ pub struct Config {
     #[serde(default = "default_reclaim_reserve_percent")]
     pub reclaim_reserve_percent: u64,
 
+    /// A staged write (stage_write / append_write) that is not committed within this many seconds
+    /// of its last stage or append is removed, files included (0 = never)
+    #[serde(default = "default_staged_write_timeout_secs")]
+    pub staged_write_timeout_secs: u64,
+
     /// Controller only: let loopback / controller-host connections skip token authentication.
     /// Disable when the controller sits behind a local proxy or sidecar (all traffic then
     /// appears to come from 127.0.0.1).
@@ -562,6 +567,10 @@ fn default_reclaim_reserve_percent() -> u64 {
     5
 }
 
+fn default_staged_write_timeout_secs() -> u64 {
+    1800
+}
+
 fn default_true() -> bool {
     true
 }
@@ -654,6 +663,7 @@ impl Default for Config {
             s3_multipart_threshold_bytes: default_s3_multipart_threshold_bytes(),
             reclaim_grace_secs: default_reclaim_grace_secs(),
             reclaim_reserve_percent: default_reclaim_reserve_percent(),
+            staged_write_timeout_secs: default_staged_write_timeout_secs(),
             allow_local_admin_bypass: true,
             node_gc_secs: default_node_gc_secs(),
             client_gid: None,

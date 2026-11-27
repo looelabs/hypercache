@@ -245,6 +245,7 @@ kill $DAEMON_PID
 - **One manifest writer.** Mutations signal the coalescing writer in `metadata.rs`. Do not write `metadata.json` from anywhere else. `atomic_write` (unique tmp, fsync, rename, dir fsync) is the only correct way to replace it.
 - **Dirty objects are never evictable.** `COMMITTED`, `SYNCING_BACKEND` and `SYNC_FAILED` weigh 0 for eviction. `resume_pending_writebacks` re-queues them at boot. A new `SyncStatus` variant must be classified in `SyncStatus::is_dirty` (`protocol.rs`).
 - **Pinned and dirty objects are never evicted automatically.** Not by Moka, capacity pressure or the reserve. A pin sticks through re-ingest, overwrite and `refresh`; only `unpin` (`Request::Pin { pinned: false }`) clears it. `purge` keeps pinned objects unless `include_pinned` is set, and resets the allocators only when nothing is kept. `rm` still removes a pinned object, since it names it.
+- **STAGED layouts are never readable.** A staged object's chunks may be unwritten. Every path that hands a layout to a reader (UDS `locate`, `get_or_ingest`, the agent layout, chunk and preload endpoints) must use `MetadataStore::get_readable_layout` or refuse STAGED explicitly, and must not ingest over a staged layout. `locate` answers MISS with `sync_status` STAGED. Staged entries are dropped on restart and expire after `staged_write_timeout_secs`.
 - **Allocations roll back on failure.** If striping fails partway, every extent allocated in that call is returned.
 
 ### B. Compatibility Rules in Practice
@@ -364,6 +365,7 @@ Leave committing, merging, tagging and pushing to the maintainer unless they exp
 | `p2p_preload_enabled` | bool | `false` | Enable P2P fleet pre-warming (1 origin pull + peer chunk distribution) |
 | `nfs_allowed_paths` | list | `[]` | Extra roots `file://` / `nfs://` URIs may access (besides `nfs_mount_path`) |
 | `reclaim_grace_secs` | integer | `30` | Grace period before freed extents are reused, also when a device is full (protects in-flight readers). A write to a full device waits up to this long for evicted space, then fails |
+| `staged_write_timeout_secs` | integer | `1800` | A staged write not committed within this many seconds of its last stage or append is removed, files included (0 = never). Staged objects are never served to readers and are dropped on restart |
 | `reclaim_reserve_percent` | integer | `5` | Percent of each NVMe device kept free ahead of need (0 = off, max 50). Least recently used clean, unpinned objects are evicted early so their space has served the grace period before a write needs it |
 | `s3_parallel_streams` | integer | `8` | Parallel ranged GETs per object during S3 ingest |
 | `s3_read_timeout_secs` | integer | `60` | Per-read idle timeout for S3 transfers (no total-time cap) |

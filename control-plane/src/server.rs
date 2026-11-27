@@ -399,6 +399,13 @@ impl Server {
         t_start: Instant,
     ) -> Response {
         match self.metadata.get_layout(uri).await {
+            // Being written and not committed: its chunks may be unwritten, so it is a miss, with
+            // the status saying why. No layout, and no auto-ingest, which would replace the
+            // writer's layout.
+            Ok(Some(meta)) if meta.sync_status == Some(SyncStatus::Staged) => {
+                self.record_event("CACHE_MISS", "MISS", uri, 0, &[], t_start);
+                Response::miss().with_sync_status(Some(SyncStatus::Staged))
+            }
             Ok(Some(meta)) => {
                 if pinned && !meta.pinned {
                     let _ = self.metadata.set_pinned(uri, true).await;
@@ -1181,6 +1188,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&test_dir);
     }
 
+    /// A staged object is being written: locate must not serve its layout (a reader would get
+    /// unwritten chunks) nor ingest over it (that would replace the writer's layout).
+    #[tokio::test]
+    async fn test_staged_objects_are_never_served_or_ingested_over() {
+        let (server, dir) = nvme_server("stagedread", 16, |_| {});
+        let uri = "hypercache://checkpoints/in_progress.pt";
+        let t = Instant::now();
+        let staged = server
+            .handle_stage_write(uri, 2 * 1024 * 1024, None, false, false, false, t)
+            .await;
+        assert_eq!(staged.status, crate::protocol::ResponseStatus::WriteStaged);
+
+        for auto_ingest in [false, true] {
+            let res = server.handle_locate(uri, auto_ingest, None, false, t).await;
+            assert_eq!(res.status, crate::protocol::ResponseStatus::Miss);
+            assert!(res.chunk_layout.is_none());
+            assert_eq!(res.sync_status, Some(SyncStatus::Staged));
+        }
+        assert!(server.ingestion.get_or_ingest(uri, None, false, false).await.is_err());
+        let meta = server.metadata().get_layout(uri).await.unwrap().unwrap();
+        assert_eq!(
+            meta.generation,
+            staged.generation.unwrap(),
+            "the writer's layout was replaced"
+        );
+        assert_eq!(meta.sync_status, Some(SyncStatus::Staged));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_server_write_through_flow() {
         let test_dir = std::env::temp_dir().join(format!(
@@ -1293,8 +1329,10 @@ mod tests {
         let layout = staged.chunk_layout.unwrap();
         write_staged(&server, &layout, &data).await;
 
-        // Before commit, locate reports the staged status so a reader can refuse the object
+        // Before commit, locate is a miss with no layout, and reports the staged status
         let before = server.handle_locate(uri, false, None, false, t).await;
+        assert_eq!(before.status, crate::protocol::ResponseStatus::Miss);
+        assert!(before.chunk_layout.is_none());
         assert_eq!(before.sync_status, Some(SyncStatus::Staged));
 
         let mut pos = 0usize;

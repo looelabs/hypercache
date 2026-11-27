@@ -126,16 +126,30 @@ impl IngestionEngine {
         pinned: bool,
         allow_synthetic: bool,
     ) -> Result<(IngestedObject, bool)> {
-        if let Some(meta) = self.metadata.get_layout(uri).await? {
+        if let Some(meta) = self.readable_or_staged(uri).await? {
             return Ok((Self::from_meta(meta), true));
         }
         let _guard = self.lock_uri(uri).await;
         // Another caller may have completed the ingest while we waited
-        if let Some(meta) = self.metadata.get_layout(uri).await? {
+        if let Some(meta) = self.readable_or_staged(uri).await? {
             return Ok((Self::from_meta(meta), true));
         }
         let obj = self.ingest_locked(uri, target_tier, pinned, allow_synthetic).await?;
         Ok((obj, false))
+    }
+
+    /// The cached layout, or an error while `uri` is being written (STAGED): a staged layout is not
+    /// readable yet, and ingesting over it would replace the writer's layout.
+    async fn readable_or_staged(&self, uri: &str) -> Result<Option<crate::metadata::StoredMetadata>> {
+        match self.metadata.get_layout(uri).await? {
+            Some(meta) if meta.sync_status == Some(crate::protocol::SyncStatus::Staged) => {
+                anyhow::bail!(
+                    "{} is being written (staged, not committed yet) and cannot be read",
+                    uri
+                )
+            }
+            other => Ok(other),
+        }
     }
 
     fn from_meta(meta: crate::metadata::StoredMetadata) -> IngestedObject {
