@@ -7,6 +7,11 @@
   this many seconds of its last stage or append is removed, files included.
 
 ### Fixed
+- Pinned objects, and checkpoints not yet written to the backend, could be evicted under cache
+  pressure. Their zero eviction weight did not stop the metadata cache from removing them (it
+  evicts zero-weight entries too, especially when a frequently requested object is admitted), and
+  the eviction deleted their data, so a checkpoint that had not reached S3 could be lost. They are
+  now kept through such evictions and still served.
 - Half-written checkpoints were served as cached. A staged write that was never committed (the
   client died, or the daemon restarted, mid-write) stayed forever with its files, and `locate`
   returned its layout as a HIT, so a reader that trusted HIT got unwritten chunks. `locate` now
