@@ -295,6 +295,13 @@ impl MetadataStore {
                 let removed = {
                     let mut mirror = inner.entries_mirror.lock().unwrap();
                     match mirror.get(key.as_str()) {
+                        // Pinned and dirty objects are never evicted. Moka can still remove them, since it
+                        // evicts weight-0 entries like any other (from the front of its queue, and as
+                        // admission victims). The mirror keeps them and get_layout serves them from it.
+                        Some(current) if current.pinned || current.is_dirty() => {
+                            tracing::debug!("Kept {} through a cache eviction: it is pinned or dirty", key);
+                            false
+                        }
                         Some(current) if current.generation == val.generation => {
                             mirror.remove(key.as_str());
                             inner.last_access.lock().unwrap().remove(key.as_str());
@@ -506,11 +513,29 @@ impl MetadataStore {
 
     /// Fast-path in-process metadata lookup (zero network/TCP roundtrip)
     pub async fn get_layout(&self, uri: &str) -> Result<Option<StoredMetadata>> {
-        let meta = self.cache.get(uri).await;
+        let meta = self.lookup(uri).await;
         if meta.is_some() {
             self.touch(uri);
         }
         Ok(meta)
+    }
+
+    /// Moka first, then the mirror for pinned or dirty objects Moka dropped. Does not count as an
+    /// access for pressure eviction.
+    async fn lookup(&self, uri: &str) -> Option<StoredMetadata> {
+        let mut meta = self.cache.get(uri).await;
+        if meta.is_none() {
+            // A pinned or dirty object Moka dropped stays in the mirror (see the eviction listener)
+            meta = self
+                .inner
+                .entries_mirror
+                .lock()
+                .unwrap()
+                .get(uri)
+                .filter(|m| m.pinned || m.is_dirty())
+                .cloned();
+        }
+        meta
     }
 
     /// Inserts or updates physical chunk routing layout in the Moka cache & persistence tier
@@ -746,7 +771,7 @@ impl MetadataStore {
 
     /// Gets the synchronization status for an object
     pub async fn get_sync_status(&self, uri: &str) -> Result<Option<SyncStatus>> {
-        Ok(self.cache.get(uri).await.and_then(|m| m.sync_status))
+        Ok(self.lookup(uri).await.and_then(|m| m.sync_status))
     }
 
     /// Lists objects whose data has not reached the authoritative backend yet
@@ -3093,5 +3118,92 @@ mod tests {
             off
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Size eviction must never remove a pinned object or one whose data has not reached the
+    /// backend. Moka evicts from the front of its queue whatever the weight, so the weight-0 weigher
+    /// alone does not protect them: put them first in line and overfill the cache.
+    #[tokio::test]
+    async fn test_size_eviction_never_removes_pinned_or_dirty_objects() {
+        let dir = temp_manifest_path("protect");
+        let shm = dir.parent().unwrap().join("shm");
+        std::fs::create_dir_all(&shm).unwrap();
+        // Moka's capacity floor is 100 MiB
+        let store = MetadataStore::new(100 * 1024 * 1024, None, None);
+        let pool = Arc::new(crate::ram::RamMemoryPool::new(shm.clone(), 1 << 30));
+        store.set_ram_pool(pool.clone()).await;
+
+        let pinned = "hypercache://models/pinned.bin";
+        let dirty = "hypercache://checkpoints/unsynced.pt";
+        let pinned_chunk = pool.allocate_and_write_chunk("pinned_chunk_0", &[1u8; 4096]).unwrap();
+        let dirty_chunk = pool.allocate_and_write_chunk("dirty_chunk_0", &[2u8; 4096]).unwrap();
+        store
+            .save_layout_full(pinned, 64 << 20, 4194304, vec![pinned_chunk.clone()], None, true)
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                dirty,
+                64 << 20,
+                4194304,
+                vec![dirty_chunk.clone()],
+                Some(SyncStatus::SyncFailed),
+            )
+            .await
+            .unwrap();
+        store.run_pending_cache_tasks().await;
+
+        for i in 0..60 {
+            let uri = format!("hypercache://models/clean{}.bin", i);
+            // Popular objects: TinyLFU admits a candidate more frequent than the entries at the
+            // front of the queue by evicting them, which is how B5 lost its pinned object
+            for _ in 0..8 {
+                let _ = store.get_layout(&uri).await;
+            }
+            store
+                .save_layout(
+                    &uri,
+                    8 << 20,
+                    4194304,
+                    vec![nvme_crc("/dev/r0", 4096 + i * (8 << 20), 8 << 20)],
+                )
+                .await
+                .unwrap();
+            store.run_pending_cache_tasks().await;
+        }
+        store.run_pending_cache_tasks().await;
+
+        let clean_left = (0..60)
+            .filter(|i| {
+                store
+                    .inner
+                    .entries_mirror
+                    .lock()
+                    .unwrap()
+                    .contains_key(&format!("hypercache://models/clean{}.bin", i))
+            })
+            .count();
+        assert!(clean_left < 60, "the test must cause size eviction");
+        for (uri, chunk) in [(pinned, &pinned_chunk), (dirty, &dirty_chunk)] {
+            let meta = store.get_layout(uri).await.unwrap();
+            assert!(meta.is_some(), "{} was evicted", uri);
+            assert!(Path::new(&chunk.device).exists(), "{}'s RAM file was deleted", uri);
+        }
+        assert_eq!(
+            store.get_sync_status(dirty).await.unwrap(),
+            Some(SyncStatus::SyncFailed)
+        );
+        assert_eq!(store.list_dirty_entries().await.len(), 1);
+
+        // Once synced and unpinned they are ordinary cached objects again, served from Moka
+        store
+            .update_sync_status(dirty, SyncStatus::SyncedBackend)
+            .await
+            .unwrap();
+        store.set_pinned(pinned, false).await.unwrap();
+        for uri in [pinned, dirty] {
+            assert!(store.cache.get(uri).await.is_some(), "{} is not back in the cache", uri);
+        }
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
