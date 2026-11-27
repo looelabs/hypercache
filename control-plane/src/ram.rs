@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,22 @@ pub struct RamMemoryPool {
     max_capacity_bytes: u64,
     used_bytes: Arc<AtomicU64>,
     client_gid: Option<u32>,
+    // Held for the daemon's lifetime once `lock_dir` succeeds
+    dir_lock: Arc<std::sync::Mutex<Option<fs::File>>>,
+}
+
+/// Whether `name` has the shape `get_chunk_path` gives chunk files: `<id>.<pid>.<nanos>.<seq>.shm`.
+fn is_pool_chunk_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".shm") else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(4, '.');
+    let numeric = |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    // seq, nanos, pid, then a non-empty id prefix
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_some_and(|p| !p.is_empty())
 }
 
 impl RamMemoryPool {
@@ -29,6 +46,7 @@ impl RamMemoryPool {
             max_capacity_bytes,
             used_bytes: Arc::new(AtomicU64::new(0)),
             client_gid: None,
+            dir_lock: Arc::new(std::sync::Mutex::new(None)),
         };
 
         pool.recompute_used_bytes();
@@ -47,18 +65,66 @@ impl RamMemoryPool {
         self
     }
 
-    /// Creates the empty file for a chunk a client is about to write (staged writes).
-    /// Creating it here, rather than in the client, means a client that does not share this
-    /// `/dev/shm` with the daemon fails loudly instead of writing into a private copy.
-    pub fn create_staged_chunk(&self, path: &Path) -> Result<()> {
-        OpenOptions::new()
+    /// Reserves `len` bytes of pool capacity, or fails without reserving anything when the
+    /// pool would go over its limit. Atomic, so concurrent writers cannot overshoot.
+    fn reserve(&self, len: u64) -> Result<()> {
+        let mut current_used = self.used_bytes.load(Ordering::Relaxed);
+        loop {
+            if current_used + len > self.max_capacity_bytes {
+                anyhow::bail!(
+                    "RAM cache capacity exceeded (used: {} B, requested: {} B, max: {} B)",
+                    current_used,
+                    len,
+                    self.max_capacity_bytes
+                );
+            }
+            match self.used_bytes.compare_exchange_weak(
+                current_used,
+                current_used + len,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current_used = actual,
+            }
+        }
+    }
+
+    /// Returns `len` reserved bytes to the pool (never below zero).
+    fn unreserve(&self, len: u64) {
+        let mut used = self.used_bytes.load(Ordering::Relaxed);
+        while let Err(actual) =
+            self.used_bytes
+                .compare_exchange_weak(used, used.saturating_sub(len), Ordering::AcqRel, Ordering::Relaxed)
+        {
+            used = actual;
+        }
+    }
+
+    /// Reserves `len` bytes and creates the empty file for a chunk a client is about to write
+    /// (staged writes). The reservation counts the chunk's full length, not the file's current
+    /// size, so a checkpoint being written can never take the pool over its limit.
+    /// Creating the file here, rather than in the client, means a client that does not share
+    /// this `/dev/shm` with the daemon fails loudly instead of writing into a private copy.
+    pub fn allocate_staged_chunk(&self, chunk_id: &str, len: u64) -> Result<ChunkDescriptor> {
+        self.reserve(len)?;
+        let path = self.get_chunk_path(chunk_id);
+        let created = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .with_context(|| format!("Failed to create staged shared memory file at {:?}", path))?;
-        crate::access::grant_file_or_warn(path, self.client_gid);
-        Ok(())
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("Failed to create staged shared memory file at {:?}", path));
+        if let Err(e) = created {
+            self.unreserve(len);
+            return Err(e);
+        }
+        crate::access::grant_file_or_warn(&path, self.client_gid);
+        Ok(ChunkDescriptor::new(
+            StorageTier::Ram,
+            path.to_string_lossy().to_string(),
+            0,
+            len,
+        ))
     }
 
     /// Recomputes used bytes by scanning existing .shm files in the shared memory directory.
@@ -84,27 +150,7 @@ impl RamMemoryPool {
     pub fn allocate_and_write_chunk(&self, chunk_id: &str, data: &[u8]) -> Result<ChunkDescriptor> {
         let chunk_len = data.len() as u64;
 
-        // Reserve capacity atomically so concurrent writers cannot overshoot the pool limit
-        let mut current_used = self.used_bytes.load(Ordering::Relaxed);
-        loop {
-            if current_used + chunk_len > self.max_capacity_bytes {
-                anyhow::bail!(
-                    "RAM cache capacity exceeded (used: {} B, requested: {} B, max: {} B)",
-                    current_used,
-                    chunk_len,
-                    self.max_capacity_bytes
-                );
-            }
-            match self.used_bytes.compare_exchange_weak(
-                current_used,
-                current_used + chunk_len,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_used = actual,
-            }
-        }
+        self.reserve(chunk_len)?;
 
         let target_path = self.get_chunk_path(chunk_id);
         let write_result = (|| -> Result<()> {
@@ -123,7 +169,7 @@ impl RamMemoryPool {
 
         if let Err(e) = write_result {
             let _ = fs::remove_file(&target_path);
-            self.used_bytes.fetch_sub(chunk_len, Ordering::AcqRel);
+            self.unreserve(chunk_len);
             return Err(e);
         }
 
@@ -141,22 +187,82 @@ impl RamMemoryPool {
         .with_checksum(data))
     }
 
-    /// Deletes a shared memory chunk file and decrements the used bytes counter.
-    #[allow(dead_code)]
-    pub fn delete_chunk(&self, chunk_path: &str) -> Result<()> {
-        let path = Path::new(chunk_path);
-        if path.exists() {
-            if let Ok(metadata) = fs::metadata(path) {
-                let size = metadata.len();
-                let _ = fs::remove_file(path);
-                self.used_bytes
-                    .fetch_sub(size.min(self.used_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-                debug!("Removed RAM shared memory chunk: {:?} (freed {} bytes)", path, size);
-            } else {
-                let _ = fs::remove_file(path);
+    /// Deletes a chunk file and returns its `length` (the chunk descriptor's length, which is
+    /// what was reserved) to the pool. Nothing is returned when the file was already gone:
+    /// `reconcile` only counts chunks whose file exists.
+    pub fn delete_chunk(&self, chunk_path: &str, length: u64) -> Result<()> {
+        match fs::remove_file(chunk_path) {
+            Ok(()) => {
+                self.unreserve(length);
+                debug!(
+                    "Removed RAM shared memory chunk: {} (freed {} bytes)",
+                    chunk_path, length
+                );
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Failed to remove RAM shared memory chunk {}: {}", chunk_path, e),
         }
         Ok(())
+    }
+
+    /// Takes an exclusive lock on the pool directory for this process's lifetime. Returns false
+    /// when another process (a second daemon pointed at the same directory) holds it.
+    pub fn lock_dir(&self) -> bool {
+        use fs2::FileExt;
+        let mut held = self.dir_lock.lock().unwrap();
+        if held.is_some() {
+            return true;
+        }
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.shm_path.join(".hypercache-pool.lock"))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Could not open the RAM pool lock file in {:?}: {}", self.shm_path, e);
+                return false;
+            }
+        };
+        if file.try_lock_exclusive().is_err() {
+            return false;
+        }
+        *held = Some(file);
+        true
+    }
+
+    /// Startup only, before anything is served: deletes every chunk file in the pool directory
+    /// that `keep` (path to chunk length, from the restored index) does not list, such as chunks
+    /// of an ingest a crash interrupted, then sets used bytes to the lengths of the kept chunks
+    /// whose file exists. Returns the number of files and bytes deleted.
+    pub fn reconcile(&self, keep: &HashMap<PathBuf, u64>) -> (usize, u64) {
+        let mut removed = 0usize;
+        let mut removed_bytes = 0u64;
+        if let Ok(entries) = fs::read_dir(&self.shm_path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let is_chunk = p.file_name().and_then(|n| n.to_str()).is_some_and(is_pool_chunk_name);
+                if !is_chunk || keep.contains_key(&p) {
+                    continue;
+                }
+                let Ok(meta) = fs::symlink_metadata(&p) else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                match fs::remove_file(&p) {
+                    Ok(()) => {
+                        removed += 1;
+                        removed_bytes += meta.len();
+                    }
+                    Err(e) => warn!("Failed to remove unreferenced RAM chunk {:?}: {}", p, e),
+                }
+            }
+        }
+        let used: u64 = keep.iter().filter(|(p, _)| p.is_file()).map(|(_, &len)| len).sum();
+        self.used_bytes.store(used, Ordering::Relaxed);
+        (removed, removed_bytes)
     }
 
     /// Cleans up all `.shm` files inside the configured shared memory directory.
@@ -264,7 +370,7 @@ mod tests {
         assert_eq!(read_back, test_data);
 
         // Delete chunk
-        pool.delete_chunk(&desc.device).unwrap();
+        pool.delete_chunk(&desc.device, desc.length).unwrap();
         assert!(!Path::new(&desc.device).exists());
         assert_eq!(pool.get_used_bytes(), 0);
 
@@ -288,7 +394,7 @@ mod tests {
         assert_ne!(first.device, second.device);
 
         // Releasing the old generation must not touch the new generation's data
-        pool.delete_chunk(&first.device).unwrap();
+        pool.delete_chunk(&first.device, first.length).unwrap();
         assert_eq!(fs::read(&second.device).unwrap(), vec![2u8; 1024]);
         assert_eq!(second.checksum, Some(crc32fast::hash(&[2u8; 1024])));
 
@@ -298,5 +404,117 @@ mod tests {
         assert_eq!(pool.get_used_bytes(), 3 * 1024);
 
         let _ = fs::remove_dir_all(&temp_shm);
+    }
+
+    fn temp_pool_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "test_hypercache_shm_{}_{}",
+            tag,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn test_staged_chunks_reserve_their_full_length() {
+        let dir = temp_pool_dir("staged");
+        let pool = RamMemoryPool::new(dir.clone(), 10 * 1024);
+
+        let staged = pool.allocate_staged_chunk("ckpt_chunk_0", 8 * 1024).unwrap();
+        assert_eq!(staged.tier, StorageTier::Ram);
+        assert_eq!(staged.length, 8 * 1024);
+        // The file is still empty, but its full length counts against the cap
+        assert_eq!(fs::metadata(&staged.device).unwrap().len(), 0);
+        assert_eq!(pool.get_used_bytes(), 8 * 1024);
+
+        let files_before = fs::read_dir(&dir).unwrap().count();
+        assert!(pool.allocate_staged_chunk("ckpt_chunk_1", 4 * 1024).is_err());
+        assert!(pool.allocate_and_write_chunk("other", &[1u8; 4 * 1024]).is_err());
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            files_before,
+            "a refused chunk leaves no file"
+        );
+        assert_eq!(pool.get_used_bytes(), 8 * 1024);
+
+        // Freeing a chunk returns what it reserved, not the (short) file's size
+        fs::write(&staged.device, [9u8; 100]).unwrap();
+        pool.delete_chunk(&staged.device, staged.length).unwrap();
+        assert_eq!(pool.get_used_bytes(), 0);
+        // A second delete of the same chunk returns nothing
+        pool.delete_chunk(&staged.device, staged.length).unwrap();
+        assert_eq!(pool.get_used_bytes(), 0);
+        pool.allocate_staged_chunk("ckpt_chunk_0", 10 * 1024).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reconcile_removes_unreferenced_chunks_and_counts_kept_ones() {
+        let dir = temp_pool_dir("reconcile");
+        let pool = RamMemoryPool::new(dir.clone(), 1024 * 1024);
+        let kept = pool.allocate_and_write_chunk("model_chunk_0", &[1u8; 3000]).unwrap();
+        let orphan = pool.allocate_and_write_chunk("model_chunk_1", &[2u8; 5000]).unwrap();
+        let staged = pool.allocate_staged_chunk("ckpt_chunk_0", 4096).unwrap();
+        // Files that are not pool chunks are never touched
+        let foreign = [dir.join("notes.shm"), dir.join("readme.txt"), dir.join("a.1.2.shm")];
+        for f in &foreign {
+            fs::write(f, b"x").unwrap();
+        }
+
+        // A fresh pool over the same directory (a restart) counts every .shm file
+        drop(pool);
+        let pool = RamMemoryPool::new(dir.clone(), 1024 * 1024);
+        assert!(pool.get_used_bytes() >= 3000 + 5000);
+
+        let gone = dir.join("model_chunk_9.1.2.3.shm");
+        let keep: HashMap<PathBuf, u64> = [
+            (PathBuf::from(&kept.device), kept.length),
+            (PathBuf::from(&staged.device), staged.length),
+            (gone, 4096),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(pool.reconcile(&keep), (1, 5000));
+        assert!(!Path::new(&orphan.device).exists());
+        assert!(Path::new(&kept.device).exists() && Path::new(&staged.device).exists());
+        for f in &foreign {
+            assert!(f.exists(), "{:?} must be left alone", f);
+        }
+        // Kept chunks count at their reserved length; a referenced file that is gone counts nothing
+        assert_eq!(pool.get_used_bytes(), 3000 + 4096);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pool_dir_lock_is_exclusive() {
+        let dir = temp_pool_dir("lock");
+        let first = RamMemoryPool::new(dir.clone(), 1024);
+        let second = RamMemoryPool::new(dir.clone(), 1024);
+        assert!(first.lock_dir());
+        assert!(first.lock_dir(), "taking it again in the same pool is fine");
+        assert!(!second.lock_dir());
+        drop(first);
+        assert!(second.lock_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pool_chunk_names() {
+        let dir = temp_pool_dir("names");
+        let pool = RamMemoryPool::new(dir.clone(), 1024);
+        let path = pool.get_chunk_path("hypercache://s3/b/model.bin_chunk_3");
+        assert!(is_pool_chunk_name(path.file_name().unwrap().to_str().unwrap()));
+        for name in [
+            "notes.shm",
+            "a.1.2.shm",
+            ".1.2.3.shm",
+            "a.1.2.x.shm",
+            "a.1.2.3.tmp",
+            "a.1..3.shm",
+        ] {
+            assert!(!is_pool_chunk_name(name), "{}", name);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

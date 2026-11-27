@@ -574,6 +574,7 @@ async fn run_daemon(
         let shm_path = config::get_ram_pool_path(&config);
         let pool = Arc::new(ram::RamMemoryPool::new(shm_path, ram_cap).with_client_gid(config.client_gid));
         metadata.set_ram_pool(pool.clone()).await;
+        metadata.reconcile_ram_pool(&pool);
         Some(pool)
     } else {
         None

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- RAM tier after a reboot: cached objects whose shared memory files were gone (a reboot empties
+  `/dev/shm`) came back in the index and failed every read with "file not found", and asking for
+  them again did not re-fetch them until `rm` or `purge`. On start the daemon now drops every entry
+  whose RAM files are missing or short, so they are misses and ingest again. A checkpoint that
+  existed only in RAM and had not reached the backend is lost after a reboot: it used to stay as
+  `SYNC_FAILED` forever, retried on every start, with a log line saying it "stays cached". It is now
+  removed and logged as an error that names it.
+- RAM tier capacity leaked on every crash: chunk files left by an ingest that a crash interrupted,
+  or by an object the manifest writer had not saved yet, were counted as used and never removed,
+  so each `kill -9` shrank the RAM tier until a full `purge`. On start the daemon now deletes chunk
+  files no cached object references (only files named like its own chunks) and counts only the
+  rest. If another process holds the same RAM directory, it leaves the files alone and warns.
+- Staged writes into RAM (`stage_write` with the RAM tier, used for checkpoints) ignored
+  `ram_cache_capacity_bytes`: their chunk files reserved nothing, so checkpoints could fill
+  `/dev/shm` past the limit, and freeing them later made the pool under-count. Each staged chunk now
+  reserves its full length when it is staged and returns it when it is removed. A staged write that
+  does not fit fails cleanly (with `--tier ram`) or is staged on NVMe instead (auto tier), and a
+  failed staged write no longer leaves chunk files behind.
+
 ## 0.11.1
 
 Faster warm model loads from the Python client, and a fix for a small daemon memory leak. A warm

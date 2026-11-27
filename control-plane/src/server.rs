@@ -1105,6 +1105,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&test_dir);
     }
 
+    /// Staged checkpoints written into RAM count toward ram_cache_capacity_bytes from the moment
+    /// they are staged, and give the space back when replaced or removed.
+    #[tokio::test]
+    async fn test_staged_ram_writes_respect_the_ram_cap() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hypercache_server_ram_cap_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let shm_dir = test_dir.join("shm");
+        std::fs::create_dir_all(&shm_dir).unwrap();
+        let mib = 1024 * 1024u64;
+        let config = Config {
+            ram_cache_enabled: true,
+            ram_cache_shm_path: shm_dir.to_str().unwrap().to_string(),
+            ram_cache_capacity_bytes: Some(16 * mib),
+            chunk_size_bytes: 4 * 1024 * 1024,
+            block_devices: vec![],
+            ..Config::default()
+        };
+        let ram_pool = Arc::new(crate::ram::RamMemoryPool::new(shm_dir.clone(), 16 * mib));
+        let metadata = MetadataStore::new(10 * 1024 * 1024 * 1024, None, None);
+        metadata.set_ram_pool(ram_pool.clone()).await;
+        let ingestion = IngestionEngine::new(config.clone(), metadata.clone(), Some(ram_pool.clone()));
+        let telemetry = TelemetryCollector::new("127.0.0.1", 9110, false);
+        let server = Server::new(config, metadata.clone(), ingestion, telemetry, vec![]);
+        let t = Instant::now();
+        let files = || std::fs::read_dir(&shm_dir).unwrap().count();
+
+        let a = "hypercache://checkpoints/a.pt";
+        let staged = server
+            .handle_stage_write(a, 12 * mib, Some(StorageTier::Ram), true, true, false, t)
+            .await;
+        assert_eq!(staged.status, crate::protocol::ResponseStatus::WriteStaged);
+        assert_eq!(
+            ram_pool.get_used_bytes(),
+            12 * mib,
+            "the staged layout reserves its full size"
+        );
+
+        // A second checkpoint that does not fit is refused and leaves nothing behind
+        let files_before = files();
+        let b = "hypercache://checkpoints/b.pt";
+        let refused = server
+            .handle_stage_write(b, 8 * mib, Some(StorageTier::Ram), true, true, false, t)
+            .await;
+        assert_eq!(refused.status, crate::protocol::ResponseStatus::Error);
+        assert_eq!(files(), files_before);
+        assert_eq!(ram_pool.get_used_bytes(), 12 * mib);
+        assert!(metadata.get_layout(b).await.unwrap().is_none());
+        // So is an ingest-style chunk write into the remaining space plus one byte
+        assert!(ram_pool
+            .allocate_and_write_chunk("x", &vec![0u8; 4 * mib as usize + 1])
+            .is_err());
+
+        // Re-staging the same URI smaller gives the old reservation back
+        let restaged = server
+            .handle_stage_write(a, 4 * mib, Some(StorageTier::Ram), true, true, false, t)
+            .await;
+        assert_eq!(restaged.status, crate::protocol::ResponseStatus::WriteStaged);
+        assert_eq!(ram_pool.get_used_bytes(), 4 * mib);
+
+        // Committing keeps the count; removing the object returns it
+        let layout = restaged.chunk_layout.unwrap();
+        for chunk in &layout {
+            std::fs::write(&chunk.device, vec![7u8; chunk.length as usize]).unwrap();
+        }
+        let committed = server.handle_commit_write(a, None, false, t).await;
+        assert_eq!(committed.status, crate::protocol::ResponseStatus::WriteCommitted);
+        assert_eq!(ram_pool.get_used_bytes(), 4 * mib);
+        metadata.evict_entry(a).await.unwrap();
+        assert_eq!(ram_pool.get_used_bytes(), 0);
+        assert_eq!(files(), 0);
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
     #[tokio::test]
     async fn test_server_write_through_flow() {
         let test_dir = std::env::temp_dir().join(format!(

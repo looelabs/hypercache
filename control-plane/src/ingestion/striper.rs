@@ -194,22 +194,35 @@ impl Striper {
             let Some(ref pool) = self.ram_pool else {
                 anyhow::bail!("RAM cache tier requested but RAM caching is disabled.");
             };
-            let layout = (0..num_chunks)
-                .map(|local_idx| {
-                    let start = local_idx as u64 * chunk_size;
-                    let chunk_len = (start + chunk_size).min(size_bytes) - start;
-                    let chunk_id = format!("{}_chunk_{}", uri, start_chunk_idx + local_idx);
-                    let path = pool.get_chunk_path(&chunk_id);
-                    pool.create_staged_chunk(&path)?;
-                    Ok(ChunkDescriptor::new(
-                        StorageTier::Ram,
-                        path.to_string_lossy().to_string(),
-                        0,
-                        chunk_len,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(layout);
+            // Each chunk reserves its full length in the pool before its file exists, so staged
+            // checkpoints count toward ram_cache_capacity_bytes like ingested objects do.
+            let mut layout = Vec::with_capacity(num_chunks);
+            let mut failure = None;
+            for local_idx in 0..num_chunks {
+                let start = local_idx as u64 * chunk_size;
+                let chunk_len = (start + chunk_size).min(size_bytes) - start;
+                let chunk_id = format!("{}_chunk_{}", uri, start_chunk_idx + local_idx);
+                match pool.allocate_staged_chunk(&chunk_id, chunk_len) {
+                    Ok(desc) => layout.push(desc),
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            let Some(e) = failure else {
+                return Ok(layout);
+            };
+            for chunk in &layout {
+                let _ = pool.delete_chunk(&chunk.device, chunk.length);
+            }
+            if target_tier == Some(StorageTier::Ram) {
+                return Err(e.context(format!(
+                    "RAM cache tier cannot hold a {} byte staged write for {}",
+                    size_bytes, uri
+                )));
+            }
+            // Auto tier: another writer took the space first, so stage on NVMe instead
         }
 
         let mut layout = Vec::with_capacity(num_chunks);

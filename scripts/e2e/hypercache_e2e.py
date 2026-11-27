@@ -597,6 +597,82 @@ def scenario_daemon(ctx: Ctx, rep: Report) -> None:
     rc = node.stop(signal.SIGINT)
     rep.check("daemon shuts down cleanly on SIGINT", lambda: expect(rc in (0, -2, 130), f"exit code {rc}"))
 
+    scenario_ram_tier(ctx, rep)
+
+
+def scenario_ram_tier(ctx: Ctx, rep: Report) -> None:
+    """RAM tier across crashes and reboots. A plain directory stands in for /dev/shm; a "reboot"
+    is a stop followed by emptying it."""
+    print("== Scenario: RAM tier restarts")
+    shm = os.path.join(ctx.workdir, "ram-shm")
+    os.makedirs(shm, exist_ok=True)
+    cap = 16 * MIB
+    node = Node(ctx, "ramnode", device_mb=64, devices=1, overrides={
+        "ram_cache_enabled": True,
+        "ram_cache_shm_path": shm,
+        "ram_cache_capacity_bytes": cap,
+    })
+    if not rep.check("daemon starts with the RAM tier enabled", node.start):
+        print(node.log_tail())
+        return
+
+    def chunk_files() -> List[str]:
+        return sorted(f for f in os.listdir(shm) if f.endswith(".shm"))
+
+    data = random_bytes(4 * MIB + 5)
+    uri = ctx.nfs_file("ram/a.bin", data)
+
+    def crash_leaves_no_orphans():
+        res = node.client().preload(uri, tier="ram")
+        expect(res.is_hit, f"RAM preload failed: {res.status} {res.error_message}")
+        expect(all(c.tier == "ram" for c in res.chunk_layout), "object did not go to the RAM tier")
+        time.sleep(1.0)  # manifest writes are debounced by milliseconds
+        node.stop(signal.SIGKILL)
+        # What a crash mid-ingest leaves: a written chunk file no cached object references
+        orphan = os.path.join(shm, "hypercache___file_ram_partial.bin_chunk_0.999.1.0.shm")
+        with open(orphan, "wb") as f:
+            f.write(b"\0" * (8 * MIB))
+        node.start()
+        expect(not os.path.exists(orphan), "an unreferenced RAM chunk file survived the restart")
+        expect(sha256(node.read_object(uri)) == sha256(data), "RAM object corrupt after crash recovery")
+        # The orphan's space is usable again: everything up to the cap fits
+        fill = ctx.nfs_file("ram/fill.bin", random_bytes(cap - len(data)))
+        res = node.client().preload(fill, tier="ram")
+        expect(res.is_hit, f"the RAM tier lost capacity across a crash: {res.status} {res.error_message}")
+
+    rep.check("SIGKILL: unreferenced RAM chunk files are removed and the full cap is usable", crash_leaves_no_orphans)
+
+    def reboot_turns_entries_into_misses():
+        node.stop(signal.SIGINT)
+        for f in chunk_files():
+            os.remove(os.path.join(shm, f))
+        node.start()
+        res = node.client().locate(uri, auto_ingest=False)
+        expect(not res.is_hit, f"an object whose RAM files are gone is still served: {res.status}")
+        res = node.client().locate(uri, auto_ingest=True, tier="ram")
+        expect(res.is_hit, f"the object did not ingest again: {res.status} {res.error_message}")
+        expect(sha256(node.read_object(uri)) == sha256(data), "re-ingested RAM object corrupt")
+
+    rep.check("reboot (RAM files gone): cached RAM objects become misses and ingest again", reboot_turns_entries_into_misses)
+
+    def staged_writes_respect_cap():
+        node.cli("purge")
+        c = node.client()
+        staged = c.stage_write("hypercache://checkpoints/e2e-ram-a.pt", 12 * MIB, tier="ram")
+        expect(staged.is_staged, f"stage_write into RAM failed: {staged.status} {staged.error_message}")
+        before = chunk_files()
+        refused = c.stage_write("hypercache://checkpoints/e2e-ram-b.pt", 8 * MIB, tier="ram")
+        expect(not refused.is_staged, "a staged RAM write past the cap was accepted")
+        expect(chunk_files() == before, "a refused staged write left chunk files behind")
+        over = ctx.nfs_file("ram/over.bin", random_bytes(6 * MIB))
+        res = c.preload(over, tier="ram")
+        expect(not res.is_hit, "an ingest past the cap was accepted next to a staged checkpoint")
+        node.cli("purge")
+
+    rep.check("staged RAM writes count toward ram_cache_capacity_bytes", staged_writes_respect_cap)
+
+    node.stop(signal.SIGINT)
+
 
 # ----------------------------------------------------------------------------------------------
 # Scenario: controller + agents
