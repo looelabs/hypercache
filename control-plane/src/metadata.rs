@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::{ChunkDescriptor, StorageTier, SyncStatus};
 use crate::telemetry::MetricsState;
@@ -382,6 +382,41 @@ impl MetadataStore {
         *self.inner.ram_pool.write().unwrap() = Some(pool);
     }
 
+    /// Startup only, before anything is served: makes the RAM pool match the restored index.
+    /// Chunk files no entry references (left by a crash mid-ingest, or by an object the manifest
+    /// writer had not persisted yet) are deleted, and used bytes count only referenced chunks.
+    /// Without this every crash shrinks the RAM tier until a full purge.
+    pub fn reconcile_ram_pool(&self, pool: &crate::ram::RamMemoryPool) {
+        if !pool.lock_dir() {
+            warn!(
+                "Another process holds the RAM pool directory {:?}; not removing unreferenced chunk files. \
+                 Give each daemon its own ram_cache_shm_path.",
+                pool.get_shm_path()
+            );
+            return;
+        }
+        let keep: HashMap<PathBuf, u64> = self
+            .inner
+            .entries_mirror
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|m| m.chunk_layout.iter())
+            .filter(|c| c.tier == StorageTier::Ram)
+            .map(|c| (PathBuf::from(&c.device), c.length))
+            .collect();
+        let (removed, removed_bytes) = pool.reconcile(&keep);
+        if removed > 0 {
+            warn!(
+                "Removed {} RAM chunk file(s) ({} bytes) in {:?} that no cached object references, \
+                 left by an interrupted ingest or an unclean stop",
+                removed,
+                removed_bytes,
+                pool.get_shm_path()
+            );
+        }
+    }
+
     /// Fast-path in-process metadata lookup (zero network/TCP roundtrip)
     pub async fn get_layout(&self, uri: &str) -> Result<Option<StoredMetadata>> {
         let meta = self.cache.get(uri).await;
@@ -735,11 +770,19 @@ impl MetadataStore {
         devices
     }
 
+    /// Whether any RAM chunk of `meta` has no file, or a file shorter than the chunk.
+    fn ram_chunks_missing(meta: &StoredMetadata) -> bool {
+        meta.chunk_layout
+            .iter()
+            .filter(|c| c.tier == StorageTier::Ram)
+            .any(|c| std::fs::metadata(&c.device).map_or(true, |m| !m.is_file() || m.len() < c.length))
+    }
+
     fn delete_ram_chunks(inner: &Inner, chunks: &[ChunkDescriptor]) {
         let maybe_pool = inner.ram_pool.read().unwrap().clone();
         for chunk in chunks.iter().filter(|c| c.tier == StorageTier::Ram) {
             if let Some(ref pool) = maybe_pool {
-                let _ = pool.delete_chunk(&chunk.device);
+                let _ = pool.delete_chunk(&chunk.device, chunk.length);
             } else {
                 let p = Path::new(&chunk.device);
                 if p.exists() {
@@ -1219,6 +1262,60 @@ impl MetadataStore {
             }
         }
 
+        // RAM-tier files do not survive a reboot (or anything else that empties the shared memory
+        // directory). An entry whose RAM chunks are gone would fail every read and never re-ingest,
+        // so drop it: it becomes a miss. That includes dirty entries: their data is gone, so a
+        // write-back could never succeed. Each lost checkpoint is logged by name.
+        let mut dropped_missing = 0usize;
+        for map in [&mut manifest.entries, &mut manifest.local_only_entries] {
+            let lost: Vec<String> = map
+                .iter()
+                .filter(|(_, meta)| Self::ram_chunks_missing(meta))
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            if !lost.is_empty() && dropped_missing == 0 {
+                for pool in manifest.free_pools.values_mut() {
+                    pool.normalize();
+                }
+            }
+            for uri in lost {
+                let Some(meta) = map.remove(&uri) else { continue };
+                dropped_missing += 1;
+                if let Some(status) = meta.sync_status.filter(|s| s.is_dirty()) {
+                    error!(
+                        "Lost '{}' ({} bytes, status {}): its RAM-tier data was never written to the backend \
+                         and its shared memory files are gone (for example after a reboot). It is removed \
+                         from the cache and will not be written back.",
+                        uri,
+                        meta.object_size,
+                        status.as_str()
+                    );
+                }
+                debug!("Dropping {} on load: its RAM chunk files are missing or short", uri);
+                for chunk in &meta.chunk_layout {
+                    if chunk.tier == StorageTier::Ram {
+                        let _ = std::fs::remove_file(&chunk.device);
+                    } else {
+                        // Nothing has been served yet, so the extents need no quarantine
+                        Self::free_extent_locked(
+                            &mut manifest.free_pools,
+                            &mut manifest.local_alloc,
+                            &chunk.device,
+                            chunk.offset,
+                            Self::align_up_4k(chunk.length.max(4096)),
+                        );
+                    }
+                }
+            }
+        }
+        if dropped_missing > 0 {
+            warn!(
+                "Dropped {} cached object(s) whose RAM-tier files are gone (the shared memory directory \
+                 was emptied, for example by a reboot). They will be misses and ingest again.",
+                dropped_missing
+            );
+        }
+
         let store = Self::new(max_capacity_bytes, metrics.clone(), Some(path.to_path_buf()));
 
         let mut total_bytes: u64 = 0;
@@ -1264,6 +1361,10 @@ impl MetadataStore {
         if let Some(ref m) = metrics {
             m.cached_objects_count.store(count as u64, Ordering::Relaxed);
             m.storage_used_bytes.store(total_bytes, Ordering::Relaxed);
+        }
+        if dropped_missing > 0 {
+            // Rewrite the manifest without the dropped entries
+            store.mark_dirty();
         }
 
         Ok(Some((store, count, total_bytes)))
@@ -2619,6 +2720,148 @@ mod tests {
             store.get_sync_status("hypercache://old.bin").await.unwrap(),
             Some(SyncStatus::SyncFailed)
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A RAM chunk backed by a real file of `file_len` bytes (None: no file, as after a reboot).
+    fn ram_chunk(dir: &Path, name: &str, length: u64, file_len: Option<u64>) -> ChunkDescriptor {
+        let path = dir.join(format!("{}.1.2.3.shm", name));
+        if let Some(n) = file_len {
+            std::fs::write(&path, vec![5u8; n as usize]).unwrap();
+        }
+        let mut chunk = ChunkDescriptor::new(StorageTier::Ram, path.to_str().unwrap(), 0, length);
+        chunk.checksum = Some(0x1234_5678);
+        chunk
+    }
+
+    /// After a reboot (or anything that empties the shared memory directory) entries whose RAM files
+    /// are gone or short must load as misses, not as layouts that fail every read. That includes
+    /// dirty entries: their data is gone, so they must not stay queued for write-back.
+    #[tokio::test]
+    async fn test_restart_drops_entries_whose_ram_files_are_gone() {
+        let path = temp_manifest_path("ramgone");
+        let shm = path.parent().unwrap().join("shm");
+        std::fs::create_dir_all(&shm).unwrap();
+        let store = MetadataStore::new(1 << 30, None, Some(path.clone()));
+        let mixed_off = store.allocate_chunk_offset("/dev/r0", 8192, 4096).await.unwrap();
+
+        let intact = "hypercache://s3/b/intact.bin";
+        let gone = "hypercache://s3/b/gone.bin";
+        let short = "hypercache://s3/b/short.bin";
+        let mixed = "hypercache://s3/b/mixed.bin";
+        let kv = "hypercache://kv_cache/ns/m/0/0/_/ab.kv";
+        let dirty = "hypercache://checkpoints/unsynced.bin";
+        let cases: Vec<(&str, Vec<ChunkDescriptor>, Option<SyncStatus>)> = vec![
+            (intact, vec![ram_chunk(&shm, "intact", 4096, Some(4096))], None),
+            (
+                gone,
+                vec![ram_chunk(&shm, "gone", 4096, None)],
+                Some(SyncStatus::SyncedBackend),
+            ),
+            (short, vec![ram_chunk(&shm, "short", 4096, Some(100))], None),
+            (
+                mixed,
+                vec![
+                    ram_chunk(&shm, "mixed", 4096, Some(4096)),
+                    ram_chunk(&shm, "mixed_b", 4096, None),
+                    nvme_crc("/dev/r0", mixed_off, 8192),
+                ],
+                None,
+            ),
+            (kv, vec![ram_chunk(&shm, "kv", 4096, None)], Some(SyncStatus::LocalOnly)),
+            (
+                dirty,
+                vec![ram_chunk(&shm, "dirty", 4096, None)],
+                Some(SyncStatus::Committed),
+            ),
+        ];
+        for (uri, chunks, status) in cases {
+            let size = chunks.iter().map(|c| c.length).sum();
+            store
+                .save_layout_with_status(uri, size, 4194304, chunks, status)
+                .await
+                .unwrap();
+        }
+        store.flush_to_disk().await.unwrap();
+        drop(store);
+
+        let (reloaded, count, total_bytes) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(total_bytes, 4096);
+        assert!(reloaded.get_layout(intact).await.unwrap().is_some());
+        assert!(
+            reloaded.list_dirty_entries().await.is_empty(),
+            "a lost checkpoint is still queued for write-back"
+        );
+        for uri in [gone, short, mixed, kv, dirty] {
+            assert!(
+                reloaded.get_layout(uri).await.unwrap().is_none(),
+                "{} must be a miss",
+                uri
+            );
+        }
+        // The dropped entries' remaining RAM files are removed and their NVMe space is free again
+        assert!(!shm.join("short.1.2.3.shm").exists());
+        assert!(!shm.join("mixed.1.2.3.shm").exists());
+        assert!(shm.join("intact.1.2.3.shm").exists());
+        assert_eq!(
+            reloaded.allocate_chunk_offset("/dev/r0", 8192, 4096).await.unwrap(),
+            mixed_off
+        );
+
+        // The manifest is rewritten without them
+        reloaded.flush_to_disk().await.unwrap();
+        drop(reloaded);
+        let (again, count, _) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(again);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// At startup the RAM pool keeps only files the restored index references and counts only
+    /// those, so a crash mid-ingest does not shrink the RAM tier.
+    #[tokio::test]
+    async fn test_reconcile_ram_pool_removes_files_no_entry_references() {
+        let path = temp_manifest_path("ramreconcile");
+        let shm = path.parent().unwrap().join("shm");
+        std::fs::create_dir_all(&shm).unwrap();
+        let store = MetadataStore::new(1 << 30, None, Some(path.clone()));
+        let kept = ram_chunk(&shm, "kept", 4096, Some(4096));
+        store
+            .save_layout("hypercache://s3/b/kept.bin", 4096, 4194304, vec![kept.clone()])
+            .await
+            .unwrap();
+        // Chunks of an ingest the crash interrupted: written, never published
+        let orphans: Vec<_> = (0..3)
+            .map(|i| ram_chunk(&shm, &format!("partial_chunk_{}", i), 4096, Some(4096)))
+            .collect();
+
+        let pool = Arc::new(crate::ram::RamMemoryPool::new(shm.clone(), 64 * 1024));
+        assert_eq!(
+            pool.get_used_bytes(),
+            4 * 4096,
+            "before the fix this was the starting point"
+        );
+        store.set_ram_pool(pool.clone()).await;
+        store.reconcile_ram_pool(&pool);
+        assert_eq!(pool.get_used_bytes(), 4096);
+        assert!(Path::new(&kept.device).exists());
+        for o in &orphans {
+            assert!(!Path::new(&o.device).exists());
+        }
+
+        // A second daemon on the same directory must not delete the first one's files
+        let stray = ram_chunk(&shm, "other_daemon", 4096, Some(4096));
+        let second = crate::ram::RamMemoryPool::new(shm.clone(), 64 * 1024);
+        MetadataStore::new(1 << 30, None, None).reconcile_ram_pool(&second);
+        assert!(Path::new(&stray.device).exists());
+
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
