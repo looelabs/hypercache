@@ -671,6 +671,45 @@ def scenario_ram_tier(ctx: Ctx, rep: Report) -> None:
 
     rep.check("staged RAM writes count toward ram_cache_capacity_bytes", staged_writes_respect_cap)
 
+    def write_uncommitted(name: str):
+        """Stage a checkpoint and write every chunk, but never commit: a writer that died."""
+        st = node.client().stage_write(f"hypercache://checkpoints/{name}", 4 * MIB, tier="ram")
+        expect(st.is_staged, f"stage_write failed: {st.status} {st.error_message}")
+        for c in st.chunk_layout:
+            with open(c.device, "r+b") as f:
+                f.write(b"\x5a" * c.length)
+        return f"hypercache://checkpoints/{name}", [c.device for c in st.chunk_layout]
+
+    def staged_never_served_and_dropped_on_restart():
+        uri, files = write_uncommitted("e2e-uncommitted.pt")
+        for auto in (False, True):
+            res = node.client().locate(uri, auto_ingest=auto)
+            expect(not res.is_hit and not res.chunk_layout, f"a staged object was served: {res.status}")
+            expect(res.sync_status == "STAGED", f"locate did not report STAGED: {res.sync_status}")
+        node.stop(signal.SIGINT)
+        node.start()
+        res = node.client().locate(uri, auto_ingest=False)
+        expect(not res.is_hit and res.sync_status is None, f"staged write survived a restart: {res.sync_status}")
+        expect(not any(os.path.exists(f) for f in files), "the staged write's files survived a restart")
+
+    rep.check("uncommitted staged writes are never served and are dropped on restart",
+              staged_never_served_and_dropped_on_restart)
+
+    def staged_expires_while_running():
+        node.stop(signal.SIGINT)
+        node.config["staged_write_timeout_secs"] = 2
+        node.start()
+        uri, files = write_uncommitted("e2e-expires.pt")
+        wait_until(lambda: not any(os.path.exists(f) for f in files), 15, "staged write expiry")
+        res = node.client().locate(uri, auto_ingest=False)
+        expect(res.sync_status is None, f"expired staged write is still listed: {res.sync_status}")
+        # Its RAM reservation is returned: the whole cap fits again
+        fill = ctx.nfs_file("ram/after_expiry.bin", random_bytes(cap))
+        res = node.client().preload(fill, tier="ram")
+        expect(res.is_hit, f"the expired write's RAM space was not returned: {res.error_message}")
+
+    rep.check("an uncommitted staged write is removed after staged_write_timeout_secs", staged_expires_while_running)
+
     node.stop(signal.SIGINT)
 
 

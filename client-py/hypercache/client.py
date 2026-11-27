@@ -250,11 +250,13 @@ class HyperCacheClient:
                 sync_status=resp.get("sync_status"),
             )
         elif status == "MISS":
+            # sync_status "STAGED": the object is being written and is not readable yet
             return LocateResult(
                 status=status,
                 object_size=0,
                 chunk_size=0,
                 chunk_layout=[],
+                sync_status=resp.get("sync_status"),
             )
         else:
             err = resp.get("error_message", "Unknown error from control plane")

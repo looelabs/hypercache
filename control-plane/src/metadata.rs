@@ -196,6 +196,9 @@ struct Inner {
     /// When each object was last looked up, in Unix milliseconds. Kept in memory only: after a
     /// restart an object counts as last used when it was created. Picks pressure-eviction victims.
     last_access: Mutex<HashMap<String, i64>>,
+    /// When each STAGED object was last staged or appended to. In memory only: STAGED entries do
+    /// not survive a restart. Used to expire writes that are never committed.
+    staged_activity: Mutex<HashMap<String, Instant>>,
     metrics: Option<Arc<MetricsState>>,
     persister: Option<Persister>,
     /// True while `LOCAL_ONLY` commits may skip the device flush: always without a manifest (nothing
@@ -251,6 +254,7 @@ impl MetadataStore {
             reclaim_grace_ms: AtomicU64::new(DEFAULT_RECLAIM_GRACE.as_millis() as u64),
             reclaim_reserve_percent: AtomicU64::new(0),
             last_access: Mutex::new(HashMap::new()),
+            staged_activity: Mutex::new(HashMap::new()),
             metrics,
             persister: persistence_path.map(|path| Persister {
                 path,
@@ -417,6 +421,89 @@ impl MetadataStore {
         }
     }
 
+    fn note_staged_activity(&self, uri: &str, staged: bool) {
+        let mut activity = self.inner.staged_activity.lock().unwrap();
+        if staged {
+            activity.insert(uri.to_string(), Instant::now());
+        } else {
+            activity.remove(uri);
+        }
+    }
+
+    /// The layout of `uri` for a reader: None while it is STAGED. A staged layout points at chunks
+    /// a writer may not have filled yet, so it must never be served as cached data.
+    pub async fn get_readable_layout(&self, uri: &str) -> Result<Option<StoredMetadata>> {
+        Ok(self
+            .get_layout(uri)
+            .await?
+            .filter(|m| m.sync_status != Some(SyncStatus::Staged)))
+    }
+
+    /// Removes STAGED objects with no stage or append activity for `max_idle`: their writer died or
+    /// gave up without committing. RAM chunk files are deleted, NVMe extents go through the reclaim
+    /// quarantine. Returns the URIs removed.
+    pub async fn expire_stale_staged(&self, max_idle: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let expired: Vec<(String, StoredMetadata)> = {
+            let mut mirror = self.inner.entries_mirror.lock().unwrap();
+            let mut activity = self.inner.staged_activity.lock().unwrap();
+            activity.retain(|uri, _| {
+                mirror
+                    .get(uri)
+                    .is_some_and(|m| m.sync_status == Some(SyncStatus::Staged))
+            });
+            let stale: Vec<String> = mirror
+                .iter()
+                .filter(|(_, m)| m.sync_status == Some(SyncStatus::Staged))
+                .filter(|(uri, _)| {
+                    let since = *activity.entry(uri.to_string()).or_insert(now);
+                    now.duration_since(since) >= max_idle
+                })
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            stale
+                .into_iter()
+                .filter_map(|uri| {
+                    activity.remove(&uri);
+                    mirror.remove(&uri).map(|m| (uri, m))
+                })
+                .collect()
+        };
+        for (uri, meta) in &expired {
+            self.cache.invalidate(uri).await;
+            self.forget_access(uri);
+            self.quarantine_chunks(&meta.chunk_layout);
+            warn!(
+                "Removed staged write '{}' ({} bytes): not committed within {} s of its last stage or append",
+                uri,
+                meta.object_size,
+                max_idle.as_secs()
+            );
+        }
+        if !expired.is_empty() {
+            self.update_metrics_counters();
+            self.mark_dirty();
+        }
+        expired.into_iter().map(|(uri, _)| uri).collect()
+    }
+
+    /// Runs `expire_stale_staged` in the background (0 disables it).
+    pub fn spawn_staged_write_reaper(&self, timeout: Duration) {
+        if timeout.is_zero() {
+            return;
+        }
+        let store = self.clone();
+        let period = (timeout / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                store.expire_stale_staged(timeout).await;
+            }
+        });
+    }
+
     /// Fast-path in-process metadata lookup (zero network/TCP roundtrip)
     pub async fn get_layout(&self, uri: &str) -> Result<Option<StoredMetadata>> {
         let meta = self.cache.get(uri).await;
@@ -483,6 +570,7 @@ impl MetadataStore {
             mirror.insert(uri.to_string(), meta.clone())
         };
         self.touch(uri);
+        self.note_staged_activity(uri, sync_status == Some(SyncStatus::Staged));
         self.cache.insert(uri.to_string(), meta).await;
 
         if let Some(prev) = old_meta {
@@ -628,6 +716,7 @@ impl MetadataStore {
 
         let total_size = meta.object_size;
         let full_layout = meta.chunk_layout.clone();
+        self.note_staged_activity(uri, true);
         self.cache.insert(uri.to_string(), meta).await;
 
         self.update_metrics_counters();
@@ -1265,12 +1354,14 @@ impl MetadataStore {
         // RAM-tier files do not survive a reboot (or anything else that empties the shared memory
         // directory). An entry whose RAM chunks are gone would fail every read and never re-ingest,
         // so drop it: it becomes a miss. That includes dirty entries: their data is gone, so a
-        // write-back could never succeed. Each lost checkpoint is logged by name.
+        // write-back could never succeed. Each lost checkpoint is logged by name. STAGED entries are
+        // dropped too: their writer belonged to the previous daemon's lifetime and can't commit now.
         let mut dropped_missing = 0usize;
+        let mut dropped_staged = 0usize;
         for map in [&mut manifest.entries, &mut manifest.local_only_entries] {
             let lost: Vec<String> = map
                 .iter()
-                .filter(|(_, meta)| Self::ram_chunks_missing(meta))
+                .filter(|(_, meta)| meta.sync_status == Some(SyncStatus::Staged) || Self::ram_chunks_missing(meta))
                 .map(|(uri, _)| uri.clone())
                 .collect();
             if !lost.is_empty() && dropped_missing == 0 {
@@ -1281,7 +1372,13 @@ impl MetadataStore {
             for uri in lost {
                 let Some(meta) = map.remove(&uri) else { continue };
                 dropped_missing += 1;
-                if let Some(status) = meta.sync_status.filter(|s| s.is_dirty()) {
+                if meta.sync_status == Some(SyncStatus::Staged) {
+                    dropped_staged += 1;
+                    warn!(
+                        "Dropped staged write '{}' ({} bytes): it was never committed before the last stop",
+                        uri, meta.object_size
+                    );
+                } else if let Some(status) = meta.sync_status.filter(|s| s.is_dirty()) {
                     error!(
                         "Lost '{}' ({} bytes, status {}): its RAM-tier data was never written to the backend \
                          and its shared memory files are gone (for example after a reboot). It is removed \
@@ -1308,11 +1405,11 @@ impl MetadataStore {
                 }
             }
         }
-        if dropped_missing > 0 {
+        if dropped_missing > dropped_staged {
             warn!(
                 "Dropped {} cached object(s) whose RAM-tier files are gone (the shared memory directory \
                  was emptied, for example by a reboot). They will be misses and ingest again.",
-                dropped_missing
+                dropped_missing - dropped_staged
             );
         }
 
@@ -2862,6 +2959,139 @@ mod tests {
         MetadataStore::new(1 << 30, None, None).reconcile_ram_pool(&second);
         assert!(Path::new(&stray.device).exists());
 
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A staged write nobody commits is removed once it has been idle for the timeout; committed
+    /// objects and staged writes that are still being appended to stay.
+    #[tokio::test]
+    async fn test_idle_staged_writes_expire() {
+        let path = temp_manifest_path("stagedexpire");
+        let shm = path.parent().unwrap().join("shm");
+        std::fs::create_dir_all(&shm).unwrap();
+        let store = MetadataStore::new(1 << 30, None, Some(path.clone()));
+        let pool = Arc::new(crate::ram::RamMemoryPool::new(shm.clone(), 1 << 20));
+        store.set_ram_pool(pool.clone()).await;
+
+        let abandoned = "hypercache://checkpoints/abandoned.pt";
+        let active = "hypercache://checkpoints/active.pt";
+        let done = "hypercache://checkpoints/done.pt";
+        let ab_chunk = pool.allocate_staged_chunk("abandoned_chunk_0", 4096).unwrap();
+        store
+            .save_layout_with_status(
+                abandoned,
+                4096,
+                4194304,
+                vec![ab_chunk.clone()],
+                Some(SyncStatus::Staged),
+            )
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                active,
+                4096,
+                4194304,
+                vec![nvme_crc("/dev/r0", 4096, 4096)],
+                Some(SyncStatus::Staged),
+            )
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                done,
+                4096,
+                4194304,
+                vec![nvme_crc("/dev/r0", 8192, 4096)],
+                Some(SyncStatus::Staged),
+            )
+            .await
+            .unwrap();
+        store.update_sync_status(done, SyncStatus::Committed).await.unwrap();
+        assert_eq!(pool.get_used_bytes(), 4096);
+
+        let idle = Duration::from_millis(1000);
+        assert!(store.expire_stale_staged(idle).await.is_empty(), "nothing is idle yet");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // The active writer appends more data: that counts as activity
+        store
+            .append_chunks_to_layout(active, 4096, 4194304, vec![nvme_crc("/dev/r0", 12288, 4096)])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(store.expire_stale_staged(idle).await, vec![abandoned.to_string()]);
+        assert!(store.get_layout(abandoned).await.unwrap().is_none());
+        assert!(
+            !Path::new(&ab_chunk.device).exists(),
+            "the abandoned RAM chunk file is deleted"
+        );
+        assert_eq!(pool.get_used_bytes(), 0, "and its reservation returned");
+        assert_eq!(store.get_sync_status(active).await.unwrap(), Some(SyncStatus::Staged));
+        assert_eq!(store.get_sync_status(done).await.unwrap(), Some(SyncStatus::Committed));
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(store.expire_stale_staged(idle).await, vec![active.to_string()]);
+        assert!(store.get_layout(done).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A staged write cannot be committed after a restart (its writer is gone), so it is dropped on
+    /// load even when all of its chunks were written.
+    #[tokio::test]
+    async fn test_restart_drops_staged_writes() {
+        let path = temp_manifest_path("stagedrestart");
+        let shm = path.parent().unwrap().join("shm");
+        std::fs::create_dir_all(&shm).unwrap();
+        let store = MetadataStore::new(1 << 30, None, Some(path.clone()));
+        let off = store.allocate_chunk_offset("/dev/r0", 4096, 4096).await.unwrap();
+        let staged_ram = "hypercache://checkpoints/staged_ram.pt";
+        let staged_nvme = "hypercache://checkpoints/staged_nvme.pt";
+        let kept = "hypercache://checkpoints/committed.pt";
+        let full = ram_chunk(&shm, "staged_full", 4096, Some(4096));
+        store
+            .save_layout_with_status(staged_ram, 4096, 4194304, vec![full.clone()], Some(SyncStatus::Staged))
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                staged_nvme,
+                4096,
+                4194304,
+                vec![nvme_crc("/dev/r0", off, 4096)],
+                Some(SyncStatus::Staged),
+            )
+            .await
+            .unwrap();
+        store
+            .save_layout_with_status(
+                kept,
+                4096,
+                4194304,
+                vec![ram_chunk(&shm, "kept", 4096, Some(4096))],
+                Some(SyncStatus::Committed),
+            )
+            .await
+            .unwrap();
+        store.flush_to_disk().await.unwrap();
+        drop(store);
+
+        let (reloaded, count, _) = MetadataStore::load_from_disk(&path, 1 << 30, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(reloaded.get_layout(staged_ram).await.unwrap().is_none());
+        assert!(reloaded.get_layout(staged_nvme).await.unwrap().is_none());
+        assert_eq!(
+            reloaded.get_sync_status(kept).await.unwrap(),
+            Some(SyncStatus::Committed)
+        );
+        assert!(!Path::new(&full.device).exists());
+        assert_eq!(
+            reloaded.allocate_chunk_offset("/dev/r0", 4096, 4096).await.unwrap(),
+            off
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

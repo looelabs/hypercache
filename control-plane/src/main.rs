@@ -609,6 +609,11 @@ async fn run_daemon(
         detected_devices,
     ));
 
+    // Staged writes nobody commits (a client that died mid-write) are removed after a timeout
+    server
+        .metadata()
+        .spawn_staged_write_reaper(std::time::Duration::from_secs(config.staged_write_timeout_secs));
+
     // Checkpoints committed (or failed to sync) before the last shutdown are flushed again
     let resumed = server.resume_pending_writebacks().await;
     if resumed > 0 {

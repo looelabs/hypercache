@@ -2,7 +2,18 @@
 
 ## Unreleased
 
+### Added
+- `staged_write_timeout_secs` (default 1800, 0 = off): a staged write that is not committed within
+  this many seconds of its last stage or append is removed, files included.
+
 ### Fixed
+- Half-written checkpoints were served as cached. A staged write that was never committed (the
+  client died, or the daemon restarted, mid-write) stayed forever with its files, and `locate`
+  returned its layout as a HIT, so a reader that trusted HIT got unwritten chunks. `locate` now
+  answers MISS for a staged object (with `sync_status` STAGED and no layout) and does not ingest
+  over it; preload and the fleet agent API refuse it too. Staged writes are dropped on restart, and
+  removed while the daemon runs after `staged_write_timeout_secs`. The Python client now passes
+  `sync_status` through on a MISS.
 - RAM tier after a reboot: cached objects whose shared memory files were gone (a reboot empties
   `/dev/shm`) came back in the index and failed every read with "file not found", and asking for
   them again did not re-fetch them until `rm` or `purge`. On start the daemon now drops every entry
