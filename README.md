@@ -136,7 +136,7 @@ HyperCache is designed for both **AI Inference** and **Distributed AI Training**
 
 ### 1. Storage Drives: Raw Unformatted Block Devices (`NVMe` Recommended, `SATA SSD` Supported)
 * **Raw Drives Without a Filesystem**: For HyperCache's native Raw Block Striping mode (`storage_backing_mode = "raw_block"` or `"auto"`) to claim and stripe across local drives, the target drives **must be raw, unmounted block devices with no existing filesystem on them**.
-  * HyperCache automatically inspects sector headers for existing filesystem superblocks (`ext4`, `XFS`, `Btrfs`, `ZFS`, and Linux `swap`). Any drive containing an existing filesystem or mounted partition is automatically skipped by the safety guard to prevent accidental data loss.
+  * HyperCache automatically inspects sector headers for existing filesystems (`ext4`, `XFS`, `Btrfs`, FAT, NTFS, swap), partition tables (GPT, MBR) and volume, RAID or encryption headers (LVM2, md RAID, LUKS, ZFS, Ceph BlueStore), and skips any such drive, any drive it can't read, and any mounted or in-use drive, to prevent accidental data loss. It can't recognise a drive that holds raw data with no known header (for example one used by another raw block store): wipe such a drive or list devices explicitly.
   * To prepare a previously formatted drive for raw block striping, unmount it and wipe its filesystem signature:
     ```bash
     sudo wipefs -a /dev/nvme1n1

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Raw drive discovery could claim, and overwrite, drives that hold data. It only recognised
+  filesystem superblocks, so an unmounted disk with a partition table, an LVM physical volume, a
+  LUKS or md RAID member, a ZFS pool member or a Ceph BlueStore device looked blank, and a device
+  it could not read counted as blank too. These are now recognised and excluded, and an
+  unreadable device is excluded. With `include_partitions = false`, a disk with partitions is
+  excluded (its partitions were never checked). Mounts named by a link or an alias
+  (`/dev/disk/by-uuid/...`, `/dev/root`, `/dev/mapper/...`) are matched by device number, with the
+  disks under them. `exclude_root_device` was never read: the disk holding `/` is now always
+  excluded while it is set (the default), even with `exclude_mounted_devices = false`. On a test
+  host with that setting, the old code claimed the root LVM partition and two drives of a mounted
+  LVM volume. Manual device lists (`device_discovery_mode = "manual"`) are unchanged.
+
 ## 0.11.1
 
 Faster warm model loads from the Python client, and a fix for a small daemon memory leak. A warm

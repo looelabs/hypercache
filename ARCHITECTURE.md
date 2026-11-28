@@ -79,11 +79,14 @@ HyperCache dynamically scans the host system on startup without requiring manual
 #### Discovery Algorithm (`discovery.rs`):
 1. **Sysfs Traversal**: Iterates over all block devices in `/sys/class/block/` matching allowed drive prefixes (`nvme*`, `sd*`).
 2. **Root Device & Mount Exclusion**:
-   - Parses `/proc/mounts` and `/sys/class/block/<dev>/holders` to identify the OS root mountpoint (`/`).
-   - Resolves device major/minor numbers and unconditionally excludes the root drive and parent disks from the striping pool.
-3. **Filesystem Superblock Signature Detection**:
-   - Probes device sector headers for magic bytes (`EXT4: 0x53EF`, `XFS: "XFSB"`, `Btrfs: "_BHRfS_M"`, `ZFS`).
-   - Devices containing active mounted filesystems are safely quarantined unless explicitly flagged for cache pool dedication.
+   - Reads `/proc/mounts`, `/proc/self/mountinfo` (by device number, so links and aliases such as `/dev/disk/by-uuid/...` and `/dev/root` match), `/proc/swaps`, and `/sys/class/block/<dev>/holders`, and excludes each in-use device with its parent disk and the disks under it (`slaves`).
+   - With `exclude_root_device` (default), the disk holding `/` is excluded even when `exclude_mounted_devices = false`.
+   - With `include_partitions = false`, a whole disk that has partitions is excluded.
+3. **Signature Detection** (`exclude_devices_with_existing_fs`, default on):
+   - Reads the first 256 KiB and excludes devices holding a filesystem (ext2/3/4, XFS, Btrfs, FAT, NTFS, swap, ISO 9660), a partition table (GPT, MBR), or a volume manager, RAID or encryption header (LVM2, md RAID 1.1/1.2, LUKS, ZFS, Ceph BlueStore). A device that cannot be read is excluded too.
+   - Short header signatures are only looked for below `device_start_offset_bytes`, where HyperCache never writes, so its own data can't make it refuse its own drive.
+   - `force_use_devices` overrides the check for named devices. Manual mode (`block_devices`) skips discovery checks.
+   - Not detected: a drive with raw data and no known header (for example one used by another raw block store), md RAID 0.90/1.0 (superblock at the end of the device).
 4. **Capacity Calculation**: Reads `/sys/class/block/<dev>/size` (sectors $\times$ 512 bytes) and builds the aggregate multi-drive storage pool.
 
 ---
