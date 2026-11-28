@@ -111,6 +111,16 @@ enum Commands {
     /// Inspect active storage pool, discovered NVMe/SSDs, and safety exclusions
     Inspect,
 
+    /// Erase a drive that holds data and mark it as a HyperCache drive, so auto discovery uses it
+    PrepareDrive {
+        /// The drive, preferably by its /dev/disk/by-id/ name
+        device: String,
+
+        /// Don't ask for confirmation before erasing
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Run pre-flight host, storage pool, shared memory, and configuration readiness checks
     #[command(aliases = ["doctor", "preflight"])]
     Check {
@@ -259,6 +269,7 @@ async fn main() -> Result<()> {
             bench::run_benchmark(&sock, uri, size_mb, iterations, s3_config, target_tier).await
         }
         Commands::Inspect => run_inspect(cli.config, cli.devices).await,
+        Commands::PrepareDrive { device, yes } => run_prepare_drive(&device, yes),
         Commands::Check { json, ram } => run_check(cli.config, cli.devices, json, ram).await,
         Commands::Ls { json } => {
             let sock = config::client_socket_path(cli.config.as_deref())?
@@ -452,6 +463,9 @@ async fn run_daemon(
     // (e.g. an arena larger than its filesystem) stops startup instead of running without storage.
     let detected_devices = DeviceDetector::detect_devices_checked(&config)
         .context("Storage pool could not be provisioned; refusing to start")?;
+    // Erase the drives the user allowed to be erased, and mark new drives as HyperCache's own,
+    // before anything is stored on them
+    let detected_devices = DeviceDetector::claim_devices(detected_devices);
     // Clients open claimed devices directly, so share them with client_gid like arenas and the
     // socket. On a container with the host's /dev mounted, this changes the host's device node.
     for dev in &detected_devices {
@@ -682,6 +696,74 @@ async fn run_daemon(
 
     println!("HyperCache Control Plane stopped cleanly.");
     Ok(())
+}
+
+/// `hypercache prepare-drive`: erase a drive (after confirmation) and write HyperCache's marker.
+#[cfg(target_os = "linux")]
+fn run_prepare_drive(device: &str, yes: bool) -> Result<()> {
+    use hypercache_control_plane::device_claim;
+    let report = DeviceDetector::inspect_drive(device)?;
+    let gb = report.size_bytes as f64 / 1e9;
+    println!("Drive:  {} ({:.1} GB)", report.path, gb);
+    println!("Model:  {}", report.model.as_deref().unwrap_or("unknown"));
+    println!("Serial: {}", report.serial.as_deref().unwrap_or("unknown"));
+    if report.in_use {
+        anyhow::bail!(
+            "{} is in use (mounted, part of LVM/RAID/dm, swap, or the root disk): refusing to touch it",
+            report.path
+        );
+    }
+    if let Some(m) = &report.marker {
+        println!(
+            "Already a HyperCache drive (claimed {}). Nothing to do.",
+            chrono::DateTime::from_timestamp(m.claimed_at, 0)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| m.claimed_at.to_string())
+        );
+        return Ok(());
+    }
+    let write_marker = |path: &str| {
+        device_claim::write_marker(
+            path,
+            &device_claim::DeviceMarker::new(report.serial.clone(), report.model.clone()),
+        )
+        .with_context(|| format!("Failed to write the HyperCache marker to {}", path))
+    };
+    if report.found.is_none() && report.blank {
+        write_marker(&report.path)?;
+        println!("The drive is blank. Marked it as a HyperCache drive; auto discovery will use it.");
+        return Ok(());
+    }
+    match &report.found {
+        Some(f) => println!("Found:  {}", f),
+        None => println!("Found:  data (the drive is not blank)"),
+    }
+    let name = report.path.trim_start_matches("/dev/");
+    if !yes {
+        println!();
+        println!("This ERASES ALL DATA on {}. It cannot be undone.", report.path);
+        print!("Type the device name ({}) to continue: ", name);
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim() != name {
+            anyhow::bail!("Not confirmed; nothing was changed");
+        }
+    }
+    device_claim::zero_device(&report.path, report.size_bytes)
+        .with_context(|| format!("Failed to erase {} (is it open or held by something?)", report.path))?;
+    write_marker(&report.path)?;
+    println!(
+        "Erased {} and marked it as a HyperCache drive; auto discovery will use it.",
+        report.path
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_prepare_drive(_device: &str, _yes: bool) -> Result<()> {
+    anyhow::bail!("prepare-drive is only supported on Linux")
 }
 
 async fn run_inspect(config_path: Option<PathBuf>, explicit_devices: Option<Vec<String>>) -> Result<()> {

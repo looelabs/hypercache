@@ -901,6 +901,7 @@ mod tests {
             model: Some("Test SSD".to_string()),
             existing_fs: None,
             numa_node: Some(0),
+            claim: Default::default(),
         }];
         let ctx = AgentContext {
             config,

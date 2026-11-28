@@ -159,6 +159,32 @@ impl From<ManifestWithoutLocalOnly> for MetadataManifest {
 
 /// Decodes a bincode manifest in the current layout, or in the layout from before
 /// `local_only_entries`, so an upgrade never starts cold over a format change.
+/// The NVMe devices a saved manifest holds data on (allocation frontiers and chunks). Empty when
+/// there is no manifest or it can't be read.
+pub fn manifest_devices(path: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut devices = std::collections::HashSet::new();
+    let Ok(bytes) = std::fs::read(path) else {
+        return devices;
+    };
+    let manifest = if path.extension().is_some_and(|e| e == "bin" || e == "bincode") {
+        decode_bincode_manifest(&bytes)
+    } else {
+        serde_json::from_slice::<MetadataManifest>(&bytes).ok()
+    };
+    if let Some(m) = manifest {
+        devices.extend(m.local_alloc.keys().cloned());
+        for meta in m.entries.values().chain(m.local_only_entries.values()) {
+            devices.extend(
+                meta.chunk_layout
+                    .iter()
+                    .filter(|c| c.tier != StorageTier::Ram)
+                    .map(|c| c.device.clone()),
+            );
+        }
+    }
+    devices
+}
+
 fn decode_bincode_manifest(bytes: &[u8]) -> Option<MetadataManifest> {
     bincode::deserialize::<MetadataManifest>(bytes).ok().or_else(|| {
         bincode::deserialize::<ManifestWithoutLocalOnly>(bytes)
@@ -1501,6 +1527,7 @@ mod tests {
             model: None,
             existing_fs: None,
             numa_node: Some(0),
+            claim: Default::default(),
         }
     }
 

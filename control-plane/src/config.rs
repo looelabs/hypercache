@@ -82,6 +82,11 @@ pub struct Config {
     #[serde(default)]
     pub force_use_devices: Vec<String>,
 
+    /// Drives auto discovery may erase and claim although they hold data, by their
+    /// `/dev/disk/by-id/` name. A drive is erased once: it then carries HyperCache's marker.
+    #[serde(default)]
+    pub zero_devices_with_data: Vec<String>,
+
     #[serde(default = "default_ram_cache_enabled")]
     pub ram_cache_enabled: bool,
 
@@ -619,6 +624,7 @@ impl Default for Config {
             exclude_mounted_devices: default_exclude_mounted(),
             exclude_devices_with_existing_fs: default_exclude_fs(),
             force_use_devices: Vec::new(),
+            zero_devices_with_data: Vec::new(),
             ram_cache_enabled: default_ram_cache_enabled(),
             ram_cache_capacity_bytes: default_ram_cache_capacity(),
             ram_cache_shm_path: default_ram_cache_shm_path(),

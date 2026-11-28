@@ -15,6 +15,11 @@
 #               failing writes later; a fitting arena is fully reserved on disk; opting out with
 #               filesystem_arena_preallocate = false starts with a sparse arena.
 #   shutdown    SIGTERM stops the daemon cleanly and removes the socket.
+#   ownership   auto discovery (limited to one loop device) refuses a drive that holds data and
+#               leaves it untouched; prepare-drive needs confirmation, then erases and marks it;
+#               the marked drive is used, and still used after a restart with cached data on it;
+#               a drive HyperCache used before markers (listed in the manifest) is kept, not
+#               erased; zero_devices_with_data erases only drives named by /dev/disk/by-id/.
 #
 # Usage: sudo scripts/e2e/bare_metal_access.sh BIN_DIR [PYTHON]
 # ==============================================================================
@@ -28,6 +33,8 @@ CLIENT_GID=2000
 WORK=$(mktemp -d /tmp/hc-bare.XXXXXX)
 FAILS=0
 LOOP=""
+LOOP2=""
+BYID=""
 DAEMON_PID=""
 
 pass() { printf '  PASS  %s\n' "$1"; }
@@ -45,6 +52,8 @@ cleanup() {
     [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
     mountpoint -q "$WORK/smallfs" 2>/dev/null && umount "$WORK/smallfs"
     [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+    [ -n "$LOOP2" ] && losetup -d "$LOOP2" 2>/dev/null
+    [ -n "$BYID" ] && rm -f "$BYID"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -206,6 +215,146 @@ if start_daemon "$WORK/sparse.toml" "$WORK/sparse.log"; then
 else
     fail "filesystem_arena_preallocate = false starts with a sparse arena"
     tail -20 "$WORK/sparse.log"
+fi
+
+echo "== bare metal: auto discovery uses only blank, marked or allowed drives"
+rm -rf "$WORK/meta"
+truncate -s 256M "$WORK/auto.img"
+LOOP2=$(losetup -f --show "$WORK/auto.img") || { fail "attach second loop device"; exit 1; }
+L2=${LOOP2#/dev/}
+auto_cfg() { # file [extra toml line]
+    cat > "$1" <<EOF
+storage_backing_mode = "raw_block"
+device_discovery_mode = "auto"
+device_prefixes = ["loop"]
+device_filter = "$L2"
+auto_create_mock_devices = false
+ram_cache_enabled = false
+metadata_persistence_path = "$WORK/meta/metadata.json"
+authoritative_backend = "nfs"
+nfs_mount_path = "$WORK/nfs"
+${2:-}
+EOF
+}
+uses_loop2() { grep -q "Discovered 1 Active Block Device" "$1" && grep -q "$LOOP2" "$1"; }
+marked() { head -c 20 "$LOOP2" | grep -q "HYPERCACHE-DEVICE-V1"; }
+past_marker() { dd if="$LOOP2" bs=4096 skip=1 count=16383 status=none | sha256sum; } # 4 KiB..64 MiB
+
+# Someone else's data in the middle of an otherwise empty drive
+dd if=/dev/urandom of="$LOOP2" bs=1M seek=100 count=4 conv=notrunc status=none
+before=$(sha256sum < "$LOOP2")
+auto_cfg "$WORK/auto.toml"
+"$HC" -c "$WORK/auto.toml" inspect >"$WORK/inspect.log" 2>&1
+if grep -q "not blank and is not a HyperCache drive" "$WORK/inspect.log" && grep -q "prepare-drive" "$WORK/inspect.log"; then
+    pass "a drive holding data is refused, with how to erase it"
+else
+    fail "a drive holding data is refused, with how to erase it"
+    tail -5 "$WORK/inspect.log"
+fi
+if start_daemon "$WORK/auto.toml" "$WORK/auto-refused.log"; then
+    if uses_loop2 "$WORK/auto-refused.log"; then
+        fail "daemon does not use the drive holding data"
+    else
+        pass "daemon does not use the drive holding data"
+    fi
+    stop_daemon
+else
+    fail "daemon starts without the drive holding data"
+    tail -5 "$WORK/auto-refused.log"
+fi
+[ "$(sha256sum < "$LOOP2")" = "$before" ] && pass "the drive holding data is left untouched" ||
+    fail "the drive holding data is left untouched"
+
+echo no | "$HC" prepare-drive "$LOOP2" >"$WORK/prep-no.log" 2>&1
+[ "$(sha256sum < "$LOOP2")" = "$before" ] && pass "prepare-drive changes nothing without confirmation" ||
+    fail "prepare-drive changes nothing without confirmation"
+if echo "$L2" | "$HC" prepare-drive "$LOOP2" >"$WORK/prep.log" 2>&1 && marked &&
+    [ "$(dd if="$LOOP2" bs=1M skip=100 count=4 status=none | tr -d '\0' | wc -c)" -eq 0 ]; then
+    pass "prepare-drive erases the drive and marks it after confirmation"
+else
+    fail "prepare-drive erases the drive and marks it after confirmation"
+    cat "$WORK/prep.log"
+fi
+
+if start_daemon "$WORK/auto.toml" "$WORK/auto-marked.log" && uses_loop2 "$WORK/auto-marked.log"; then
+    pass "auto discovery uses the marked drive"
+    probe "client reads and writes through the auto-discovered drive" 0 "" ok
+    stop_daemon
+    if start_daemon "$WORK/auto.toml" "$WORK/auto-restart.log" && uses_loop2 "$WORK/auto-restart.log"; then
+        pass "the marked drive is still used after a restart with cached data on it"
+    else
+        fail "the marked drive is still used after a restart with cached data on it"
+        tail -5 "$WORK/auto-restart.log"
+    fi
+    stop_daemon
+else
+    fail "auto discovery uses the marked drive"
+    tail -10 "$WORK/auto-marked.log"
+    stop_daemon
+fi
+
+# Upgrade: a drive HyperCache used before markers existed (manual mode never marks)
+rm -rf "$WORK/meta"
+blkdiscard "$LOOP2" 2>/dev/null || dd if=/dev/zero of="$LOOP2" bs=1M count=256 status=none
+cat > "$WORK/manual2.toml" <<EOF
+storage_backing_mode = "raw_block"
+device_discovery_mode = "manual"
+block_devices = ["$LOOP2"]
+ram_cache_enabled = false
+metadata_persistence_path = "$WORK/meta/metadata.json"
+authoritative_backend = "nfs"
+nfs_mount_path = "$WORK/nfs"
+EOF
+if start_daemon "$WORK/manual2.toml" "$WORK/manual2.log"; then
+    probe "a drive used in manual mode gets cached data" 0 "" ok
+    stop_daemon
+fi
+if marked; then fail "manual mode leaves no marker"; else pass "manual mode leaves no marker"; fi
+cached=$(past_marker)
+if start_daemon "$WORK/auto.toml" "$WORK/auto-upgrade.log" && uses_loop2 "$WORK/auto-upgrade.log" && marked &&
+    [ "$(past_marker)" = "$cached" ]; then
+    pass "a drive the manifest lists is kept and marked, not erased"
+    probe "cached data on the kept drive still reads correctly" 0 "" ok
+    stop_daemon
+else
+    fail "a drive the manifest lists is kept and marked, not erased"
+    tail -10 "$WORK/auto-upgrade.log"
+    stop_daemon
+fi
+
+# zero_devices_with_data: only /dev/disk/by-id/ names count
+rm -rf "$WORK/meta"
+dd if=/dev/urandom of="$LOOP2" bs=1M count=4 conv=notrunc status=none
+mkdir -p /dev/disk/by-id
+BYID="/dev/disk/by-id/hypercache-e2e-$L2-$$"
+ln -sf "$LOOP2" "$BYID"
+auto_cfg "$WORK/zero-bad.toml" "zero_devices_with_data = [\"$LOOP2\"]"
+if start_daemon "$WORK/zero-bad.toml" "$WORK/zero-bad.log"; then
+    if ! uses_loop2 "$WORK/zero-bad.log" && grep -q "by-id" "$WORK/zero-bad.log" && ! marked; then
+        pass "zero_devices_with_data ignores kernel names like $LOOP2"
+    else
+        fail "zero_devices_with_data ignores kernel names like $LOOP2"
+    fi
+    stop_daemon
+else
+    fail "daemon starts with a kernel name in zero_devices_with_data"
+fi
+auto_cfg "$WORK/zero.toml" "zero_devices_with_data = [\"$BYID\"]"
+if start_daemon "$WORK/zero.toml" "$WORK/zero.log" && uses_loop2 "$WORK/zero.log" && marked &&
+    grep -q "Erased $LOOP2" "$WORK/zero.log"; then
+    pass "zero_devices_with_data erases and claims a drive named by /dev/disk/by-id/"
+    stop_daemon
+    if start_daemon "$WORK/zero.toml" "$WORK/zero2.log" && uses_loop2 "$WORK/zero2.log" &&
+        ! grep -q "Erased" "$WORK/zero2.log"; then
+        pass "a drive already claimed is not erased again"
+    else
+        fail "a drive already claimed is not erased again"
+    fi
+    stop_daemon
+else
+    fail "zero_devices_with_data erases and claims a drive named by /dev/disk/by-id/"
+    tail -10 "$WORK/zero.log"
+    stop_daemon
 fi
 
 echo

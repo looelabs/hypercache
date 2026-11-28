@@ -331,6 +331,7 @@ Leave committing, merging, tagging and pushing to the maintainer unless they exp
 | `include_partitions` | bool | `true` | Include disk partitions (`vdc1`, `nvme0n1p1`) |
 | `device_prefixes` | list | `["nvme", "vd", "xvd", "sd"]` | Allowed block device name prefixes |
 | `exclude_root_device` | bool | `true` | Exclude OS root disk from storage pool |
+| `zero_devices_with_data` | list | `[]` | Drives (`/dev/disk/by-id/` names only) auto discovery may erase once and claim although they hold data |
 | `chunk_size_bytes` | integer | `4194304` | Chunk striping size in bytes (4 MiB) |
 | `device_start_offset_bytes`| integer | `4096` | Safety offset from start of block device (4 KB) |
 | `metadata_persistence_enabled`| bool | `true` | Enable async NVMe metadata manifest sync |
