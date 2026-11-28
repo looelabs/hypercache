@@ -13,6 +13,10 @@ use std::io::Read;
 
 use crate::config::Config;
 
+/// How much of a device's start is read to look for an existing filesystem or volume header.
+#[cfg(target_os = "linux")]
+const SIGNATURE_SCAN_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredDevice {
     pub path: String,
@@ -207,11 +211,15 @@ impl DeviceDetector {
         let mut excluded_by_partition_fs = HashSet::new();
 
         // 1. Gather all mounted devices & partition parents from /proc/mounts and /proc/swaps
-        let mounted_set = if config.exclude_mounted_devices {
+        let mut mounted_set = if config.exclude_mounted_devices {
             Self::get_all_mounted_and_in_use_devices()
         } else {
             HashSet::new()
         };
+        // The disk holding `/` is never used, even with exclude_mounted_devices = false
+        if config.exclude_root_device {
+            mounted_set.extend(Self::root_device_names());
+        }
 
         if !mounted_set.is_empty() {
             info!("Identified in-use / mounted device trees to exclude: {:?}", mounted_set);
@@ -276,6 +284,16 @@ impl DeviceDetector {
                 if is_partition && !config.include_partitions {
                     continue;
                 }
+                // Partitions are not checked one by one here, so a disk that has any is in use
+                let is_forced = config.force_use_devices.iter().any(|d| d == &dev_path || d == &name);
+                if !is_partition && !config.include_partitions && !is_forced && Self::has_partitions(&dev_sys_path) {
+                    info!(
+                        "Excluding device {}: it has partitions, and include_partitions = false (add it to \
+                         force_use_devices in configs/hypercache-agent.toml to override)",
+                        dev_path
+                    );
+                    continue;
+                }
 
                 let is_virtual = name.starts_with("vd") || name.starts_with("xvd");
                 if is_virtual && !config.allow_virtual_drives {
@@ -291,12 +309,16 @@ impl DeviceDetector {
                 }
 
                 // 3. Filesystem Signature Detection: Check if unmounted disk/partition already has a formatted filesystem
-                let existing_fs = Self::detect_filesystem_signature(&dev_path);
+                let existing_fs = Self::detect_filesystem_signature(
+                    &dev_path,
+                    Self::read_logical_block_size(&dev_sys_path),
+                    config.device_start_offset_bytes,
+                );
                 if let Some(ref fs_type) = existing_fs {
-                    let is_forced = config.force_use_devices.iter().any(|d| d == &dev_path || d == &name);
                     if config.exclude_devices_with_existing_fs && !is_forced {
                         info!(
-                            "Excluding device {} because it contains existing '{}' filesystem signature (add to force_use_devices in configs/hypercache-agent.toml to override)",
+                            "Excluding device {}: found '{}' on it (add it to force_use_devices in \
+                             configs/hypercache-agent.toml to override)",
                             dev_path, fs_type
                         );
                         if is_partition {
@@ -370,11 +392,18 @@ impl DeviceDetector {
             for line in mounts.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if !parts.is_empty() && parts[0].starts_with("/dev/") {
-                    let dev = parts[0].trim_start_matches("/dev/");
-                    set.insert(dev.to_string());
-                    set.insert(parts[0].to_string());
-                    // Also add base disk
-                    set.insert(Self::extract_base_disk_name(dev));
+                    Self::insert_device_path(&mut set, parts[0]);
+                }
+            }
+        }
+
+        // 1b. Mounts by device number: catches sources /proc/mounts names by a link or an alias
+        // (`/dev/disk/by-uuid/...`, `/dev/root`, `/dev/mapper/...`)
+        if let Ok(info) = fs::read_to_string("/proc/self/mountinfo") {
+            let by_number = Self::block_devices_by_number();
+            for (dev_number, _, _) in Self::parse_mountinfo(&info) {
+                if let Some(name) = by_number.get(&dev_number) {
+                    Self::insert_device_tree(&mut set, name);
                 }
             }
         }
@@ -384,10 +413,7 @@ impl DeviceDetector {
             for line in swaps.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if !parts.is_empty() && parts[0].starts_with("/dev/") {
-                    let dev = parts[0].trim_start_matches("/dev/");
-                    set.insert(dev.to_string());
-                    set.insert(parts[0].to_string());
-                    set.insert(Self::extract_base_disk_name(dev));
+                    Self::insert_device_path(&mut set, parts[0]);
                 }
             }
         }
@@ -436,57 +462,191 @@ impl DeviceDetector {
         }
     }
 
-    /// Reads magic bytes from block device header / superblocks to identify existing filesystems.
+    /// Adds a `/dev/...` path from a mount or swap table, resolved through links, with its parent disk
+    /// and the disks under it.
     #[cfg(target_os = "linux")]
-    fn detect_filesystem_signature(dev_path: &str) -> Option<String> {
-        let mut file = match File::open(dev_path) {
-            Ok(f) => f,
-            Err(_) => return None,
-        };
-
-        let mut buf = vec![0u8; 131072]; // Read first 128 KiB
-        if file.read_exact(&mut buf).is_err() {
-            return None;
+    fn insert_device_path(set: &mut HashSet<String>, path: &str) {
+        let dev = path.trim_start_matches("/dev/");
+        set.insert(dev.to_string());
+        set.insert(path.to_string());
+        set.insert(Self::extract_base_disk_name(dev));
+        if let Ok(real) = fs::canonicalize(path) {
+            if let Some(name) = real.to_str().and_then(|p| p.strip_prefix("/dev/")) {
+                Self::insert_device_tree(set, name);
+            }
         }
+    }
 
-        // 1. HyperCache Magic Header Check (Allowed!)
+    /// Adds a block device, its parent disk, and recursively the devices it is built on (the
+    /// `slaves` of a device-mapper or md device).
+    #[cfg(target_os = "linux")]
+    fn insert_device_tree(set: &mut HashSet<String>, name: &str) {
+        let mut todo = vec![name.to_string()];
+        while let Some(n) = todo.pop() {
+            if !set.insert(n.clone()) {
+                continue;
+            }
+            set.insert(format!("/dev/{}", n));
+            set.insert(Self::extract_base_disk_name(&n));
+            if let Ok(entries) = fs::read_dir(format!("/sys/class/block/{}/slaves", n)) {
+                todo.extend(entries.flatten().map(|e| e.file_name().to_string_lossy().to_string()));
+            }
+        }
+    }
+
+    /// `major:minor` -> block device name, from sysfs.
+    #[cfg(target_os = "linux")]
+    fn block_devices_by_number() -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(entries) = fs::read_dir("/sys/class/block") {
+            for entry in entries.flatten() {
+                if let Ok(number) = fs::read_to_string(entry.path().join("dev")) {
+                    map.insert(
+                        number.trim().to_string(),
+                        entry.file_name().to_string_lossy().to_string(),
+                    );
+                }
+            }
+        }
+        map
+    }
+
+    /// (`major:minor`, mount point, source) for each line of `/proc/self/mountinfo`.
+    pub fn parse_mountinfo(text: &str) -> Vec<(String, String, String)> {
+        text.lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let sep = fields.iter().position(|f| *f == "-")?;
+                let source = fields.get(sep + 2).copied().unwrap_or("");
+                Some((
+                    fields.get(2)?.to_string(),
+                    fields.get(4)?.to_string(),
+                    source.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The block devices that hold `/` (with their parent disks and the disks under them).
+    #[cfg(target_os = "linux")]
+    fn root_device_names() -> HashSet<String> {
+        let mut set = HashSet::new();
+        let Ok(info) = fs::read_to_string("/proc/self/mountinfo") else {
+            return set;
+        };
+        let by_number = Self::block_devices_by_number();
+        for (dev_number, mount_point, source) in Self::parse_mountinfo(&info) {
+            if mount_point != "/" {
+                continue;
+            }
+            if let Some(name) = by_number.get(&dev_number) {
+                Self::insert_device_tree(&mut set, name);
+            } else if source.starts_with("/dev/") {
+                Self::insert_device_path(&mut set, &source);
+            }
+        }
+        set
+    }
+
+    /// Whether a whole disk has partitions (sysfs lists them as subdirectories with a `partition` file).
+    #[cfg(target_os = "linux")]
+    fn has_partitions(dev_sys_path: &Path) -> bool {
+        fs::read_dir(dev_sys_path)
+            .map(|entries| entries.flatten().any(|e| e.path().join("partition").exists()))
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_logical_block_size(dev_sys_path: &Path) -> u64 {
+        fs::read_to_string(dev_sys_path.join("queue/logical_block_size"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 512)
+            .unwrap_or(512)
+    }
+
+    /// What a device already holds, if anything: a filesystem, a partition table, or a volume
+    /// manager, RAID or encryption header. A device that cannot be opened or read counts as in use.
+    #[cfg(target_os = "linux")]
+    fn detect_filesystem_signature(dev_path: &str, logical_block_size: u64, protected_bytes: u64) -> Option<String> {
+        let file = match File::open(dev_path) {
+            Ok(f) => f,
+            Err(e) => return Some(format!("unreadable device ({})", e)),
+        };
+        let mut buf = Vec::with_capacity(SIGNATURE_SCAN_BYTES);
+        if let Err(e) = file.take(SIGNATURE_SCAN_BYTES as u64).read_to_end(&mut buf) {
+            return Some(format!("unreadable device ({})", e));
+        }
+        Self::classify_header(&buf, logical_block_size, protected_bytes).map(str::to_string)
+    }
+
+    /// Identifies a device from its first bytes. HyperCache stores data from `protected_bytes`
+    /// (`device_start_offset_bytes`) on, so the short header signatures are only looked for below
+    /// it; signatures past it are long magic values that cached data is very unlikely to match.
+    pub fn classify_header(buf: &[u8], logical_block_size: u64, protected_bytes: u64) -> Option<&'static str> {
+        let at = |off: usize, magic: &[u8]| buf.len() >= off + magic.len() && &buf[off..off + magic.len()] == magic;
+        let below = |off: usize, len: usize| (off + len) as u64 <= protected_bytes;
+
+        // HyperCache's own header (allowed)
         if buf.starts_with(b"HYPERCACHE") {
             return None;
         }
-
-        // 2. XFS Superblock (Offset 0: "XFSB")
-        if &buf[0..4] == b"XFSB" {
-            return Some("xfs".to_string());
+        if at(0, b"XFSB") {
+            return Some("xfs");
         }
-
-        // 3. ext2 / ext3 / ext4 Superblock (Offset 1080: 0xef53)
         if buf.len() > 1082 && buf[1080] == 0x53 && buf[1081] == 0xef {
-            return Some("ext2/3/4".to_string());
+            return Some("ext2/3/4");
         }
-
-        // 4. Btrfs Superblock (Offset 65536 / 0x10000: "_BHRfS_M")
-        if buf.len() >= 65536 + 8 && &buf[65536..65536 + 8] == b"_BHRfS_M" {
-            return Some("btrfs".to_string());
+        if at(65536, b"_BHRfS_M") {
+            return Some("btrfs");
         }
-
-        // 5. VFAT / FAT Superblock (Offset 54: "FAT12" or "FAT16", Offset 82: "FAT32")
         if buf.len() > 90 && (&buf[54..59] == b"FAT12" || &buf[54..59] == b"FAT16" || &buf[82..87] == b"FAT32") {
-            return Some("vfat/fat".to_string());
+            return Some("vfat/fat");
+        }
+        if at(4086, b"SWAPSPACE2") || at(4086, b"SWAP-SPACE") {
+            return Some("swap");
+        }
+        if at(3, b"NTFS    ") {
+            return Some("ntfs");
+        }
+        if at(32769, b"CD001") {
+            return Some("iso9660");
         }
 
-        // 6. Linux Swap (Offset 4086: "SWAPSPACE2" or "SWAP-SPACE")
-        if buf.len() > 4096 && (&buf[4086..4096] == b"SWAPSPACE2" || &buf[4086..4096] == b"SWAP-SPACE") {
-            return Some("swap".to_string());
+        // Partition tables, volume managers, RAID and encryption: no filesystem magic, but in use
+        if below(0, 6) && at(0, b"LUKS\xba\xbe") {
+            return Some("LUKS encryption header");
         }
-
-        // 7. NTFS (Offset 3: "NTFS    ")
-        if buf.len() > 11 && &buf[3..11] == b"NTFS    " {
-            return Some("ntfs".to_string());
+        if below(0, 22) && at(0, b"bluestore block device") {
+            return Some("Ceph BlueStore");
         }
-
-        // 8. ISO9660 (Offset 32769: "CD001")
-        if buf.len() >= 32774 && &buf[32769..32774] == b"CD001" {
-            return Some("iso9660".to_string());
+        // md superblock 1.1 at 0, 1.2 at 4 KiB: magic 0xa92b4efc, then major version 1
+        const MD_MAGIC: &[u8] = &[0xfc, 0x4e, 0x2b, 0xa9, 0x01, 0x00, 0x00, 0x00];
+        if (below(0, 8) && at(0, MD_MAGIC)) || at(4096, MD_MAGIC) {
+            return Some("Linux md RAID member");
+        }
+        for sector in 0..4 {
+            let off = sector * 512;
+            if below(off, 32) && at(off, b"LABELONE") && at(off + 24, b"LVM2 001") {
+                return Some("LVM2 physical volume");
+            }
+        }
+        // GPT header in LBA 1, for 512-byte and 4 KiB logical blocks
+        let lbs = logical_block_size as usize;
+        if (below(512, 8) && at(512, b"EFI PART")) || (lbs != 512 && at(lbs, b"EFI PART")) {
+            return Some("GPT partition table");
+        }
+        if below(510, 2) && buf.len() >= 512 && buf[510] == 0x55 && buf[511] == 0xaa {
+            return Some("MBR partition table or boot sector");
+        }
+        // ZFS vdev label: uberblocks from 128 KiB, magic 0x00bab10c in either byte order
+        const ZFS_LE: &[u8] = &[0x0c, 0xb1, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00];
+        const ZFS_BE: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0xba, 0xb1, 0x0c];
+        if (128 * 1024..256 * 1024)
+            .step_by(1024)
+            .any(|off| at(off, ZFS_LE) || at(off, ZFS_BE))
+        {
+            return Some("ZFS pool member");
         }
 
         None
@@ -787,6 +947,121 @@ mod tests {
         assert_eq!(DeviceDetector::extract_base_disk_name("nvme0n1p2"), "nvme0n1");
         assert_eq!(DeviceDetector::extract_base_disk_name("nvme0n1"), "nvme0n1");
         assert_eq!(DeviceDetector::extract_base_disk_name("sda2"), "sda");
+    }
+
+    fn header_with(off: usize, magic: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; 256 * 1024];
+        buf[off..off + magic.len()].copy_from_slice(magic);
+        buf
+    }
+
+    /// Devices that hold no filesystem but are in use (a partition table, LVM, LUKS, md RAID, ZFS)
+    /// must never look blank: discovery would claim and overwrite them.
+    #[test]
+    fn test_in_use_headers_are_recognised() {
+        let p = 4096; // default device_start_offset_bytes
+        assert_eq!(DeviceDetector::classify_header(&vec![0u8; 256 * 1024], 512, p), None);
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(512, b"EFI PART"), 512, p),
+            Some("GPT partition table")
+        );
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(4096, b"EFI PART"), 4096, p),
+            Some("GPT partition table")
+        );
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(510, &[0x55, 0xaa]), 512, p),
+            Some("MBR partition table or boot sector")
+        );
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(0, b"LUKS\xba\xbe"), 512, p),
+            Some("LUKS encryption header")
+        );
+        let mut lvm = header_with(512, b"LABELONE");
+        lvm[512 + 24..512 + 32].copy_from_slice(b"LVM2 001");
+        assert_eq!(
+            DeviceDetector::classify_header(&lvm, 512, p),
+            Some("LVM2 physical volume")
+        );
+        let md = [0xfc, 0x4e, 0x2b, 0xa9, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(0, &md), 512, p),
+            Some("Linux md RAID member")
+        );
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(4096, &md), 512, p),
+            Some("Linux md RAID member")
+        );
+        let zfs = [0x0c, 0xb1, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(128 * 1024 + 4096, &zfs), 512, p),
+            Some("ZFS pool member")
+        );
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(0, b"bluestore block device"), 512, p),
+            Some("Ceph BlueStore")
+        );
+        assert_eq!(
+            DeviceDetector::classify_header(&header_with(0, b"XFSB"), 512, p),
+            Some("xfs")
+        );
+    }
+
+    /// Short header signatures are only looked for where HyperCache never writes, so its own data
+    /// (from device_start_offset_bytes on) can't make it refuse its own drive.
+    #[test]
+    fn test_short_signatures_only_below_the_data_area() {
+        let boot = header_with(510, &[0x55, 0xaa]);
+        assert!(DeviceDetector::classify_header(&boot, 512, 4096).is_some());
+        assert_eq!(DeviceDetector::classify_header(&boot, 512, 0), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_unreadable_device_counts_as_in_use() {
+        let found = DeviceDetector::detect_filesystem_signature("/nonexistent/hypercache-test-dev", 512, 4096);
+        assert!(found.is_some_and(|f| f.starts_with("unreadable")));
+
+        let path = std::env::temp_dir().join(format!("hc_sig_{}.raw", std::process::id()));
+        std::fs::write(&path, header_with(512, b"EFI PART")).unwrap();
+        assert_eq!(
+            DeviceDetector::detect_filesystem_signature(path.to_str().unwrap(), 512, 4096).as_deref(),
+            Some("GPT partition table")
+        );
+        std::fs::write(&path, vec![0u8; 8192]).unwrap(); // shorter than the scan: still read
+        assert_eq!(
+            DeviceDetector::detect_filesystem_signature(path.to_str().unwrap(), 512, 4096),
+            None
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_parse_mountinfo() {
+        let text = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/root rw
+30 22 253:0 / /mnt/ckpt rw shared:2 - xfs /dev/mapper/ckpt--vg-ckpt rw
+40 22 0:52 / /proc rw - proc proc rw
+";
+        let parsed = DeviceDetector::parse_mountinfo(text);
+        assert_eq!(parsed[0], ("259:2".into(), "/".into(), "/dev/root".into()));
+        assert_eq!(
+            parsed[1],
+            ("253:0".into(), "/mnt/ckpt".into(), "/dev/mapper/ckpt--vg-ckpt".into())
+        );
+        assert_eq!(parsed.len(), 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_disk_with_partitions_is_detected() {
+        let dir = std::env::temp_dir().join(format!("hc_parts_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("queue")).unwrap();
+        assert!(!DeviceDetector::has_partitions(&dir));
+        std::fs::create_dir_all(dir.join("nvme9n1p1")).unwrap();
+        std::fs::write(dir.join("nvme9n1p1/partition"), "1\n").unwrap();
+        assert!(DeviceDetector::has_partitions(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
