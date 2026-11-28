@@ -997,6 +997,40 @@ def scenario_s3(ctx: Ctx, rep: Report, endpoint: str, access: str, secret: str, 
 
     rep.check("write-back to S3 reaches SYNCED_BACKEND", write_back_s3)
 
+    def failed_fsspec_write_keeps_the_good_copy():
+        # A checkpoint write that raises part way (e.g. a crashed torch.save) must not be committed,
+        # or write-back would copy the truncated file over the good one in S3.
+        from hypercache.fsspec_fs import HyperCacheFileSystem
+
+        good = random_bytes(6 * MIB + 5)
+        k = f"e2e-{run}/ckpt/crash.pt"
+        uri = f"s3://{bucket}/{k}"
+        s3.put_object(Bucket=bucket, Key=k, Body=good)
+        fs = HyperCacheFileSystem(socket_path=node.socket_path, prefer_gds=False)
+        try:
+            with fs.open(uri, "wb") as f:
+                f.write(random_bytes(5 * MIB))  # one 4 MiB chunk is already staged on the device
+                raise RuntimeError("simulated crash mid-save")
+        except RuntimeError:
+            pass
+        res = node.client().locate(uri, auto_ingest=False)
+        expect(not res.is_hit and res.sync_status is None, f"a write that raised is still cached ({res.status} {res.sync_status})")
+        time.sleep(3)  # longer than a write-back would take, had the partial write been committed
+        expect(s3.get_object(Bucket=bucket, Key=k)["Body"].read() == good, "a failed write replaced the S3 object")
+        expect(node.client().get_write_status(uri)["status"] != "STAGED", "the failed write is still staged")
+        node.cli("preload", uri)
+        expect(sha256(node.read_object(uri)) == sha256(good), "after a failed write, reads differ from the S3 copy")
+
+        # And a write that completes still commits and reaches S3
+        fresh = random_bytes(5 * MIB + 9)
+        with fs.open(uri, "wb") as f:
+            f.write(fresh)
+        wait_until(lambda: node.client().get_write_status(uri)["status"] == "SYNCED_BACKEND", 60, "S3 write-back")
+        expect(s3.get_object(Bucket=bucket, Key=k)["Body"].read() == fresh, "S3 object differs after the good write")
+
+    rep.check("a checkpoint write that raises is discarded, and S3 keeps the good copy",
+              failed_fsspec_write_keeps_the_good_copy)
+
     node.stop()
 
 

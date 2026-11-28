@@ -256,6 +256,7 @@ class HyperCacheClient:
                 object_size=0,
                 chunk_size=0,
                 chunk_layout=[],
+                generation=resp.get("generation"),
                 sync_status=resp.get("sync_status"),
             )
         else:

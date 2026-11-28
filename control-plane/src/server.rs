@@ -404,7 +404,10 @@ impl Server {
             // writer's layout.
             Ok(Some(meta)) if meta.sync_status == Some(SyncStatus::Staged) => {
                 self.record_event("CACHE_MISS", "MISS", uri, 0, &[], t_start);
-                Response::miss().with_sync_status(Some(SyncStatus::Staged))
+                // The generation lets the writer that staged it clean up only its own write
+                Response::miss()
+                    .with_sync_status(Some(SyncStatus::Staged))
+                    .with_generation(meta.generation)
             }
             Ok(Some(meta)) => {
                 if pinned && !meta.pinned {

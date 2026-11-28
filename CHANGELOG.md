@@ -7,6 +7,15 @@
   this many seconds of its last stage or append is removed, files included.
 
 ### Fixed
+- Python client: a checkpoint write that failed part way was committed. Leaving a
+  `with fs.open(uri, "wb")` block by an exception (for example a crashed `torch.save`) committed
+  whatever had been written, and write-back then copied the truncated file over the good copy in
+  the backend; a file that was never closed was committed the same way when garbage-collected.
+  Such a write is now discarded instead (only if it is still this writer's staging), and the
+  backend keeps the previous copy. A failed commit used to be logged as a warning and otherwise
+  ignored: `close()` now raises `IOError`. `HyperCacheWriteFile.abort()` discards a write
+  explicitly. `locate` reports the layout generation of a staged object, so the writer can tell
+  its own staging from a newer one.
 - Pinned objects, and checkpoints not yet written to the backend, could be evicted under cache
   pressure. Their zero eviction weight did not stop the metadata cache from removing them (it
   evicts zero-weight entries too, especially when a frequently requested object is admitted), and

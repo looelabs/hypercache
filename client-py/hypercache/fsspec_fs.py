@@ -193,6 +193,8 @@ class HyperCacheWriteFile(io.RawIOBase):
         self._flushed_chunks: List[Any] = []
         self._pos = 0
         self._staged_initial = False
+        # Layout generation of our staging, so an abort removes only our own write
+        self._generation: Optional[int] = None
         self._closed = False
         self._writer = DirectBlockWriter()
 
@@ -240,6 +242,7 @@ class HyperCacheWriteFile(io.RawIOBase):
                 pinned=self.pinned,
             )
             self._staged_initial = True
+            self._generation = stage_res.generation
         else:
             stage_res = self.client.append_write(
                 uri=self.uri,
@@ -324,26 +327,82 @@ class HyperCacheWriteFile(io.RawIOBase):
             self._flush_chunk_bytes(chunk_payload)
 
     def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            if len(self._buffer) > 0:
-                tail_payload = bytes(self._buffer)
-                self._buffer.clear()
-                self._flush_chunk_bytes(tail_payload)
+        """Writes the rest of the data and commits the object.
 
+        Raises if the commit fails: the object was not saved. If writing the tail fails, the staged
+        write is discarded so a half-written object never stays behind.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            try:
+                if len(self._buffer) > 0:
+                    tail_payload = bytes(self._buffer)
+                    self._buffer.clear()
+                    self._flush_chunk_bytes(tail_payload)
+            except BaseException:
+                self._discard_staged()
+                raise
             if self._flushed_bytes > 0:
-                committed = self.client.commit_write(self.uri, write_through=self.write_through)
+                committed = self.client.commit_write(
+                    self.uri, write_through=self.write_through, generation=self._generation
+                )
                 if not committed:
-                    logger.warning(f"Failed to confirm commit write for {self.uri}")
-
+                    raise IOError(
+                        f"HyperCache could not commit {self.uri}: the object was not saved "
+                        "(see the daemon log for the reason)"
+                    )
+        finally:
             self._writer.close()
             super().close()
+
+    def abort(self) -> None:
+        """Closes the file without committing, and discards whatever was staged."""
+        if self._closed:
+            return
+        self._closed = True
+        self._buffer.clear()
+        try:
+            self._discard_staged()
+        finally:
+            self._writer.close()
+            super().close()
+
+    def _discard_staged(self) -> None:
+        # Remove the staged object only if it is still our staging: another writer may have
+        # replaced it since, and its write must not be removed.
+        if not self._staged_initial:
+            return
+        try:
+            current = self.client.locate(self.uri)
+            if current.sync_status == "STAGED" and current.generation == self._generation:
+                self.client.evict(self.uri)
+        except Exception as e:  # noqa: BLE001 - best effort; the daemon also expires staged writes
+            logger.warning(f"Could not discard the staged write of {self.uri}: {e}")
 
     def __enter__(self) -> HyperCacheWriteFile:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
+        # An exception inside the with block means the data is incomplete: never commit it
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.close()
+
+    def __del__(self) -> None:
+        # A file that was never closed may hold only part of the data (for example after an
+        # exception without a with block), so garbage collection discards it instead of committing.
+        if not getattr(self, "_closed", True):
+            logger.warning(
+                f"HyperCacheWriteFile for {self.uri} was garbage-collected without close(): "
+                "discarding the uncommitted write"
+            )
+            try:
+                self.abort()
+            except Exception:  # noqa: BLE001 - never raise from __del__
+                pass
 
 
 class HyperCacheFileSystem(AbstractFileSystem):
