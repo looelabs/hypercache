@@ -29,6 +29,35 @@ pub struct DiscoveredDevice {
     pub existing_fs: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub numa_node: Option<i32>,
+    /// What the daemon must do to a raw drive before using it (see `device_claim`)
+    #[serde(skip)]
+    pub claim: DeviceClaim,
+}
+
+/// What `DeviceDetector::inspect_drive` found on a drive.
+#[derive(Debug)]
+pub struct DriveReport {
+    pub path: String,
+    /// Mounted, held by another device (LVM, md, dm), swap, or the root disk
+    pub in_use: bool,
+    pub size_bytes: u64,
+    pub marker: Option<crate::device_claim::DeviceMarker>,
+    pub found: Option<String>,
+    pub blank: bool,
+    pub serial: Option<String>,
+    pub model: Option<String>,
+}
+
+/// The step that makes a discovered drive HyperCache's own before the daemon uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceClaim {
+    /// Nothing to do: it has HyperCache's marker, or it isn't a drive auto discovery claims
+    #[default]
+    None,
+    /// Blank, or already holding HyperCache data from before markers: write the marker
+    Mark,
+    /// Holds other data and the user allowed erasing it: erase, then write the marker
+    Erase,
 }
 
 pub struct DeviceDetector;
@@ -102,6 +131,7 @@ impl DeviceDetector {
                         model,
                         existing_fs: None,
                         numa_node,
+                        claim: Default::default(),
                     }
                 })
                 .collect();
@@ -194,6 +224,7 @@ impl DeviceDetector {
                         model: Some("HyperCache-Mock-NVMe".to_string()),
                         existing_fs: None,
                         numa_node: Some(0),
+                        claim: Default::default(),
                     });
                 }
             }
@@ -224,6 +255,16 @@ impl DeviceDetector {
         if !mounted_set.is_empty() {
             info!("Identified in-use / mounted device trees to exclude: {:?}", mounted_set);
         }
+
+        // Drives the saved manifest holds data on (claimed before ownership markers existed)
+        let manifest_devices = if config.metadata_persistence_enabled {
+            crate::metadata::manifest_devices(&crate::config::resolve_metadata_persistence_path(
+                &config.metadata_persistence_path,
+            ))
+        } else {
+            HashSet::new()
+        };
+        let zero_targets = crate::device_claim::resolve_zero_targets(&config.zero_devices_with_data);
 
         // Scan all block entries in /sys/class/block
         let block_class = Path::new("/sys/class/block");
@@ -308,32 +349,28 @@ impl DeviceDetector {
                     continue; // Skip spinning HDDs
                 }
 
-                // 3. Filesystem Signature Detection: Check if unmounted disk/partition already has a formatted filesystem
-                let existing_fs = Self::detect_filesystem_signature(
+                // 3. Ownership: a drive with HyperCache's marker is ours. Any other drive must be
+                // blank, already hold HyperCache data (listed in the manifest, from before
+                // markers), or be allowed to be erased; otherwise it holds someone's data.
+                let size_bytes = Self::read_sysfs_size(&dev_sys_path);
+                let (claim, existing_fs) = match Self::decide_claim(
                     &dev_path,
-                    Self::read_logical_block_size(&dev_sys_path),
-                    config.device_start_offset_bytes,
-                );
-                if let Some(ref fs_type) = existing_fs {
-                    if config.exclude_devices_with_existing_fs && !is_forced {
-                        info!(
-                            "Excluding device {}: found '{}' on it (add it to force_use_devices in \
-                             configs/hypercache-agent.toml to override)",
-                            dev_path, fs_type
-                        );
-                        if is_partition {
+                    &dev_sys_path,
+                    size_bytes,
+                    config,
+                    is_forced,
+                    &manifest_devices,
+                    &zero_targets,
+                ) {
+                    Ok(decision) => decision,
+                    Err(found) => {
+                        if is_partition && found.is_some() {
                             excluded_by_partition_fs.insert(base_disk.clone());
                         }
                         continue;
-                    } else if is_forced {
-                        warn!(
-                            "Device {} has existing '{}' filesystem, but force_use_devices is set. Proceeding.",
-                            dev_path, fs_type
-                        );
                     }
-                }
+                };
 
-                let size_bytes = Self::read_sysfs_size(&dev_sys_path);
                 let model = Self::read_sysfs_model(&dev_sys_path, &name);
                 let numa_node = Self::extract_numa_node(&dev_sys_path);
 
@@ -347,6 +384,7 @@ impl DeviceDetector {
                     model,
                     existing_fs,
                     numa_node,
+                    claim,
                 });
             }
         }
@@ -437,29 +475,218 @@ impl DeviceDetector {
         set
     }
 
-    /// Extracts the parent disk from a partition name (e.g. "vda1" -> "vda", "nvme0n1p1" -> "nvme0n1", "sda2" -> "sda")
+    /// Extracts the parent disk from a partition name (e.g. "vda1" -> "vda", "nvme0n1p1" -> "nvme0n1",
+    /// "sda2" -> "sda", "loop0p1" -> "loop0"). A name that is not a partition is its own disk:
+    /// "loop1", "dm-1" and "md0" stay as they are.
     #[allow(dead_code)]
     pub fn extract_base_disk_name(name: &str) -> String {
         let clean = name.trim_start_matches("/dev/");
-        if clean.contains("nvme") {
-            if let Some((base, part)) = clean.rsplit_once('p') {
-                if !part.is_empty() && part.chars().all(|c| c.is_numeric()) {
-                    return base.to_string();
+        // Disks whose names end in a digit number partitions with a "p": nvme0n1p1, loop0p1, md0p1
+        if let Some((base, part)) = clean.rsplit_once('p') {
+            if !part.is_empty()
+                && part.chars().all(|c| c.is_ascii_digit())
+                && base.chars().last().is_some_and(|c| c.is_ascii_digit())
+            {
+                return base.to_string();
+            }
+        }
+        // SCSI, virtio and Xen disks append the partition number directly: sda1, vdb2, xvdc3
+        if ["sd", "vd", "xvd", "hd"].iter().any(|p| clean.starts_with(p)) {
+            let trimmed = clean.trim_end_matches(|c: char| c.is_ascii_digit());
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        clean.to_string()
+    }
+
+    /// Whether auto discovery may use a drive, and what claiming it takes. `Err` excludes it (with
+    /// what was found on it, if anything); the reason is logged here.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn decide_claim(
+        dev_path: &str,
+        dev_sys_path: &Path,
+        size_bytes: u64,
+        config: &Config,
+        is_forced: bool,
+        manifest_devices: &HashSet<String>,
+        zero_targets: &[String],
+    ) -> std::result::Result<(DeviceClaim, Option<String>), Option<String>> {
+        use crate::device_claim;
+        let protected = config.device_start_offset_bytes;
+        let can_mark = protected >= device_claim::MARKER_LEN as u64;
+
+        if config.exclude_devices_with_existing_fs && can_mark {
+            match device_claim::read_marker(dev_path) {
+                Ok(Some(_)) => return Ok((DeviceClaim::None, None)),
+                Ok(None) => {}
+                Err(e) => {
+                    info!("Excluding device {}: it can't be read ({})", dev_path, e);
+                    return Err(Some(format!("unreadable device ({})", e)));
                 }
             }
-            return clean.to_string();
         }
 
-        let mut non_digit_len = clean.len();
-        while non_digit_len > 0 && clean.as_bytes()[non_digit_len - 1].is_ascii_digit() {
-            non_digit_len -= 1;
+        let found = Self::detect_filesystem_signature(dev_path, Self::read_logical_block_size(dev_sys_path), protected);
+        if !config.exclude_devices_with_existing_fs {
+            if let Some(ref fs_type) = found {
+                warn!(
+                    "Device {} has '{}' on it, but exclude_devices_with_existing_fs = false. Proceeding.",
+                    dev_path, fs_type
+                );
+            }
+            return Ok((DeviceClaim::None, found));
+        }
+        let erase_allowed = zero_targets.iter().any(|t| t == dev_path);
+        let advice = || {
+            let id = crate::device_claim::by_id_name(dev_path).unwrap_or_else(|| "/dev/disk/by-id/<name>".to_string());
+            format!(
+                "To use it, erase it (for example `blkdiscard {dev}`), run `hypercache prepare-drive {id}`, \
+                 or add \"{id}\" to zero_devices_with_data in configs/hypercache-agent.toml",
+                dev = dev_path,
+                id = id
+            )
+        };
+        let describe = || {
+            let (serial, model) = crate::device_claim::device_identity(dev_path);
+            format!(
+                "{} ({}, serial {}, {:.1} GB)",
+                dev_path,
+                model.as_deref().unwrap_or("unknown model"),
+                serial.as_deref().unwrap_or("unknown"),
+                size_bytes as f64 / 1e9
+            )
+        };
+
+        if let Some(ref fs_type) = found {
+            if is_forced {
+                warn!(
+                    "Device {} has existing '{}', but force_use_devices is set. Proceeding.",
+                    dev_path, fs_type
+                );
+                return Ok((if can_mark { DeviceClaim::Mark } else { DeviceClaim::None }, found));
+            }
+            if erase_allowed && can_mark {
+                warn!(
+                    "Erasing {}: it holds '{}', and zero_devices_with_data allows it",
+                    describe(),
+                    fs_type
+                );
+                return Ok((DeviceClaim::Erase, found));
+            }
+            warn!(
+                "Excluding device {}: found '{}' on it. {}, or add it to force_use_devices.",
+                describe(),
+                fs_type,
+                advice()
+            );
+            return Err(found);
         }
 
-        if non_digit_len > 0 && non_digit_len < clean.len() {
-            clean[..non_digit_len].to_string()
-        } else {
-            clean.to_string()
+        // Below 4 KiB of protected space there is no room for the marker: signatures only, as before
+        if !can_mark {
+            return Ok((DeviceClaim::None, None));
         }
+        if manifest_devices.contains(dev_path) {
+            info!(
+                "{} holds HyperCache data from before ownership markers: marking it",
+                dev_path
+            );
+            return Ok((DeviceClaim::Mark, None));
+        }
+        match crate::device_claim::looks_blank(dev_path, size_bytes) {
+            Ok(true) => Ok((DeviceClaim::Mark, None)),
+            Ok(false) if is_forced => {
+                warn!(
+                    "Device {} holds data, but force_use_devices is set. Proceeding.",
+                    dev_path
+                );
+                Ok((DeviceClaim::Mark, None))
+            }
+            Ok(false) if erase_allowed => {
+                warn!(
+                    "Erasing {}: it holds data, and zero_devices_with_data allows it",
+                    describe()
+                );
+                Ok((DeviceClaim::Erase, None))
+            }
+            Ok(false) => {
+                warn!(
+                    "Excluding device {}: it is not blank and is not a HyperCache drive (it holds data \
+                     another program may own). {}.",
+                    describe(),
+                    advice()
+                );
+                Err(Some("data (not blank)".to_string()))
+            }
+            Err(e) => {
+                info!("Excluding device {}: it can't be read ({})", dev_path, e);
+                Err(Some(format!("unreadable device ({})", e)))
+            }
+        }
+    }
+
+    /// Makes the drives discovery chose HyperCache's own: erases those the user allowed to be
+    /// erased, then writes the ownership marker. A drive that can't be claimed is dropped.
+    pub fn claim_devices(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
+        use crate::device_claim;
+        devices
+            .into_iter()
+            .filter(|d| {
+                let result = match d.claim {
+                    DeviceClaim::None => return true,
+                    DeviceClaim::Erase => device_claim::zero_device(&d.path, d.size_bytes).and_then(|()| {
+                        info!("Erased {}", d.path);
+                        Self::mark(&d.path)
+                    }),
+                    DeviceClaim::Mark => Self::mark(&d.path),
+                };
+                match result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        error!("Not using {}: claiming it failed ({})", d.path, e);
+                        false
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn mark(path: &str) -> std::io::Result<()> {
+        let (serial, model) = crate::device_claim::device_identity(path);
+        crate::device_claim::write_marker(path, &crate::device_claim::DeviceMarker::new(serial, model))
+    }
+
+    /// Everything `hypercache prepare-drive` needs to know about one drive.
+    #[cfg(target_os = "linux")]
+    pub fn inspect_drive(dev_path: &str) -> Result<DriveReport> {
+        use std::os::unix::fs::FileTypeExt;
+        let real = fs::canonicalize(dev_path).with_context(|| format!("{} does not exist", dev_path))?;
+        let real = real.to_string_lossy().to_string();
+        if !fs::metadata(&real)?.file_type().is_block_device() {
+            anyhow::bail!("{} is not a block device", real);
+        }
+        let name = real.trim_start_matches("/dev/").to_string();
+        let sys = Path::new("/sys/class/block").join(&name);
+        let mut in_use = Self::get_all_mounted_and_in_use_devices();
+        in_use.extend(Self::root_device_names());
+        let in_use = in_use.contains(&name) || in_use.contains(&Self::extract_base_disk_name(&name));
+        let size_bytes = Self::read_sysfs_size(&sys);
+        let marker = crate::device_claim::read_marker(&real)?;
+        let found = Self::detect_filesystem_signature(&real, Self::read_logical_block_size(&sys), 4096);
+        let blank = crate::device_claim::looks_blank(&real, size_bytes)?;
+        let (serial, model) = crate::device_claim::device_identity(&real);
+        Ok(DriveReport {
+            path: real,
+            in_use,
+            size_bytes,
+            marker,
+            found,
+            blank,
+            serial,
+            model,
+        })
     }
 
     /// Adds a `/dev/...` path from a mount or swap table, resolved through links, with its parent disk
@@ -739,6 +966,7 @@ impl DeviceDetector {
                         model: Some("HyperCache-Mock-NVMe".to_string()),
                         existing_fs: None,
                         numa_node: Some(0),
+                        claim: Default::default(),
                     });
                 }
             }
@@ -887,6 +1115,7 @@ impl DeviceDetector {
                 model: Some("Filesystem-DirectIO-Arena".to_string()),
                 existing_fs: Some("ext4/xfs-arena".to_string()),
                 numa_node: Some(0),
+                claim: Default::default(),
             });
         }
 
@@ -947,6 +1176,14 @@ mod tests {
         assert_eq!(DeviceDetector::extract_base_disk_name("nvme0n1p2"), "nvme0n1");
         assert_eq!(DeviceDetector::extract_base_disk_name("nvme0n1"), "nvme0n1");
         assert_eq!(DeviceDetector::extract_base_disk_name("sda2"), "sda");
+        // Devices whose own names end in a digit are not partitions of a shorter name
+        assert_eq!(DeviceDetector::extract_base_disk_name("loop1"), "loop1");
+        assert_eq!(DeviceDetector::extract_base_disk_name("loop0p1"), "loop0");
+        assert_eq!(DeviceDetector::extract_base_disk_name("dm-1"), "dm-1");
+        assert_eq!(DeviceDetector::extract_base_disk_name("md0"), "md0");
+        assert_eq!(DeviceDetector::extract_base_disk_name("md0p2"), "md0");
+        assert_eq!(DeviceDetector::extract_base_disk_name("nvme0n1p12"), "nvme0n1");
+        assert_eq!(DeviceDetector::extract_base_disk_name("xvdc3"), "xvdc");
     }
 
     fn header_with(off: usize, magic: &[u8]) -> Vec<u8> {

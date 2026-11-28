@@ -999,6 +999,7 @@ mod tests {
             model: Some("TestNVMe".to_string()),
             existing_fs: None,
             numa_node: Some(0),
+            claim: Default::default(),
         }];
 
         let server = Server::new(config, metadata, ingestion, telemetry, devices);
@@ -1139,6 +1140,7 @@ mod tests {
             model: Some("TestNVMe".to_string()),
             existing_fs: None,
             numa_node: Some(0),
+            claim: Default::default(),
         }];
 
         let server = Server::new(config, metadata.clone(), ingestion, telemetry, devices);

@@ -86,8 +86,13 @@ HyperCache dynamically scans the host system on startup without requiring manual
    - Reads the first 256 KiB and excludes devices holding a filesystem (ext2/3/4, XFS, Btrfs, FAT, NTFS, swap, ISO 9660), a partition table (GPT, MBR), or a volume manager, RAID or encryption header (LVM2, md RAID 1.1/1.2, LUKS, ZFS, Ceph BlueStore). A device that cannot be read is excluded too.
    - Short header signatures are only looked for below `device_start_offset_bytes`, where HyperCache never writes, so its own data can't make it refuse its own drive.
    - `force_use_devices` overrides the check for named devices. Manual mode (`block_devices`) skips discovery checks.
-   - Not detected: a drive with raw data and no known header (for example one used by another raw block store), md RAID 0.90/1.0 (superblock at the end of the device).
-4. **Capacity Calculation**: Reads `/sys/class/block/<dev>/size` (sectors $\times$ 512 bytes) and builds the aggregate multi-drive storage pool.
+   - Not detected by signature: md RAID 0.90/1.0 (superblock at the end of the device). The ownership check below refuses such drives anyway, since they are not blank.
+4. **Ownership** (`device_claim.rs`, needs `device_start_offset_bytes` >= 4096):
+   - A claimed drive carries a 4 KiB marker at offset 0 (magic `HYPERCACHE-DEVICE-V1`, serial, model, claim time, CRC32). A marked drive is used as is.
+   - An unmarked drive is used only if it reads as blank (first and last 1 MiB, and 64 samples between, all zeros) or the saved manifest lists it (drives claimed before markers existed); the daemon then writes the marker before storing anything.
+   - Any other unmarked drive is refused with a warning naming it (model, serial, size) and how to erase it. `zero_devices_with_data` (by `/dev/disk/by-id/` name) and `hypercache prepare-drive` erase it (BLKDISCARD of the whole drive, BLKZEROOUT of the first and last 1 MiB, O_EXCL open) and mark it. `force_use_devices` uses it without erasing.
+   - Claims happen in `start` only; `inspect` and `check` never write.
+5. **Capacity Calculation**: Reads `/sys/class/block/<dev>/size` (sectors $\times$ 512 bytes) and builds the aggregate multi-drive storage pool.
 
 ---
 

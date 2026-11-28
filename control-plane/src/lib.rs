@@ -5,6 +5,7 @@ pub mod bench;
 pub mod check;
 pub mod config;
 pub mod controller;
+pub mod device_claim;
 pub mod discovery;
 pub mod fleet;
 pub mod ingestion;

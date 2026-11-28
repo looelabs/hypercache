@@ -2,7 +2,33 @@
 
 ## Unreleased
 
+### Added
+- Auto discovery refuses a drive that holds data HyperCache didn't write, and leaves it untouched.
+  It used to claim any drive without a recognised filesystem or header, so a drive another program
+  used as a raw device (for example a raw block cache) was overwritten. A drive is now used only if
+  it is blank, carries HyperCache's ownership marker, or the saved manifest lists it. The warning
+  names the drive (model, serial, size) and how to erase it.
+- Ownership marker: HyperCache writes a 4 KiB marker to the start of each drive it claims (below
+  `device_start_offset_bytes`, where it never stores data), so it keeps using its own drives across
+  restarts.
+- `hypercache prepare-drive <device>`: shows a drive and what is on it, asks for confirmation (the
+  device name; `--yes` skips it), then erases it and marks it. It refuses drives that are mounted,
+  in use or the root disk.
+- `zero_devices_with_data` (default empty): drives, by `/dev/disk/by-id/` name only, that the daemon
+  may erase once at start and claim. Kernel names such as `/dev/nvme0n1` are rejected, because they
+  can change between boots.
+
+Upgrade note: drives HyperCache already uses keep working when metadata persistence is on (the
+manifest lists them; they are marked on the first start). With `metadata_persistence_enabled =
+false`, a drive HyperCache used before holds data the daemon can't vouch for, so it is refused
+once: erase it or list it in `zero_devices_with_data` (that cache is empty after a restart anyway).
+With `device_start_offset_bytes` below 4096 there is no room for the marker, and discovery checks
+signatures only, as before.
+
 ### Fixed
+- Raw drive discovery took the parent disk of `loop1` to be `loop`, and of `dm-1` to be `dm-`, so
+  one mounted loop or device-mapper device excluded all of them. Only `sd`, `vd`, `xvd` and `hd`
+  names have their partition number appended directly; other names end a partition in `p<N>`.
 - Raw drive discovery could claim, and overwrite, drives that hold data. It only recognised
   filesystem superblocks, so an unmounted disk with a partition table, an LVM physical volume, a
   LUKS or md RAID member, a ZFS pool member or a Ceph BlueStore device looked blank, and a device

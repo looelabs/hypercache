@@ -23,6 +23,14 @@ device_filter = ""
 # Automatically exclude OS root filesystem drive from cache striping pool
 exclude_root_device = true
 
+# Auto discovery only uses a drive that is blank, already carries HyperCache's marker (written to
+# its first 4 KiB when HyperCache claims it), or that the saved manifest lists. A drive holding any
+# other data is refused with a warning, and left untouched, until it is erased: with `blkdiscard`,
+# with `hypercache prepare-drive /dev/disk/by-id/<name>` (asks for confirmation), or by listing it
+# here. Listed drives are ERASED at start, once (they then carry the marker). Only
+# /dev/disk/by-id/ names are accepted: kernel names like /dev/nvme0n1 can change between boots.
+# zero_devices_with_data = ["/dev/disk/by-id/nvme-Micron_7450_MTFDKCC960TFR_XXXXXXXX"]
+
 # Chunk size for striping across devices (default: 4 MiB)
 chunk_size_bytes = 4194304
 
